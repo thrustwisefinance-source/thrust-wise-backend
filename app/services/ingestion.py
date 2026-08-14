@@ -167,6 +167,14 @@ async def ingest_all(trigger: str = "schedule") -> None:
         "tw:v1:compare:",
         "tw:v1:allocation:",
         "tw:v1:dashboard",
+        # Strategies cache (six technical strategies + VT vs VTI+VXUS
+        # portfolio comparison). Was previously never busted here, so a
+        # cached "insufficient data" / null result for a strategy could
+        # survive up to cache_ttl_seconds after the underlying data
+        # actually became available. Required for the new VT vs
+        # VTI+VXUS strategy to reliably pick up VT/VXUS data as soon as
+        # it's ingested, rather than waiting out the full cache TTL.
+        "tw:v3:strategies:",
     ):
         await cache.delete_prefix(prefix)
 
