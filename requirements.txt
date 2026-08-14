@@ -1,0 +1,15 @@
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+sqlalchemy==2.0.30
+alembic==1.13.1
+asyncpg==0.29.0           # async postgres driver
+psycopg2-binary==2.9.9    # sync driver for Alembic
+redis==5.0.4
+apscheduler==3.10.4
+pandas==2.2.2
+numpy==1.26.4
+python-dotenv==1.0.1
+pydantic-settings==2.2.1
+httpx==0.27.0
+slowapi==0.1.9            # rate limiting
+python-json-logger==2.0.7 # structured json logging

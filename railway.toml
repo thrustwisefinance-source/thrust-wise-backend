@@ -1,0 +1,21 @@
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+# Run database migrations first, then start the web server on the port Railway provides.
+# Migrations are bounded by `timeout` and non-fatal: the schema is Alembic-managed and
+# usually already current, so a hung/failed migration must not block serving —
+# /health/ready surfaces any real DB problem once the app is up.
+# NOTE: explicit `sh -c` + semicolons — Railway's start-command handling has
+# proven unreliable with compound && chains and ${VAR:-default} expansion.
+# uvicorn starts unconditionally; migrations are bounded and best-effort
+# (schema is Alembic-managed and already current; /health/ready reports any
+# real DB problem). Port 8000 matches the PORT service variable.
+#
+# --host :: (not 0.0.0.0): Railway's internal proxy/healthcheck traffic
+# runs over IPv6. Binding 0.0.0.0 is IPv4-only and unreachable from that
+# hop. Binding :: is dual-stack on Linux and covers both.
+
+startCommand = "sh -c 'uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} --log-level debug'"
+restartPolicyType = "ON_FAILURE"
