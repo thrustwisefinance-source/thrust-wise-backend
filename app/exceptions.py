@@ -5,7 +5,6 @@ ApiResponse envelope: { data: null, success: false, message: "..." }.
 Without these, FastAPI returns raw {"detail": "..."} which breaks
 the frontend's error parsing.
 """
-
 import logging
 
 from fastapi import FastAPI, HTTPException, Request
