@@ -367,3 +367,85 @@ class TestSmaTrend:
         prices = _make_series("VOO", datetime.date(2022, 1, 3), closes)
         result = strategies.compute_sma_trend(prices)
         assert len(result["chart_data"]) == strategies.CHART_LOOKBACK_DAYS
+
+
+# ---------------------------------------------------------------------------
+# Strategy 7: EVaR Risk / Position Sizing
+# ---------------------------------------------------------------------------
+
+
+class TestEvarRisk:
+    def _steady_series(self, n: int = 400, seed: int = 7) -> list:
+        """Mildly noisy random-walk-ish closes — enough variance for a
+        real (non-degenerate) return distribution, deterministic via a
+        fixed seed so the test is stable."""
+        import random
+
+        rng = random.Random(seed)
+        price = 100.0
+        closes = []
+        for _ in range(n):
+            price *= 1 + rng.gauss(0.0003, 0.01)
+            closes.append(price)
+        return _make_series("VOO", datetime.date(2022, 1, 3), closes)
+
+    def test_returns_none_with_too_few_rows(self):
+        prices = _make_series("VOO", datetime.date(2024, 1, 2), [100.0] * 50)
+        assert strategies.compute_evar_risk(prices) is None
+
+    def test_empty_prices_return_none(self):
+        assert strategies.compute_evar_risk([]) is None
+
+    def test_valid_price_history_produces_valid_result(self):
+        prices = self._steady_series()
+        result = strategies.compute_evar_risk(prices)
+
+        assert result is not None
+        assert isinstance(result["evar_percent"], float)
+        assert result["evar_percent"] >= 0.0
+        assert isinstance(result["tsallis_q"], float)
+        assert 1.0 <= result["tsallis_q"] <= strategies.EVAR_MAX_Q
+        assert result["confidence_level"] == strategies.EVAR_CONFIDENCE_LEVEL
+        assert result["tail_risk_level"] in {"Low", "Moderate", "Elevated", "High"}
+        assert result["risk_regime"] in {"Calm", "Normal", "Elevated", "Stressed"}
+        assert 0.0 <= result["tail_risk_percentile"] <= 100.0
+        assert (
+            strategies.EVAR_MIN_EXPOSURE_PERCENT
+            <= result["suggested_exposure_percent"]
+            <= strategies.EVAR_MAX_EXPOSURE_PERCENT
+        )
+        assert "chart_data" in result
+        row = result["chart_data"][-1]
+        assert set(row.keys()) == {"date", "close", "evar_percent", "tail_risk_percentile"}
+
+    def test_suggested_exposure_within_bounds_across_many_regimes(self):
+        # Sweep several noise levels and confirm exposure never leaves bounds.
+        import random
+
+        for seed in range(5):
+            rng = random.Random(seed)
+            price = 50.0
+            closes = []
+            for _ in range(350):
+                price *= 1 + rng.gauss(0.0, 0.005 + seed * 0.01)
+                closes.append(max(price, 1.0))
+            prices = _make_series("QQQ", datetime.date(2021, 6, 1), closes)
+            result = strategies.compute_evar_risk(prices)
+            if result is None:
+                continue
+            assert (
+                strategies.EVAR_MIN_EXPOSURE_PERCENT
+                <= result["suggested_exposure_percent"]
+                <= strategies.EVAR_MAX_EXPOSURE_PERCENT
+            )
+
+    def test_missing_invalid_data_does_not_crash(self):
+        prices = _make_series("VOO", datetime.date(2024, 1, 2), [])
+        assert strategies.compute_evar_risk(prices) is None
+
+        # A single zero/None-ish close shouldn't raise — log-return of 0
+        # produces -inf/NaN internally but must be handled gracefully.
+        closes = [100.0] * 30 + [0.0] + [100.0] * 200
+        prices = _make_series("VOO", datetime.date(2022, 1, 3), closes)
+        result = strategies.compute_evar_risk(prices)  # should not raise
+        assert result is None or isinstance(result["evar_percent"], float)

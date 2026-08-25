@@ -158,6 +158,69 @@ class VtVsVtiVxusStrategy(CamelModel):
     performance: list[VtVsVtiVxusPerformancePoint]
 
 
+class EvarRiskChartPoint(CamelModel):
+    date: str
+    close: float | None = None
+    evar_percent: float | None = None
+    tail_risk_percentile: float | None = None
+
+
+class EvarRiskStrategy(CamelModel):
+    """EVaR Risk / Position Sizing.
+
+    Entropic Value at Risk (EVaR), informed by Tsallis (q-exponential)
+    entropy, estimates 1-day downside tail risk with more sensitivity to
+    fat tails than a plain Gaussian VaR. This is a quantitative risk
+    signal only — it does not predict crashes and does not guarantee any
+    outcome. See services.strategies module docstring (Strategy 7) for
+    the full formula, assumptions, and parameter choices.
+    """
+
+    price: float
+    evar_percent: float
+    tsallis_q: float
+    confidence_level: float
+    lookback_days: int
+    tail_risk_percentile: float
+    tail_risk_level: str  # "Low" | "Moderate" | "Elevated" | "High"
+    risk_regime: str  # "Calm" | "Normal" | "Elevated" | "Stressed"
+    suggested_exposure_percent: float
+    chart_data: list[EvarRiskChartPoint]
+
+
+class RiskOnRiskOffChartPoint(CamelModel):
+    date: str
+    regime_score: float | None = None
+    regime_state: str | None = None  # "Risk-On" | "Risk-Off"
+    avg_rolling_volatility: float | None = None
+
+
+class RiskOnRiskOffStrategy(CamelModel):
+    """Risk-On / Risk-Off Market Regime.
+
+    Cross-asset strategy: analyzes the behavior of every ETF in the
+    Thrustwise universe together (weekly technical features, standardized,
+    compared via Dynamic Time Warping, grouped via clustering) to
+    classify the overall market regime and this ETF's role within it.
+    NOT a single-ETF technical indicator, and NOT a predictive or
+    guaranteed signal. See services.regime module docstring for the full
+    methodology and universe-size limitation.
+    """
+
+    symbol: str
+    market_regime: str  # "Risk-On" | "Risk-Off"
+    regime_score: float  # 0-100
+    etf_universe: list[str]
+    etf_regime: str  # "Risk-On" | "Risk-Off"
+    cluster: int
+    adx: float | None = None
+    rolling_volatility: float | None = None
+    downside_deviation: float | None = None
+    scaled_return_vs_spy: float | None = None
+    dtw_distance_to_market: float | None = None
+    chart_data: list[RiskOnRiskOffChartPoint]
+
+
 class StrategyAnalytics(CamelModel):
     """Top-level payload for GET /etfs/{symbol}/strategies.
 
@@ -177,3 +240,7 @@ class StrategyAnalytics(CamelModel):
     # VTI symbol's response ("VTI tile" placement) — null for every other
     # symbol. See VtVsVtiVxusStrategy docstring.
     vt_vs_vti_vxus: VtVsVtiVxusStrategy | None = None
+    # Strategy 7 (single-ETF, all symbols): EVaR Risk / Position Sizing.
+    evar_risk: EvarRiskStrategy | None = None
+    # Strategy 8 (cross-ETF, all symbols): Risk-On / Risk-Off Market Regime.
+    risk_on_risk_off: RiskOnRiskOffStrategy | None = None

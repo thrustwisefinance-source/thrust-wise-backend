@@ -12,10 +12,11 @@ import logging
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.constants import ETF_REGISTRY
 from app.database import get_db
 from app.routers.deps import load_prices, require_prices, resolve_meta
 from app.schemas import ApiResponse, StrategyAnalytics
-from app.services import cache, portfolio_comparison, strategies
+from app.services import cache, portfolio_comparison, regime, strategies
 
 logger = logging.getLogger(__name__)
 
@@ -30,31 +31,57 @@ router = APIRouter(prefix="/etfs", tags=["strategy-analytics"])
 # passed through resolve_meta.
 PORTFOLIO_COMPARISON_SYMBOL = "VTI"
 
+# Risk-On/Risk-Off is cross-ETF and expensive (pairwise DTW + clustering
+# across the whole universe), and its result doesn't depend on which
+# symbol the frontend is currently viewing. It is cached separately, once,
+# under its own key — see _load_market_regime below — rather than being
+# recomputed as part of every single symbol's /strategies request.
+MARKET_REGIME_CACHE_KEY = "tw:v1:regime:market"
+
+
+async def _load_market_regime(db: AsyncSession) -> dict | None:
+    """Load weekly price history for the whole ETF universe and run the
+    Risk-On/Risk-Off computation once. Only called on a cache miss for
+    MARKET_REGIME_CACHE_KEY (via cache.get_or_compute below), so the
+    price history is not re-downloaded and DTW/clustering does not
+    re-run on every /strategies request.
+    """
+    prices_by_symbol = {
+        registry_symbol: await load_prices(db, registry_symbol)
+        for registry_symbol in ETF_REGISTRY
+    }
+    return regime.compute_market_regime(prices_by_symbol)
+
 
 @router.get("/{symbol}/strategies", response_model=ApiResponse[StrategyAnalytics])
 async def get_strategy_analytics(symbol: str, db: AsyncSession = Depends(get_db)):
     """Indicator readouts for all technical strategies:
     EMA50+RSI Pullback, EMA8/EMA21 Pullback, MACD, Bollinger Bands,
-    Better Breakout, and SMA Trend.
+    Better Breakout, SMA Trend, and EVaR Risk / Position Sizing.
 
-    Also carries the VT vs VTI+VXUS Portfolio Comparison (a multi-ETF
-    portfolio-analytics strategy, not a technical indicator) when the
-    requested symbol is VTI — the "VTI tile" placement requested by the
-    client. It is computed from VT, VTI, and VXUS price history, not
-    just VTI's, and is null for every other symbol.
+    Also carries:
+    - The VT vs VTI+VXUS Portfolio Comparison (a multi-ETF
+      portfolio-analytics strategy, not a technical indicator) when the
+      requested symbol is VTI — the "VTI tile" placement requested by the
+      client. It is computed from VT, VTI, and VXUS price history, not
+      just VTI's, and is null for every other symbol.
+    - The Risk-On / Risk-Off Market Regime (a cross-ETF strategy — see
+      services.regime) for every symbol, computed once across the whole
+      ETF universe and cached separately (see _load_market_regime) since
+      it doesn't depend on which symbol was requested.
 
     Reuses the existing price retrieval (`load_prices`) and symbol
     validation (`resolve_meta`, `require_prices`) helpers, and follows
     the same cache-then-compute pattern as the other /etfs routes.
 
-    NOTE: bumping the cache key version (v2 -> v3) so previously cached
-    responses (which don't contain vt_vs_vti_vxus) are not served for
-    the new field; the response shape stays backward compatible either
-    way since all fields are optional.
+    NOTE: bumping the cache key version (v3 -> v4) so previously cached
+    responses (which don't contain evar_risk / risk_on_risk_off) are not
+    served for the new fields; the response shape stays backward
+    compatible either way since all fields are optional.
     """
     meta = resolve_meta(symbol)
 
-    cache_key = f"tw:v3:strategies:{meta.symbol}"
+    cache_key = f"tw:v4:strategies:{meta.symbol}"
     cached = await cache.get_json(cache_key)
     if cached is not None:
         result = cached
@@ -70,6 +97,8 @@ async def get_strategy_analytics(symbol: str, db: AsyncSession = Depends(get_db)
             "better_breakout": strategies.compute_better_breakout(prices),
             "sma_trend": strategies.compute_sma_trend(prices),
             "vt_vs_vti_vxus": None,
+            "evar_risk": strategies.compute_evar_risk(prices),
+            "risk_on_risk_off": None,
         }
 
         if meta.symbol == PORTFOLIO_COMPARISON_SYMBOL:
@@ -80,6 +109,13 @@ async def get_strategy_analytics(symbol: str, db: AsyncSession = Depends(get_db)
                 vti_prices=prices,
                 vxus_prices=vxus_prices,
             )
+
+        market_regime = await cache.get_or_compute(
+            MARKET_REGIME_CACHE_KEY, lambda: _load_market_regime(db)
+        )
+        result["risk_on_risk_off"] = regime.extract_symbol_view(
+            market_regime, meta.symbol
+        )
 
         await cache.set_json(cache_key, result)
 
@@ -93,6 +129,8 @@ async def get_strategy_analytics(symbol: str, db: AsyncSession = Depends(get_db)
         "bollinger_bands": "Bollinger Bands",
         "better_breakout": "Better Breakout",
         "sma_trend": "SMA Trend",
+        "evar_risk": "EVaR Risk",
+        "risk_on_risk_off": "Risk-On / Risk-Off Market Regime",
     }
     if meta.symbol == PORTFOLIO_COMPARISON_SYMBOL:
         strategy_labels["vt_vs_vti_vxus"] = "VT vs VTI+VXUS Portfolio Comparison"

@@ -15,6 +15,7 @@ HTTP access here, no external calls.
 
 import math
 
+import numpy as np
 import pandas as pd
 
 from app.models import DailyPrice
@@ -489,4 +490,171 @@ def compute_sma_trend(prices: list[DailyPrice]) -> dict | None:
         "death_cross": death_cross,
         "price_above_sma200": price_above_sma200,
         "chart_data": _chart_rows(df, ["close", "sma20", "sma50", "sma100", "sma200"]),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Strategy 7: EVaR Risk / Position Sizing
+#
+# Entropic Value at Risk (EVaR) generalizes Gaussian VaR to better capture
+# fat-tail / extreme-event risk, using ideas from Tsallis (q-exponential)
+# entropy: the further a return distribution's tails deviate from a normal
+# distribution, the more a naive Gaussian VaR underestimates real downside
+# risk. This is a quantitative risk-sizing signal — NOT a crash predictor
+# and NOT a guarantee of any future outcome.
+#
+# IMPLEMENTATION NOTE (read before changing constants below):
+# The source article describes the concept (Tsallis/q-exponential EVaR
+# used for dynamic position sizing) but not a fully reproducible formula.
+# There is no attempt here to replicate a specific author's TradingView
+# script. Instead this is a defensible, documented, from-first-principles
+# implementation:
+#
+#   1. Over a trailing window of daily log returns, estimate the mean (mu),
+#      standard deviation (sigma), and Fisher excess kurtosis (kappa).
+#      Kurtosis is the standard, model-free way to detect fat tails.
+#   2. Map kappa to a Tsallis entropic index q via
+#         q = 1 + kappa_clamped / (kappa_clamped + 3)
+#      This is a simple, monotonic, bounded (q in [1, ~1.8]) function we
+#      define for this purpose: q = 1 (Gaussian, no tail adjustment) when
+#      kappa <= 0, and q rises toward the bound as kappa grows. It is a
+#      practical proxy for "how much fatter than Gaussian are the tails",
+#      not a maximum-likelihood fit of a q-Gaussian distribution (that fit
+#      is numerically unstable on rolling windows of daily ETF data and is
+#      out of scope here).
+#   3. The base risk quantile uses a fixed z-score for a 95% one-sided
+#      confidence level (EVAR_CONFIDENCE_LEVEL / EVAR_Z_SCORE below), then
+#      inflates it by the q-derived tail-fatness via a linear amplification
+#      factor (EVAR_TAIL_AMPLIFICATION). This is a heuristic, not a closed-
+#      form q-Gaussian quantile — documented as such.
+#   4. EVaR is reported as a 1-day potential downside move, in percent of
+#      price, at the (tail-adjusted) confidence level.
+#   5. Risk classification and suggested exposure are both derived from
+#      where today's EVaR sits in ITS OWN trailing distribution (a
+#      percentile rank), not from a fixed universal threshold — this keeps
+#      the classification meaningful across very different ETFs (e.g. GLD
+#      vs QQQ) without hand-picking per-asset cutoffs.
+# ---------------------------------------------------------------------------
+
+# Trailing window (trading days) used to estimate the return distribution
+# (mean / stdev / kurtosis) for each day's EVaR reading.
+EVAR_RETURN_WINDOW = 252  # ~1 trading year
+EVAR_MIN_RETURN_WINDOW = 60  # allow the rolling window to warm up gradually
+
+# Trailing number of daily EVaR readings used to rank today's EVaR value
+# as a percentile (0 = lowest tail-risk day in the window, 1 = highest).
+EVAR_PERCENTILE_WINDOW = 120
+
+# Total price history required before a result is returned at all.
+MIN_ROWS_EVAR = EVAR_MIN_RETURN_WINDOW + EVAR_PERCENTILE_WINDOW  # 180 trading days
+
+EVAR_CONFIDENCE_LEVEL = 95.0  # percent, one-sided
+EVAR_Z_SCORE = 1.645  # standard normal one-sided 95% quantile
+
+# Heuristic amplification of the base Gaussian z-score as the Tsallis q
+# parameter departs from 1 (Gaussian). See module note above.
+EVAR_TAIL_AMPLIFICATION = 1.5
+EVAR_MAX_Q = 1.8
+
+# Suggested exposure is bounded — EVaR informs sizing, it never suggests
+# fully exiting a position based on a single statistical read.
+EVAR_MIN_EXPOSURE_PERCENT = 20.0
+EVAR_MAX_EXPOSURE_PERCENT = 100.0
+# suggested_exposure = MAX_EXPOSURE - EXPOSURE_SENSITIVITY * percentile
+EVAR_EXPOSURE_SENSITIVITY = 80.0
+
+
+def _evar_series(series: pd.Series) -> pd.DataFrame:
+    """Rolling EVaR (%) and its trailing percentile rank for every day
+    that has enough trailing history. Vectorized via pandas .rolling()
+    so this is cheap even over a symbol's full price history.
+    """
+    log_returns = np.log(series / series.shift(1))
+
+    roll = log_returns.rolling(
+        window=EVAR_RETURN_WINDOW, min_periods=EVAR_MIN_RETURN_WINDOW
+    )
+    mu = roll.mean()
+    sigma = roll.std()
+    kappa = roll.kurt()  # pandas .kurt() is Fisher (excess) kurtosis
+
+    kappa_clamped = kappa.clip(lower=0)
+    q = 1 + kappa_clamped / (kappa_clamped + 3)
+    q = q.clip(upper=EVAR_MAX_Q)
+
+    z_adjusted = EVAR_Z_SCORE * (1 + EVAR_TAIL_AMPLIFICATION * (q - 1))
+    evar_pct = ((z_adjusted * sigma) - mu) * 100
+    evar_pct = evar_pct.clip(lower=0)
+
+    percentile = evar_pct.rolling(
+        window=EVAR_PERCENTILE_WINDOW, min_periods=EVAR_PERCENTILE_WINDOW
+    ).rank(pct=True)
+
+    return pd.DataFrame(
+        {
+            "close": series,
+            "evar_percent": evar_pct,
+            "tsallis_q": q,
+            "tail_risk_percentile": percentile * 100,
+        }
+    )
+
+
+def _evar_classification(percentile: float) -> tuple[str, str]:
+    """(tail_risk_level, risk_regime) from a 0-100 percentile rank of
+    today's EVaR within its own trailing history."""
+    if percentile < 33:
+        return "Low", "Calm"
+    if percentile < 66:
+        return "Moderate", "Normal"
+    if percentile < 85:
+        return "Elevated", "Elevated"
+    return "High", "Stressed"
+
+
+def compute_evar_risk(prices: list[DailyPrice]) -> dict | None:
+    """EVaR Risk / Position Sizing strategy.
+
+    Returns None when there isn't enough price history for a stable
+    rolling return-distribution estimate plus a meaningful percentile
+    ranking (see MIN_ROWS_EVAR) — same "unavailable" convention as every
+    other strategy in this module. Never returns a zeroed-out result for
+    insufficient data.
+    """
+    series = to_close_series(prices)
+    if len(series) < MIN_ROWS_EVAR:
+        return None
+
+    df = _evar_series(series).dropna()
+    if df.empty:
+        return None
+
+    last = df.iloc[-1]
+    price = float(last["close"])
+    evar_pct = float(last["evar_percent"])
+    tsallis_q = float(last["tsallis_q"])
+    percentile = float(last["tail_risk_percentile"])
+
+    tail_risk_level, risk_regime = _evar_classification(percentile)
+
+    suggested_exposure = EVAR_MAX_EXPOSURE_PERCENT - EVAR_EXPOSURE_SENSITIVITY * (
+        percentile / 100
+    )
+    suggested_exposure = max(
+        EVAR_MIN_EXPOSURE_PERCENT, min(EVAR_MAX_EXPOSURE_PERCENT, suggested_exposure)
+    )
+
+    return {
+        "price": _round(price),
+        "evar_percent": _round(evar_pct),
+        "tsallis_q": _round(tsallis_q, 3),
+        "confidence_level": EVAR_CONFIDENCE_LEVEL,
+        "lookback_days": min(len(series), EVAR_RETURN_WINDOW),
+        "tail_risk_percentile": _round(percentile),
+        "tail_risk_level": tail_risk_level,
+        "risk_regime": risk_regime,
+        "suggested_exposure_percent": _round(suggested_exposure),
+        "chart_data": _chart_rows(
+            df, ["close", "evar_percent", "tail_risk_percentile"]
+        ),
     }
