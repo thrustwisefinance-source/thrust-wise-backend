@@ -15,7 +15,12 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.constants import ETF_REGISTRY, INDEX_REGISTRY, PORTFOLIO_COMPARISON_REGISTRY
+from app.constants import (
+    ETF_REGISTRY,
+    INDEX_REGISTRY,
+    PORTFOLIO_COMPARISON_REGISTRY,
+    STRATEGY_ONLY_REGISTRY,
+)
 from app.database import AsyncSessionLocal
 from app.models import DailyPrice, IngestionRun
 from app.services import cache, eodhd_client
@@ -25,9 +30,15 @@ logger = logging.getLogger(__name__)
 
 # Everything we pull daily bars for: explorable ETFs + dashboard indices +
 # portfolio-comparison-only symbols (e.g. VT, VXUS — see
-# PORTFOLIO_COMPARISON_REGISTRY docstring in app.constants).
+# PORTFOLIO_COMPARISON_REGISTRY docstring in app.constants) + strategy-only
+# symbols (e.g. TLT — see STRATEGY_ONLY_REGISTRY docstring in app.constants).
 def _all_price_sources() -> dict:
-    return {**ETF_REGISTRY, **INDEX_REGISTRY, **PORTFOLIO_COMPARISON_REGISTRY}
+    return {
+        **ETF_REGISTRY,
+        **INDEX_REGISTRY,
+        **PORTFOLIO_COMPARISON_REGISTRY,
+        **STRATEGY_ONLY_REGISTRY,
+    }
 
 
 async def ingest_symbol(session: AsyncSession, symbol: str) -> int:

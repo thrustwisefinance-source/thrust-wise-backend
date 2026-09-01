@@ -294,6 +294,32 @@ PORTFOLIO_COMPARISON_REGISTRY: dict[str, PortfolioComponentMeta] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Strategy-only price sources (same pattern as PORTFOLIO_COMPARISON_REGISTRY
+# above).
+#
+# TLT is NOT an explorable Explorer product (intentionally absent from
+# ETF_REGISTRY), so it must not appear in the ETF Explorer, /etfs/{symbol}
+# details, quote, compare, or allocation endpoints. It is needed purely as
+# a historical-price input for the "TLT Monthly Cycle" calendar strategy
+# (see services/strategies.py, compute_tlt_monthly_cycle), which is
+# surfaced on the existing Strategies section for every symbol (the same
+# way the cross-ETF Risk-On/Risk-Off strategy is), not as a standalone
+# Explorer product.
+#
+# Kept as its own lightweight registry (mirroring PORTFOLIO_COMPARISON_
+# REGISTRY) so app.services.ingestion pulls daily bars for it the same way
+# it does for every other symbol, without touching ETF_REGISTRY or any of
+# the existing technical-analysis strategies.
+# ---------------------------------------------------------------------------
+
+STRATEGY_ONLY_REGISTRY: dict[str, PortfolioComponentMeta] = {
+    "TLT": PortfolioComponentMeta(
+        symbol="TLT", name="iShares 20+ Year Treasury Bond ETF"
+    ),
+}
+
+
 ETF_EDUCATION: dict[str, str] = {
     "VOO": (
         "VOO is often recommended as a core portfolio holding. By owning it "

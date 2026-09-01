@@ -38,6 +38,18 @@ PORTFOLIO_COMPARISON_SYMBOL = "VTI"
 # recomputed as part of every single symbol's /strategies request.
 MARKET_REGIME_CACHE_KEY = "tw:v1:regime:market"
 
+# TLT Monthly Cycle is calendar-based off TLT's own price history, not the
+# symbol currently being viewed — cross-cutting like Risk-On/Risk-Off, so
+# it's computed once and cached separately rather than recomputed per
+# symbol. See app.constants.STRATEGY_ONLY_REGISTRY.
+TLT_MONTHLY_CYCLE_CACHE_KEY = "tw:v1:strategy:tlt_monthly_cycle"
+TLT_SYMBOL = "TLT"
+
+
+async def _load_tlt_monthly_cycle(db: AsyncSession) -> dict | None:
+    tlt_prices = await load_prices(db, TLT_SYMBOL)
+    return strategies.compute_tlt_monthly_cycle(tlt_prices)
+
 
 async def _load_market_regime(db: AsyncSession) -> dict | None:
     """Load weekly price history for the whole ETF universe and run the
@@ -57,7 +69,8 @@ async def _load_market_regime(db: AsyncSession) -> dict | None:
 async def get_strategy_analytics(symbol: str, db: AsyncSession = Depends(get_db)):
     """Indicator readouts for all technical strategies:
     EMA50+RSI Pullback, EMA8/EMA21 Pullback, MACD, Bollinger Bands,
-    Better Breakout, SMA Trend, and EVaR Risk / Position Sizing.
+    Better Breakout, SMA Trend, Triple-MA Pullback, and EVaR Risk /
+    Position Sizing.
 
     Also carries:
     - The VT vs VTI+VXUS Portfolio Comparison (a multi-ETF
@@ -69,19 +82,24 @@ async def get_strategy_analytics(symbol: str, db: AsyncSession = Depends(get_db)
       services.regime) for every symbol, computed once across the whole
       ETF universe and cached separately (see _load_market_regime) since
       it doesn't depend on which symbol was requested.
+    - The TLT Monthly Cycle (a calendar-based strategy — see
+      services.strategies) for every symbol, computed once from TLT's own
+      price history and cached separately (see _load_tlt_monthly_cycle)
+      since it doesn't depend on which symbol was requested, same
+      treatment as Risk-On/Risk-Off above.
 
     Reuses the existing price retrieval (`load_prices`) and symbol
     validation (`resolve_meta`, `require_prices`) helpers, and follows
     the same cache-then-compute pattern as the other /etfs routes.
 
-    NOTE: bumping the cache key version (v3 -> v4) so previously cached
-    responses (which don't contain evar_risk / risk_on_risk_off) are not
-    served for the new fields; the response shape stays backward
+    NOTE: bumping the cache key version (v4 -> v5) so previously cached
+    responses (which don't contain triple_ma_pullback / tlt_monthly_cycle)
+    are not served for the new fields; the response shape stays backward
     compatible either way since all fields are optional.
     """
     meta = resolve_meta(symbol)
 
-    cache_key = f"tw:v4:strategies:{meta.symbol}"
+    cache_key = f"tw:v5:strategies:{meta.symbol}"
     cached = await cache.get_json(cache_key)
     if cached is not None:
         result = cached
@@ -99,6 +117,8 @@ async def get_strategy_analytics(symbol: str, db: AsyncSession = Depends(get_db)
             "vt_vs_vti_vxus": None,
             "evar_risk": strategies.compute_evar_risk(prices),
             "risk_on_risk_off": None,
+            "triple_ma_pullback": strategies.compute_triple_ma_pullback(prices),
+            "tlt_monthly_cycle": None,
         }
 
         if meta.symbol == PORTFOLIO_COMPARISON_SYMBOL:
@@ -117,6 +137,10 @@ async def get_strategy_analytics(symbol: str, db: AsyncSession = Depends(get_db)
             market_regime, meta.symbol
         )
 
+        result["tlt_monthly_cycle"] = await cache.get_or_compute(
+            TLT_MONTHLY_CYCLE_CACHE_KEY, lambda: _load_tlt_monthly_cycle(db)
+        )
+
         await cache.set_json(cache_key, result)
 
     # Insufficient history is not an error — surface it as an informational
@@ -131,6 +155,8 @@ async def get_strategy_analytics(symbol: str, db: AsyncSession = Depends(get_db)
         "sma_trend": "SMA Trend",
         "evar_risk": "EVaR Risk",
         "risk_on_risk_off": "Risk-On / Risk-Off Market Regime",
+        "triple_ma_pullback": "Triple-MA Pullback",
+        "tlt_monthly_cycle": "TLT Monthly Cycle",
     }
     if meta.symbol == PORTFOLIO_COMPARISON_SYMBOL:
         strategy_labels["vt_vs_vti_vxus"] = "VT vs VTI+VXUS Portfolio Comparison"

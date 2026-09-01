@@ -449,3 +449,154 @@ class TestEvarRisk:
         prices = _make_series("VOO", datetime.date(2022, 1, 3), closes)
         result = strategies.compute_evar_risk(prices)  # should not raise
         assert result is None or isinstance(result["evar_percent"], float)
+
+
+def _make_price_with_range(
+    symbol: str, date: datetime.date, close: float, day_range: float = 1.0
+) -> MagicMock:
+    """Like _make_price, but with a non-zero high/low range so ATR is
+    non-zero (needed for Triple-MA Pullback tests)."""
+    p = MagicMock()
+    p.symbol = symbol
+    p.date = date
+    p.close = close
+    p.open = close
+    p.high = close + day_range
+    p.low = close - day_range
+    p.adjusted_close = close
+    p.volume = 1_000_000
+    return p
+
+
+def _make_ohlc_series(
+    symbol: str, start: datetime.date, closes: list[float], day_range: float = 1.0
+) -> list[MagicMock]:
+    result = []
+    current = start
+    for close in closes:
+        while current.weekday() >= 5:
+            current += datetime.timedelta(days=1)
+        result.append(_make_price_with_range(symbol, current, close, day_range))
+        current += datetime.timedelta(days=1)
+    return result
+
+
+class TestTripleMaPullback:
+    def _sufficient_uptrend(self, dip: float = 0.0) -> list[MagicMock]:
+        closes = [100.0 + i * 0.3 for i in range(150)]
+        if dip:
+            closes[-1] = closes[-2] - dip
+        return _make_ohlc_series("QQQ", datetime.date(2023, 1, 2), closes)
+
+    def test_returns_none_with_too_few_rows(self):
+        prices = _make_ohlc_series("QQQ", datetime.date(2024, 1, 2), [100.0] * 20)
+        assert strategies.compute_triple_ma_pullback(prices) is None
+
+    def test_empty_prices_return_none(self):
+        assert strategies.compute_triple_ma_pullback([]) is None
+
+    def test_confirmed_uptrend_no_pullback(self):
+        prices = self._sufficient_uptrend()
+        result = strategies.compute_triple_ma_pullback(prices)
+
+        assert result is not None
+        assert result["trend"] == "Uptrend"
+        assert result["uptrend_confirmed"] is True
+        assert result["ma1"] > result["ma2"] > result["ma3"]
+        assert result["price"] > result["ma3"]
+        assert result["pullback_active"] is False
+        assert result["current_signal"] == "Uptrend — No Pullback"
+        assert "chart_data" in result
+        row = result["chart_data"][-1]
+        assert set(row.keys()) == {
+            "date",
+            "close",
+            "ma1",
+            "ma2",
+            "ma3",
+            "entry_level",
+            "exit_level",
+        }
+
+    def test_pullback_entry_zone_detected(self):
+        # A sharp one-day drop pulls price below the 5-day-mean/ATR entry
+        # level while the longer nested MAs still confirm the uptrend.
+        prices = self._sufficient_uptrend(dip=5.0)
+        result = strategies.compute_triple_ma_pullback(prices)
+
+        assert result is not None
+        assert result["uptrend_confirmed"] is True
+        assert result["price"] < result["entry_level"]
+        assert result["pullback_active"] is True
+        assert result["current_signal"] == "Pullback Entry Zone"
+
+    def test_no_confirmed_uptrend_in_downtrend(self):
+        closes = [200.0 - i * 0.3 for i in range(150)]
+        prices = _make_ohlc_series("QQQ", datetime.date(2023, 1, 2), closes)
+        result = strategies.compute_triple_ma_pullback(prices)
+
+        assert result is not None
+        assert result["uptrend_confirmed"] is False
+        assert result["trend"] == "No Confirmed Uptrend"
+        assert result["pullback_active"] is False
+        assert result["current_signal"] == "No Confirmed Uptrend"
+
+
+class TestTltMonthlyCycle:
+    def _prices_ending_on(self, end_date: datetime.date) -> list[MagicMock]:
+        prices = _make_ohlc_series("TLT", datetime.date(2025, 1, 2), [90.0] * 400)
+        prices.append(_make_price_with_range("TLT", end_date, 90.5))
+        return prices
+
+    def test_returns_none_with_too_few_rows(self):
+        prices = _make_ohlc_series("TLT", datetime.date(2026, 9, 1), [90.0] * 3)
+        assert strategies.compute_tlt_monthly_cycle(prices) is None
+
+    def test_empty_prices_return_none(self):
+        assert strategies.compute_tlt_monthly_cycle([]) is None
+
+    def test_short_window_at_start_of_month(self):
+        prices = self._prices_ending_on(datetime.date(2026, 9, 1))
+        result = strategies.compute_tlt_monthly_cycle(prices)
+
+        assert result is not None
+        assert result["current_position"] == "Short"
+        assert result["current_phase"] == "Short Window (Start of Month)"
+        assert result["month"] == "2026-09"
+        assert result["next_expected_action"] == "Exit Short"
+
+    def test_flat_mid_month(self):
+        prices = self._prices_ending_on(datetime.date(2026, 9, 15))
+        result = strategies.compute_tlt_monthly_cycle(prices)
+
+        assert result is not None
+        assert result["current_position"] == "Flat"
+        assert result["current_phase"] == "Mid-Month (No Position)"
+        assert result["next_expected_action"] == "Enter Long"
+
+    def test_long_window_near_month_end(self):
+        prices = self._prices_ending_on(datetime.date(2026, 9, 29))
+        result = strategies.compute_tlt_monthly_cycle(prices)
+
+        assert result is not None
+        assert result["current_position"] == "Long"
+        assert result["current_phase"] == "Long Window (End of Month)"
+        assert result["next_expected_action"] == "Exit Long"
+
+    def test_calendar_dates_are_well_formed(self):
+        prices = self._prices_ending_on(datetime.date(2026, 9, 1))
+        result = strategies.compute_tlt_monthly_cycle(prices)
+
+        assert result is not None
+        for key in (
+            "short_entry_date",
+            "short_exit_date",
+            "long_entry_date",
+            "long_exit_date",
+            "next_expected_date",
+        ):
+            # Should parse as ISO dates without raising.
+            datetime.date.fromisoformat(result[key])
+        assert result["short_entry_date"] <= result["short_exit_date"]
+        assert result["long_entry_date"] <= result["long_exit_date"]
+        assert result["short_exit_date"] < result["long_entry_date"]

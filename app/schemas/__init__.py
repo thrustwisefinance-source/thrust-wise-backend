@@ -27,6 +27,10 @@ from app.schemas.strategy import (
     RiskOnRiskOffStrategy,
     SmaTrendStrategy,
     StrategyAnalytics,
+    TltMonthlyCycleChartPoint,
+    TltMonthlyCycleStrategy,
+    TripleMaPullbackChartPoint,
+    TripleMaPullbackStrategy,
     VtVsVtiVxusPerformancePoint,
     VtVsVtiVxusStrategy,
 )
@@ -60,6 +64,10 @@ __all__ = [
     "RiskOnRiskOffStrategy",
     "SmaTrendStrategy",
     "StrategyAnalytics",
+    "TltMonthlyCycleChartPoint",
+    "TltMonthlyCycleStrategy",
+    "TripleMaPullbackChartPoint",
+    "TripleMaPullbackStrategy",
     "VtVsVtiVxusPerformancePoint",
     "VtVsVtiVxusStrategy",
 ]

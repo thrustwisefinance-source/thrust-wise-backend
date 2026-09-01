@@ -221,6 +221,75 @@ class RiskOnRiskOffStrategy(CamelModel):
     chart_data: list[RiskOnRiskOffChartPoint]
 
 
+class TripleMaPullbackChartPoint(CamelModel):
+    date: str
+    close: float | None = None
+    ma1: float | None = None
+    ma2: float | None = None
+    ma3: float | None = None
+    entry_level: float | None = None
+    exit_level: float | None = None
+
+
+class TripleMaPullbackStrategy(CamelModel):
+    """Triple-MA Pullback.
+
+    Trend-confirmed mean-reversion strategy: an uptrend is confirmed via
+    three nested SMAs (MA1 = SMA(close), MA2 = SMA(MA1), MA3 = SMA(MA2),
+    with MA1 > MA2 > MA3 and close > MA3), then ATR(14)-based zones around
+    the 5-day mean define a pullback entry level and an exit level. See
+    services.strategies module docstring (Strategy 8) for the full
+    formula and the documented period assumption.
+    """
+
+    price: float
+    ma1: float
+    ma2: float
+    ma3: float
+    mean5: float
+    atr14: float
+    entry_level: float
+    exit_level: float
+    trend: str  # "Uptrend" | "No Confirmed Uptrend"
+    uptrend_confirmed: bool
+    pullback_active: bool
+    exit_zone_active: bool
+    current_signal: str
+    chart_data: list[TripleMaPullbackChartPoint]
+
+
+class TltMonthlyCycleChartPoint(CamelModel):
+    date: str
+    close: float | None = None
+
+
+class TltMonthlyCycleStrategy(CamelModel):
+    """TLT Monthly Cycle.
+
+    Calendar-based strategy that uses recurring monthly timing patterns
+    (short near the start of the month, long shortly before month-end)
+    rather than technical indicators. Computed from TLT's own price
+    history — independent of whichever symbol's page is being viewed,
+    same as Risk-On/Risk-Off is cross-ETF and shown on every symbol's
+    response. Trading-day-of-month windows are approximated using
+    business days (Mon-Fri); no exchange-holiday calendar is available,
+    so dates near holidays may be off by a day. See services.strategies
+    module docstring (Strategy 9) for the documented window assumptions.
+    """
+
+    price: float
+    month: str  # "YYYY-MM"
+    current_phase: str
+    current_position: str  # "Short" | "Long" | "Flat"
+    short_entry_date: str
+    short_exit_date: str
+    long_entry_date: str
+    long_exit_date: str
+    next_expected_action: str
+    next_expected_date: str
+    chart_data: list[TltMonthlyCycleChartPoint]
+
+
 class StrategyAnalytics(CamelModel):
     """Top-level payload for GET /etfs/{symbol}/strategies.
 
@@ -244,3 +313,8 @@ class StrategyAnalytics(CamelModel):
     evar_risk: EvarRiskStrategy | None = None
     # Strategy 8 (cross-ETF, all symbols): Risk-On / Risk-Off Market Regime.
     risk_on_risk_off: RiskOnRiskOffStrategy | None = None
+    # Strategy 9 (single-ETF, all symbols): Triple-MA Pullback.
+    triple_ma_pullback: TripleMaPullbackStrategy | None = None
+    # Strategy 10 (TLT's own data, all symbols — like Risk-On/Risk-Off):
+    # TLT Monthly Cycle (calendar-based, not a technical indicator).
+    tlt_monthly_cycle: TltMonthlyCycleStrategy | None = None

@@ -13,6 +13,7 @@ already loaded from the database (see routers.deps.load_prices), no DB or
 HTTP access here, no external calls.
 """
 
+import datetime
 import math
 
 import numpy as np
@@ -53,6 +54,38 @@ MIN_ROWS_BETTER_BREAKOUT = BETTER_BREAKOUT_SMA_PERIOD + BETTER_BREAKOUT_OFFSET_L
 
 SMA_TREND_PERIODS = (20, 50, 100, 200)
 MIN_ROWS_SMA_TREND = max(SMA_TREND_PERIODS) + 10
+
+# Triple-MA Pullback: MA1 = SMA(close), MA2 = SMA(MA1), MA3 = SMA(MA2), all
+# using the same period ("nested" moving averages). The reference material
+# describes the nesting mechanism but does not specify a period, so 20 is
+# used here as the documented default (a standard trend-length lookback
+# consistent with the other SMA-based strategies in this module, e.g. the
+# 20/50/100/200 set used by SMA Trend above). ATR uses the conventional
+# Wilder-smoothed 14-period True Range.
+TRIPLE_MA_PERIOD = 20
+TRIPLE_MA_MEAN_PERIOD = 5
+TRIPLE_MA_ATR_PERIOD = 14
+TRIPLE_MA_ENTRY_ATR_MULTIPLIER = 1.0
+TRIPLE_MA_EXIT_ATR_MULTIPLIER = 0.5
+# MA3 needs MA2 to have warmed up, which needs MA1 to have warmed up first
+# (SMA-of-SMA-of-SMA), i.e. ~3x the period before MA3 is stable, plus ATR's
+# own warm-up and a small buffer.
+MIN_ROWS_TRIPLE_MA = 3 * TRIPLE_MA_PERIOD + TRIPLE_MA_ATR_PERIOD + 10
+
+# TLT Monthly Cycle: calendar/seasonality strategy, not indicator-based.
+# Trading-day-of-month windows (business days, i.e. weekdays only — this is
+# an approximation since no market-holiday calendar is available; see
+# compute_tlt_monthly_cycle docstring for the limitation). Values are
+# documented, configurable defaults implementing the described pattern
+# ("short near month start, held a few days; long shortly before month end,
+# exited around month end") — they are not backtested/optimized figures
+# from the reference material, since no such figures were supplied.
+TLT_SHORT_HOLD_TRADING_DAYS = 3  # short position open on trading days 1..3
+TLT_LONG_WINDOW_TRADING_DAYS = 5  # long position open for the last 5 trading days
+# Minimum history required: this strategy only needs the most recent price
+# point (for the "current price" readout) plus enough days to safely
+# resolve a calendar month — a small, fixed floor is sufficient.
+MIN_ROWS_TLT_MONTHLY_CYCLE = 5
 
 
 def _round(value: float | None, digits: int = 2) -> float | None:
@@ -657,4 +690,241 @@ def compute_evar_risk(prices: list[DailyPrice]) -> dict | None:
         "chart_data": _chart_rows(
             df, ["close", "evar_percent", "tail_risk_percentile"]
         ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Strategy 8: Triple-MA Pullback
+#
+# Trend-following + mean-reversion strategy:
+#   1. Confirm an uptrend via three nested SMAs: MA1 = SMA(close), MA2 =
+#      SMA(MA1), MA3 = SMA(MA2). Uptrend is confirmed when MA1 > MA2 > MA3
+#      and close > MA3.
+#   2. Only once an uptrend is confirmed, look for a pullback: the 5-day
+#      mean (SMA5 of close) and ATR(14) define an entry zone at
+#      mean - 1.0*ATR and an exit zone at mean + 0.5*ATR.
+#
+# Same "analytical only" convention as every other strategy in this
+# module: booleans/status strings describe conditions (uptrend confirmed,
+# pullback zone reached, exit zone reached) — this is not a buy/sell
+# recommendation.
+# ---------------------------------------------------------------------------
+
+
+def _atr(frame: pd.DataFrame, period: int = TRIPLE_MA_ATR_PERIOD) -> pd.Series:
+    """Wilder-smoothed Average True Range from a high/low/close frame."""
+    prev_close = frame["close"].shift(1)
+    true_range = pd.concat(
+        [
+            frame["high"] - frame["low"],
+            (frame["high"] - prev_close).abs(),
+            (frame["low"] - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    return true_range.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+
+
+def compute_triple_ma_pullback(prices: list[DailyPrice]) -> dict | None:
+    """Returns None when there isn't enough price history for a stable
+    triple-nested-SMA / ATR(14) reading — same "unavailable" convention as
+    every other strategy in this module."""
+    frame = to_ohlc_frame(prices)
+    if len(frame) < MIN_ROWS_TRIPLE_MA:
+        return None
+
+    close = frame["close"]
+    ma1 = close.rolling(window=TRIPLE_MA_PERIOD).mean()
+    ma2 = ma1.rolling(window=TRIPLE_MA_PERIOD).mean()
+    ma3 = ma2.rolling(window=TRIPLE_MA_PERIOD).mean()
+    mean5 = close.rolling(window=TRIPLE_MA_MEAN_PERIOD).mean()
+    atr14 = _atr(frame, TRIPLE_MA_ATR_PERIOD)
+
+    entry_level = mean5 - TRIPLE_MA_ENTRY_ATR_MULTIPLIER * atr14
+    exit_level = mean5 + TRIPLE_MA_EXIT_ATR_MULTIPLIER * atr14
+
+    df = pd.DataFrame(
+        {
+            "close": close,
+            "ma1": ma1,
+            "ma2": ma2,
+            "ma3": ma3,
+            "mean5": mean5,
+            "atr14": atr14,
+            "entry_level": entry_level,
+            "exit_level": exit_level,
+        }
+    ).dropna()
+    if df.empty:
+        return None
+
+    last = df.iloc[-1]
+    price = float(last["close"])
+    ma1_val = float(last["ma1"])
+    ma2_val = float(last["ma2"])
+    ma3_val = float(last["ma3"])
+    mean5_val = float(last["mean5"])
+    atr14_val = float(last["atr14"])
+    entry_level_val = float(last["entry_level"])
+    exit_level_val = float(last["exit_level"])
+
+    uptrend_confirmed = ma1_val > ma2_val and ma2_val > ma3_val and price > ma3_val
+    trend = "Uptrend" if uptrend_confirmed else "No Confirmed Uptrend"
+
+    pullback_active = uptrend_confirmed and price < entry_level_val
+    exit_zone_active = price > exit_level_val
+
+    if pullback_active:
+        current_signal = "Pullback Entry Zone"
+    elif uptrend_confirmed and exit_zone_active:
+        current_signal = "Uptrend — Exit Zone"
+    elif uptrend_confirmed:
+        current_signal = "Uptrend — No Pullback"
+    else:
+        current_signal = "No Confirmed Uptrend"
+
+    return {
+        "price": _round(price),
+        "ma1": _round(ma1_val),
+        "ma2": _round(ma2_val),
+        "ma3": _round(ma3_val),
+        "mean5": _round(mean5_val),
+        "atr14": _round(atr14_val),
+        "entry_level": _round(entry_level_val),
+        "exit_level": _round(exit_level_val),
+        "trend": trend,
+        "uptrend_confirmed": uptrend_confirmed,
+        "pullback_active": pullback_active,
+        "exit_zone_active": exit_zone_active,
+        "current_signal": current_signal,
+        "chart_data": _chart_rows(
+            df, ["close", "ma1", "ma2", "ma3", "entry_level", "exit_level"]
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Strategy 9: TLT Monthly Cycle
+#
+# Calendar/seasonality strategy — NOT indicator-based (no EMA, RSI, MACD,
+# Bollinger, or moving averages are used here). The described cycle:
+#   - Short near the start of the month, exit the short after a few
+#     trading days.
+#   - Go long shortly before month-end, exit the long around month-end.
+#   - Repeat monthly.
+#
+# Trading-day-of-month position is approximated using business days
+# (Mon-Fri) within the calendar month of the most recent available price,
+# since no exchange-holiday calendar is available in this codebase — see
+# the "limitations" note in the response docstring (schemas.strategy).
+# This is a descriptive calendar readout only (current phase / position /
+# key dates), not a buy/sell recommendation, matching every other strategy
+# in this module.
+# ---------------------------------------------------------------------------
+
+
+def _business_days_of_month(year: int, month: int) -> pd.DatetimeIndex:
+    start = pd.Timestamp(year=year, month=month, day=1)
+    end = start + pd.offsets.MonthEnd(0)
+    return pd.bdate_range(start=start, end=end)
+
+
+def _tlt_cycle_dates(bdays: pd.DatetimeIndex) -> dict[str, datetime.date]:
+    num_days = len(bdays)
+    short_entry_idx = 1
+    short_exit_idx = min(TLT_SHORT_HOLD_TRADING_DAYS, num_days)
+    long_entry_idx = max(num_days - TLT_LONG_WINDOW_TRADING_DAYS + 1, short_exit_idx + 1)
+    long_entry_idx = min(long_entry_idx, num_days)
+    long_exit_idx = num_days
+
+    return {
+        "short_entry_date": bdays[short_entry_idx - 1].date(),
+        "short_exit_date": bdays[short_exit_idx - 1].date(),
+        "long_entry_date": bdays[long_entry_idx - 1].date(),
+        "long_exit_date": bdays[long_exit_idx - 1].date(),
+    }
+
+
+def compute_tlt_monthly_cycle(prices: list[DailyPrice]) -> dict | None:
+    """Returns None when there's no TLT price history yet — same
+    "unavailable" convention as every other strategy in this module.
+
+    `prices` is TLT's own daily-bar history (loaded the same way VT/VXUS
+    are loaded directly by symbol for the VT-vs-VTI+VXUS strategy — see
+    routers/strategy.py), independent of whichever symbol's page the
+    caller is viewing.
+    """
+    series = to_close_series(prices)
+    if len(series) < MIN_ROWS_TLT_MONTHLY_CYCLE:
+        return None
+
+    last_date = series.index[-1].date()
+    price = float(series.iloc[-1])
+
+    this_month_bdays = _business_days_of_month(last_date.year, last_date.month)
+    this_month_dates = _tlt_cycle_dates(this_month_bdays)
+
+    # 1-based trading-day-of-month index for the most recent price date.
+    day_positions = np.searchsorted(this_month_bdays.date, last_date)
+    today_idx = int(day_positions) + 1
+    num_days = len(this_month_bdays)
+
+    short_entry_idx = 1
+    short_exit_idx = min(TLT_SHORT_HOLD_TRADING_DAYS, num_days)
+    long_entry_idx = max(
+        num_days - TLT_LONG_WINDOW_TRADING_DAYS + 1, short_exit_idx + 1
+    )
+    long_entry_idx = min(long_entry_idx, num_days)
+    long_exit_idx = num_days
+
+    if today_idx <= short_exit_idx:
+        current_position = "Short" if today_idx >= short_entry_idx else "Flat"
+        current_phase = "Short Window (Start of Month)"
+    elif today_idx < long_entry_idx:
+        current_position = "Flat"
+        current_phase = "Mid-Month (No Position)"
+    elif today_idx <= long_exit_idx:
+        current_position = "Long"
+        current_phase = "Long Window (End of Month)"
+    else:
+        current_position = "Flat"
+        current_phase = "Post Long-Exit (No Position)"
+
+    # Next expected action/date: the next upcoming key date strictly after
+    # today, rolling into next month once this month's cycle is done.
+    events = [
+        (short_entry_idx, "Enter Short", this_month_dates["short_entry_date"]),
+        (short_exit_idx, "Exit Short", this_month_dates["short_exit_date"]),
+        (long_entry_idx, "Enter Long", this_month_dates["long_entry_date"]),
+        (long_exit_idx, "Exit Long", this_month_dates["long_exit_date"]),
+    ]
+    upcoming = [e for e in events if e[0] > today_idx]
+    if upcoming:
+        _, next_action, next_date = min(upcoming, key=lambda e: e[0])
+    else:
+        next_month = last_date.month + 1
+        next_year = last_date.year
+        if next_month > 12:
+            next_month = 1
+            next_year += 1
+        next_month_dates = _tlt_cycle_dates(
+            _business_days_of_month(next_year, next_month)
+        )
+        next_action = "Enter Short"
+        next_date = next_month_dates["short_entry_date"]
+
+    df = pd.DataFrame({"close": series}).dropna()
+
+    return {
+        "price": _round(price),
+        "month": last_date.strftime("%Y-%m"),
+        "current_phase": current_phase,
+        "current_position": current_position,
+        "short_entry_date": this_month_dates["short_entry_date"].isoformat(),
+        "short_exit_date": this_month_dates["short_exit_date"].isoformat(),
+        "long_entry_date": this_month_dates["long_entry_date"].isoformat(),
+        "long_exit_date": this_month_dates["long_exit_date"].isoformat(),
+        "next_expected_action": next_action,
+        "next_expected_date": next_date.isoformat(),
+        "chart_data": _chart_rows(df, ["close"]),
     }
