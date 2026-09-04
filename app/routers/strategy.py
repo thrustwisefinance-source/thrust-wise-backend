@@ -45,10 +45,31 @@ MARKET_REGIME_CACHE_KEY = "tw:v1:regime:market"
 TLT_MONTHLY_CYCLE_CACHE_KEY = "tw:v1:strategy:tlt_monthly_cycle"
 TLT_SYMBOL = "TLT"
 
+# TQQQ / TMF / IEF Rebalancing is a multi-ETF portfolio-allocation strategy,
+# not tied to whichever symbol's page the caller is viewing — same
+# cross-cutting treatment as TLT Monthly Cycle and Risk-On/Risk-Off above:
+# computed once from TQQQ/TMF/IEF's own price history and cached
+# separately rather than recomputed per symbol. See
+# app.constants.STRATEGY_ONLY_REGISTRY and
+# services.strategies.compute_tqqq_tmf_ief_rebalancing (Strategy 11).
+TQQQ_TMF_IEF_CACHE_KEY = "tw:v1:strategy:tqqq_tmf_ief_rebalancing"
+TQQQ_SYMBOL = "TQQQ"
+TMF_SYMBOL = "TMF"
+IEF_SYMBOL = "IEF"
+
 
 async def _load_tlt_monthly_cycle(db: AsyncSession) -> dict | None:
     tlt_prices = await load_prices(db, TLT_SYMBOL)
     return strategies.compute_tlt_monthly_cycle(tlt_prices)
+
+
+async def _load_tqqq_tmf_ief_rebalancing(db: AsyncSession) -> dict | None:
+    tqqq_prices = await load_prices(db, TQQQ_SYMBOL)
+    tmf_prices = await load_prices(db, TMF_SYMBOL)
+    ief_prices = await load_prices(db, IEF_SYMBOL)
+    return strategies.compute_tqqq_tmf_ief_rebalancing(
+        tqqq_prices=tqqq_prices, tmf_prices=tmf_prices, ief_prices=ief_prices
+    )
 
 
 async def _load_market_regime(db: AsyncSession) -> dict | None:
@@ -87,19 +108,25 @@ async def get_strategy_analytics(symbol: str, db: AsyncSession = Depends(get_db)
       price history and cached separately (see _load_tlt_monthly_cycle)
       since it doesn't depend on which symbol was requested, same
       treatment as Risk-On/Risk-Off above.
+    - The TQQQ / TMF / IEF Rebalancing strategy (a multi-ETF portfolio-
+      allocation and crash-defense strategy — see services.strategies
+      Strategy 11) for every symbol, computed once from TQQQ/TMF/IEF's
+      own price history and cached separately (see
+      _load_tqqq_tmf_ief_rebalancing), same cross-cutting treatment as
+      TLT Monthly Cycle and Risk-On/Risk-Off above.
 
     Reuses the existing price retrieval (`load_prices`) and symbol
     validation (`resolve_meta`, `require_prices`) helpers, and follows
     the same cache-then-compute pattern as the other /etfs routes.
 
-    NOTE: bumping the cache key version (v4 -> v5) so previously cached
-    responses (which don't contain triple_ma_pullback / tlt_monthly_cycle)
-    are not served for the new fields; the response shape stays backward
+    NOTE: bumping the cache key version (v5 -> v6) so previously cached
+    responses (which don't contain tqqq_tmf_ief_rebalancing) are not
+    served for the new field; the response shape stays backward
     compatible either way since all fields are optional.
     """
     meta = resolve_meta(symbol)
 
-    cache_key = f"tw:v5:strategies:{meta.symbol}"
+    cache_key = f"tw:v6:strategies:{meta.symbol}"
     cached = await cache.get_json(cache_key)
     if cached is not None:
         result = cached
@@ -119,6 +146,7 @@ async def get_strategy_analytics(symbol: str, db: AsyncSession = Depends(get_db)
             "risk_on_risk_off": None,
             "triple_ma_pullback": strategies.compute_triple_ma_pullback(prices),
             "tlt_monthly_cycle": None,
+            "tqqq_tmf_ief_rebalancing": None,
         }
 
         if meta.symbol == PORTFOLIO_COMPARISON_SYMBOL:
@@ -141,6 +169,10 @@ async def get_strategy_analytics(symbol: str, db: AsyncSession = Depends(get_db)
             TLT_MONTHLY_CYCLE_CACHE_KEY, lambda: _load_tlt_monthly_cycle(db)
         )
 
+        result["tqqq_tmf_ief_rebalancing"] = await cache.get_or_compute(
+            TQQQ_TMF_IEF_CACHE_KEY, lambda: _load_tqqq_tmf_ief_rebalancing(db)
+        )
+
         await cache.set_json(cache_key, result)
 
     # Insufficient history is not an error — surface it as an informational
@@ -157,6 +189,7 @@ async def get_strategy_analytics(symbol: str, db: AsyncSession = Depends(get_db)
         "risk_on_risk_off": "Risk-On / Risk-Off Market Regime",
         "triple_ma_pullback": "Triple-MA Pullback",
         "tlt_monthly_cycle": "TLT Monthly Cycle",
+        "tqqq_tmf_ief_rebalancing": "TQQQ / TMF / IEF Rebalancing",
     }
     if meta.symbol == PORTFOLIO_COMPARISON_SYMBOL:
         strategy_labels["vt_vs_vti_vxus"] = "VT vs VTI+VXUS Portfolio Comparison"

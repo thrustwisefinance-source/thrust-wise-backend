@@ -928,3 +928,431 @@ def compute_tlt_monthly_cycle(prices: list[DailyPrice]) -> dict | None:
         "next_expected_date": next_date.isoformat(),
         "chart_data": _chart_rows(df, ["close"]),
     }
+
+
+# ---------------------------------------------------------------------------
+# Strategy 11: TQQQ / TMF / IEF Rebalancing
+#
+# Multi-ETF portfolio-allocation and crash-defense strategy — conceptually
+# closer to services/portfolio_comparison.py (which grows a hypothetical
+# $-investment across a portfolio built from several underlying ETFs) than
+# to the single-symbol technical indicators above, but implemented here
+# alongside every other pre-defined strategy for consistency, following
+# the exact same "pure function over list[DailyPrice], returns None when
+# there isn't enough history" convention as Strategy 9 (TLT Monthly
+# Cycle) just above.
+#
+# Unlike the buy-and-hold VT vs VTI+VXUS comparison, this strategy is
+# path-dependent (it rebalances periodically and switches allocations
+# based on a crash filter), so it is simulated day-by-day over the full
+# joined price history rather than computed as a single vectorized
+# snapshot. Every decision at day t only ever looks at prices up to and
+# including day t — no future price is used to decide the current day's
+# state (no look-ahead bias).
+#
+# STATE MACHINE
+# --------------
+# NORMAL (50% TQQQ / 50% TMF):
+#   - Rebalanced back to 50/50 on the last available trading day of every
+#     second calendar month.
+#   - Monitored daily for the crash filter.
+#
+# Crash filter (NORMAL -> DEFENSIVE): if TQQQ's close-to-close return on
+# a single trading day is <= TQQQ_TMF_IEF_CRASH_THRESHOLD_PERCENT, exit
+# TQQQ and TMF entirely and move 100% into IEF. The TQQQ close from the
+# trading day *before* the crash is stored as the pre-crash reference
+# price.
+#
+# DEFENSIVE (100% IEF): held until TQQQ's close exceeds the stored
+# pre-crash reference price (not a moving average, not a fixed recovery
+# percentage — literally the pre-crash price). On recovery, the portfolio
+# returns to 50% TQQQ / 50% TMF and a fresh two-month rebalancing cycle
+# begins from the recovery date.
+#
+# This is a research/backtesting framework, not investment advice. TQQQ
+# and TMF are 3x leveraged ETFs and carry substantial risk; the crash
+# filter reduces exposure after a large single-day decline but does not
+# guarantee protection from losses. See TQQQ_TMF_IEF_DISCLAIMER below.
+# ---------------------------------------------------------------------------
+
+TQQQ_TMF_IEF_STRATEGY_KEY = "tqqq_tmf_ief_rebalancing"
+
+TQQQ_TMF_IEF_NORMAL_TQQQ_WEIGHT = 0.5
+TQQQ_TMF_IEF_NORMAL_TMF_WEIGHT = 0.5
+
+TQQQ_TMF_IEF_REBALANCE_FREQUENCY_MONTHS = 2
+
+# Single-trading-day TQQQ decline that trips the crash filter. Deliberately
+# NOT a drawdown-from-peak, weekly, or monthly measure — see module note
+# above.
+TQQQ_TMF_IEF_CRASH_THRESHOLD_PERCENT = -20.0
+
+# Backtest defaults. $100,000 mirrors the amount used to describe the
+# strategy concept; the resulting performance figures are ThrustWise's own
+# calculation from ThrustWise's own ingested price history — NOT the
+# source article's reported backtest (see TQQQ_TMF_IEF_BACKTEST_LABEL).
+TQQQ_TMF_IEF_DEFAULT_INITIAL_INVESTMENT = 100_000.0
+
+# Per-leg execution cost applied to every dollar of turnover (bought or
+# sold) at each rebalance / crash / recovery event — a simple, documented
+# slippage assumption, not a claim of matching any third party's reported
+# results.
+TQQQ_TMF_IEF_SLIPPAGE_RATE = 0.0025  # 0.25%
+
+# Minimum number of joined (TQQQ ^ TMF ^ IEF) trading days required before
+# a result is considered meaningful — same "unavailable" convention as
+# every MIN_ROWS_* constant above.
+MIN_ROWS_TQQQ_TMF_IEF = 10
+
+TQQQ_TMF_IEF_BACKTEST_LABEL = "ThrustWise calculated backtest"
+
+TQQQ_TMF_IEF_DISCLAIMER = (
+    "This strategy is a research and backtesting framework involving "
+    "leveraged ETFs. Historical results do not guarantee future "
+    "performance, and the crash filter does not eliminate market or "
+    "execution risk."
+)
+
+
+def _tqqq_tmf_ief_rebalance_to_target(
+    current_values: dict[str, float],
+    target_weights: dict[str, float],
+    total_value: float,
+    slippage_rate: float = TQQQ_TMF_IEF_SLIPPAGE_RATE,
+) -> dict[str, float]:
+    """Move a portfolio from `current_values` (mark-to-market $ per leg) to
+    `target_weights` (fraction of `total_value` per leg), charging
+    `slippage_rate` against the total dollar turnover (every dollar bought
+    plus every dollar sold).
+
+    Used for every allocation change in the simulation below: the initial
+    purchase, periodic 50/50 rebalances, the crash exit into IEF, and the
+    recovery exit back into 50/50 TQQQ/TMF. Reused rather than duplicated
+    per event type because the trade-cost mechanics are identical in each
+    case — only the target weights differ.
+    """
+    target_values = {leg: total_value * weight for leg, weight in target_weights.items()}
+    legs = set(current_values) | set(target_values)
+    turnover = sum(
+        abs(target_values.get(leg, 0.0) - current_values.get(leg, 0.0)) for leg in legs
+    )
+    cost = turnover * slippage_rate
+    net_value = max(total_value - cost, 0.0)
+    scale = (net_value / total_value) if total_value > 0 else 0.0
+    return {leg: value * scale for leg, value in target_values.items()}
+
+
+def _tqqq_tmf_ief_join_prices(
+    tqqq_prices: list[DailyPrice],
+    tmf_prices: list[DailyPrice],
+    ief_prices: list[DailyPrice],
+) -> pd.DataFrame:
+    """Inner-join TQQQ/TMF/IEF close prices on date — only trading days
+    where all three symbols have a real, ingested price are kept. Same
+    alignment convention as portfolio_comparison.compute_vt_vs_vti_vxus:
+    no missing value is ever interpolated or fabricated.
+
+    Uses adjusted_close (via services.analytics.to_series), same series
+    convention as the VT vs VTI+VXUS portfolio comparison, since this is
+    a portfolio-growth simulation rather than a raw-close indicator
+    reading.
+    """
+    from app.services.analytics import to_series  # local import: avoids a
+
+    # module-level cycle between services.strategies and services.analytics
+    tqqq_series = to_series(tqqq_prices)
+    tmf_series = to_series(tmf_prices)
+    ief_series = to_series(ief_prices)
+
+    if tqqq_series.empty or tmf_series.empty or ief_series.empty:
+        return pd.DataFrame(columns=["tqqq", "tmf", "ief"])
+
+    combined = pd.concat(
+        {"tqqq": tqqq_series, "tmf": tmf_series, "ief": ief_series},
+        axis=1,
+        join="inner",
+    ).dropna()
+    return combined
+
+
+def _tqqq_tmf_ief_month_end_flags(index: pd.DatetimeIndex) -> list[bool]:
+    """True for the last available trading day of each calendar month
+    within `index` (rebalancing uses trading days, not arbitrary calendar
+    dates, so "month end" means the last joined trading day actually
+    observed in that month — not a fixed calendar date that might not be
+    a trading day at all)."""
+    n = len(index)
+    flags = [False] * n
+    for i in range(n):
+        if i == n - 1:
+            flags[i] = True
+        else:
+            cur, nxt = index[i], index[i + 1]
+            flags[i] = cur.month != nxt.month or cur.year != nxt.year
+    return flags
+
+
+def compute_tqqq_tmf_ief_rebalancing(
+    tqqq_prices: list[DailyPrice],
+    tmf_prices: list[DailyPrice],
+    ief_prices: list[DailyPrice],
+    *,
+    initial_investment: float = TQQQ_TMF_IEF_DEFAULT_INITIAL_INVESTMENT,
+) -> dict | None:
+    """Simulate the TQQQ / TMF / IEF Rebalancing strategy day-by-day over
+    the full joined TQQQ/TMF/IEF price history and return the current
+    strategy state plus a ThrustWise-calculated backtest equity curve.
+
+    Returns None when any of the three symbols has no price history yet,
+    or when fewer than MIN_ROWS_TQQQ_TMF_IEF joined trading days exist —
+    callers should treat that as "unavailable", the same convention used
+    by every other compute_* function in this module.
+    """
+    df = _tqqq_tmf_ief_join_prices(tqqq_prices, tmf_prices, ief_prices)
+    if len(df) < MIN_ROWS_TQQQ_TMF_IEF:
+        return None
+
+    index = df.index
+    tqqq = df["tqqq"].tolist()
+    tmf = df["tmf"].tolist()
+    ief = df["ief"].tolist()
+    n = len(df)
+
+    month_end = _tqqq_tmf_ief_month_end_flags(index)
+
+    # --- Day 0: initial purchase, 50% TQQQ / 50% TMF -----------------------
+    values = _tqqq_tmf_ief_rebalance_to_target(
+        current_values={},
+        target_weights={
+            "tqqq": TQQQ_TMF_IEF_NORMAL_TQQQ_WEIGHT,
+            "tmf": TQQQ_TMF_IEF_NORMAL_TMF_WEIGHT,
+        },
+        total_value=initial_investment,
+    )
+    shares = {
+        "tqqq": values["tqqq"] / tqqq[0] if tqqq[0] else 0.0,
+        "tmf": values["tmf"] / tmf[0] if tmf[0] else 0.0,
+        "ief": 0.0,
+    }
+
+    state = "Normal"
+    last_rebalance_date: datetime.date = index[0].date()
+    next_rebalance_period = (
+        pd.Period(index[0], freq="M") + TQQQ_TMF_IEF_REBALANCE_FREQUENCY_MONTHS
+    )
+
+    crash_trigger_date: datetime.date | None = None
+    pre_crash_tqqq_price: float | None = None
+    recovered_since_crash = True  # no crash yet == "recovered" (inactive)
+
+    chart_rows: list[dict] = []
+    equity_curve: list[float] = []
+
+    def _mark_to_market(i: int) -> dict[str, float]:
+        return {
+            "tqqq": shares["tqqq"] * tqqq[i],
+            "tmf": shares["tmf"] * tmf[i],
+            "ief": shares["ief"] * ief[i],
+        }
+
+    for i in range(n):
+        is_crash_event = False
+        is_recovery_event = False
+        is_rebalance_event = i == 0  # initial purchase counts as the first rebalance
+
+        # 1) Crash filter — evaluated on consecutive trading-day closes only.
+        if i > 0 and state == "Normal":
+            tqqq_return_pct = (
+                ((tqqq[i] - tqqq[i - 1]) / tqqq[i - 1]) * 100 if tqqq[i - 1] else 0.0
+            )
+            if tqqq_return_pct <= TQQQ_TMF_IEF_CRASH_THRESHOLD_PERCENT:
+                mtm = _mark_to_market(i)
+                total = sum(mtm.values())
+                new_values = _tqqq_tmf_ief_rebalance_to_target(
+                    current_values=mtm, target_weights={"ief": 1.0}, total_value=total
+                )
+                shares = {
+                    "tqqq": 0.0,
+                    "tmf": 0.0,
+                    "ief": (new_values["ief"] / ief[i]) if ief[i] else 0.0,
+                }
+                state = "Defensive"
+                pre_crash_tqqq_price = tqqq[i - 1]
+                crash_trigger_date = index[i].date()
+                recovered_since_crash = False
+                is_crash_event = True
+
+        # 2) Recovery — exit IEF once TQQQ's close exceeds the pre-crash price.
+        elif state == "Defensive" and pre_crash_tqqq_price is not None:
+            if tqqq[i] > pre_crash_tqqq_price:
+                mtm = _mark_to_market(i)
+                total = sum(mtm.values())
+                new_values = _tqqq_tmf_ief_rebalance_to_target(
+                    current_values=mtm,
+                    target_weights={
+                        "tqqq": TQQQ_TMF_IEF_NORMAL_TQQQ_WEIGHT,
+                        "tmf": TQQQ_TMF_IEF_NORMAL_TMF_WEIGHT,
+                    },
+                    total_value=total,
+                )
+                shares = {
+                    "tqqq": (new_values["tqqq"] / tqqq[i]) if tqqq[i] else 0.0,
+                    "tmf": (new_values["tmf"] / tmf[i]) if tmf[i] else 0.0,
+                    "ief": 0.0,
+                }
+                state = "Normal"
+                last_rebalance_date = index[i].date()
+                next_rebalance_period = (
+                    pd.Period(index[i], freq="M")
+                    + TQQQ_TMF_IEF_REBALANCE_FREQUENCY_MONTHS
+                )
+                recovered_since_crash = True
+                is_recovery_event = True
+                is_rebalance_event = True
+
+        # 3) Periodic rebalance — only while Normal, on the last available
+        #    trading day of every second calendar month, and never on the
+        #    same day a crash/recovery just fired above.
+        if (
+            state == "Normal"
+            and not is_crash_event
+            and not is_recovery_event
+            and i > 0
+            and month_end[i]
+            and pd.Period(index[i], freq="M") >= next_rebalance_period
+        ):
+            mtm = _mark_to_market(i)
+            total = sum(mtm.values())
+            new_values = _tqqq_tmf_ief_rebalance_to_target(
+                current_values=mtm,
+                target_weights={
+                    "tqqq": TQQQ_TMF_IEF_NORMAL_TQQQ_WEIGHT,
+                    "tmf": TQQQ_TMF_IEF_NORMAL_TMF_WEIGHT,
+                },
+                total_value=total,
+            )
+            shares = {
+                "tqqq": (new_values["tqqq"] / tqqq[i]) if tqqq[i] else 0.0,
+                "tmf": (new_values["tmf"] / tmf[i]) if tmf[i] else 0.0,
+                "ief": 0.0,
+            }
+            last_rebalance_date = index[i].date()
+            next_rebalance_period = (
+                pd.Period(index[i], freq="M") + TQQQ_TMF_IEF_REBALANCE_FREQUENCY_MONTHS
+            )
+            is_rebalance_event = True
+
+        mtm = _mark_to_market(i)
+        total_value = sum(mtm.values())
+        equity_curve.append(total_value)
+
+        chart_rows.append(
+            {
+                "date": index[i].date().isoformat(),
+                "tqqq": _round(tqqq[i]),
+                "tmf": _round(tmf[i]),
+                "ief": _round(ief[i]),
+                "portfolio_value": _round(total_value),
+                "state": state,
+                "is_rebalance_event": is_rebalance_event,
+                "is_crash_event": is_crash_event,
+                "is_recovery_event": is_recovery_event,
+            }
+        )
+
+    # --- Current state (as of the latest joined trading day) ---------------
+    last_i = n - 1
+    last_mtm = _mark_to_market(last_i)
+    last_total = sum(last_mtm.values())
+    tqqq_alloc_pct = (last_mtm["tqqq"] / last_total * 100) if last_total else 0.0
+    tmf_alloc_pct = (last_mtm["tmf"] / last_total * 100) if last_total else 0.0
+    ief_alloc_pct = (last_mtm["ief"] / last_total * 100) if last_total else 0.0
+
+    tqqq_daily_return_pct = (
+        ((tqqq[last_i] - tqqq[last_i - 1]) / tqqq[last_i - 1]) * 100
+        if last_i > 0 and tqqq[last_i - 1]
+        else 0.0
+    )
+
+    # Next scheduled rebalance date shown to the user: the last joined
+    # trading day actually observed in the target month, when we have data
+    # that far; otherwise the calendar month-end as a forward estimate
+    # (never used to make a decision above — decisions only ever look at
+    # data already observed, this is display-only).
+    target_month_rows = [
+        ts for ts in index if pd.Period(ts, freq="M") == next_rebalance_period
+    ]
+    if target_month_rows:
+        next_rebalance_date = target_month_rows[-1].date().isoformat()
+    else:
+        next_rebalance_date = next_rebalance_period.end_time.date().isoformat()
+
+    if state == "Normal":
+        crash_filter_status = "Inactive"
+        recovery_status = None
+        next_expected_action = f"Rebalance TQQQ/TMF to 50/50 on {next_rebalance_date}"
+    else:
+        crash_filter_status = "Triggered"
+        recovery_status = "Waiting for TQQQ to exceed pre-crash price"
+        next_expected_action = (
+            "Exit IEF and return to 50% TQQQ / 50% TMF once TQQQ closes above "
+            f"its pre-crash price of {_round(pre_crash_tqqq_price)}"
+        )
+
+    # --- ThrustWise-calculated backtest summary (own data, own numbers —
+    # never the source article's reported figures; see
+    # TQQQ_TMF_IEF_BACKTEST_LABEL). ---
+    final_value = equity_curve[-1]
+    total_return_pct = (
+        ((final_value - initial_investment) / initial_investment) * 100
+        if initial_investment
+        else 0.0
+    )
+    years = max((index[-1] - index[0]).days / 365.25, 1e-9)
+    cagr_pct = (
+        ((final_value / initial_investment) ** (1 / years) - 1) * 100
+        if initial_investment > 0 and final_value > 0
+        else 0.0
+    )
+
+    equity_series = pd.Series(equity_curve)
+    running_peak = equity_series.cummax()
+    drawdown_pct = ((equity_series - running_peak) / running_peak) * 100
+    max_drawdown_pct = float(drawdown_pct.min()) if not drawdown_pct.empty else 0.0
+
+    return {
+        "strategy": TQQQ_TMF_IEF_STRATEGY_KEY,
+        "state": "Normal" if state == "Normal" else "Defensive / Crash",
+        "tqqq_allocation_percent": _round(tqqq_alloc_pct),
+        "tmf_allocation_percent": _round(tmf_alloc_pct),
+        "ief_allocation_percent": _round(ief_alloc_pct),
+        "tqqq_price": _round(tqqq[last_i]),
+        "tmf_price": _round(tmf[last_i]),
+        "ief_price": _round(ief[last_i]),
+        "tqqq_daily_return_percent": _round(tqqq_daily_return_pct),
+        "last_rebalance_date": last_rebalance_date.isoformat(),
+        "next_rebalance_date": next_rebalance_date,
+        "rebalance_frequency_months": TQQQ_TMF_IEF_REBALANCE_FREQUENCY_MONTHS,
+        "crash_filter_status": crash_filter_status,
+        "crash_filter_threshold_percent": TQQQ_TMF_IEF_CRASH_THRESHOLD_PERCENT,
+        "crash_trigger_date": (
+            crash_trigger_date.isoformat()
+            if crash_trigger_date and not recovered_since_crash
+            else None
+        ),
+        "pre_crash_tqqq_price": (
+            _round(pre_crash_tqqq_price) if state == "Defensive" else None
+        ),
+        "recovery_status": recovery_status,
+        "next_expected_action": next_expected_action,
+        "backtest_start_date": index[0].date().isoformat(),
+        "backtest_end_date": index[-1].date().isoformat(),
+        "backtest_initial_investment": _round(initial_investment),
+        "backtest_final_value": _round(final_value),
+        "backtest_total_return_percent": _round(total_return_pct),
+        "backtest_cagr_percent": _round(cagr_pct),
+        "backtest_max_drawdown_percent": _round(max_drawdown_pct),
+        "backtest_label": TQQQ_TMF_IEF_BACKTEST_LABEL,
+        "disclaimer": TQQQ_TMF_IEF_DISCLAIMER,
+        "chart_data": chart_rows,
+    }

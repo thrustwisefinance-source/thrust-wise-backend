@@ -317,6 +317,21 @@ STRATEGY_ONLY_REGISTRY: dict[str, PortfolioComponentMeta] = {
     "TLT": PortfolioComponentMeta(
         symbol="TLT", name="iShares 20+ Year Treasury Bond ETF"
     ),
+    # Needed purely as historical-price inputs for the "TQQQ / TMF / IEF
+    # Rebalancing" portfolio-allocation strategy (see
+    # services/tqqq_tmf_ief_strategy.py), surfaced on the existing
+    # Strategies section for every symbol the same way TLT Monthly Cycle
+    # and Risk-On/Risk-Off are — not as standalone Explorer products, so
+    # none of these three are added to ETF_REGISTRY.
+    "TQQQ": PortfolioComponentMeta(
+        symbol="TQQQ", name="ProShares UltraPro QQQ (3x Nasdaq-100)"
+    ),
+    "TMF": PortfolioComponentMeta(
+        symbol="TMF", name="Direxion Daily 20+ Year Treasury Bull 3x Shares"
+    ),
+    "IEF": PortfolioComponentMeta(
+        symbol="IEF", name="iShares 7-10 Year Treasury Bond ETF"
+    ),
 }
 
 

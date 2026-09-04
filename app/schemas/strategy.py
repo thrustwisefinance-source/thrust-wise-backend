@@ -290,6 +290,65 @@ class TltMonthlyCycleStrategy(CamelModel):
     chart_data: list[TltMonthlyCycleChartPoint]
 
 
+class TqqqTmfIefChartPoint(CamelModel):
+    date: str
+    tqqq: float | None = None
+    tmf: float | None = None
+    ief: float | None = None
+    portfolio_value: float | None = None
+    state: str | None = None  # "Normal" | "Defensive"
+    is_rebalance_event: bool = False
+    is_crash_event: bool = False
+    is_recovery_event: bool = False
+
+
+class TqqqTmfIefRebalancingStrategy(CamelModel):
+    """TQQQ / TMF / IEF Rebalancing (Portfolio / Allocation strategy).
+
+    Multi-ETF portfolio-allocation and crash-defense strategy — not a
+    single-symbol technical indicator, so (like VtVsVtiVxusStrategy) it
+    intentionally carries none of the trend/crossover/signal-style fields
+    the technical strategies expose. Normal state holds 50% TQQQ / 50%
+    TMF, rebalanced every two months; a single-day TQQQ decline of 20% or
+    more moves the full portfolio into IEF until TQQQ's close exceeds its
+    pre-crash reference price. See services.tqqq_tmf_ief_strategy module
+    docstring for the full state-machine and simulation methodology.
+
+    `backtest_*` fields are ThrustWise's own calculation from ThrustWise's
+    own ingested price history (see `backtest_label`) — never the source
+    article's reported performance figures.
+    """
+
+    strategy: str
+    state: str  # "Normal" | "Defensive / Crash"
+    tqqq_allocation_percent: float
+    tmf_allocation_percent: float
+    ief_allocation_percent: float
+    tqqq_price: float
+    tmf_price: float
+    ief_price: float
+    tqqq_daily_return_percent: float
+    last_rebalance_date: str
+    next_rebalance_date: str
+    rebalance_frequency_months: int
+    crash_filter_status: str  # "Inactive" | "Triggered"
+    crash_filter_threshold_percent: float
+    crash_trigger_date: str | None = None
+    pre_crash_tqqq_price: float | None = None
+    recovery_status: str | None = None
+    next_expected_action: str
+    backtest_start_date: str
+    backtest_end_date: str
+    backtest_initial_investment: float
+    backtest_final_value: float
+    backtest_total_return_percent: float
+    backtest_cagr_percent: float
+    backtest_max_drawdown_percent: float
+    backtest_label: str
+    disclaimer: str
+    chart_data: list[TqqqTmfIefChartPoint]
+
+
 class StrategyAnalytics(CamelModel):
     """Top-level payload for GET /etfs/{symbol}/strategies.
 
@@ -318,3 +377,8 @@ class StrategyAnalytics(CamelModel):
     # Strategy 10 (TLT's own data, all symbols — like Risk-On/Risk-Off):
     # TLT Monthly Cycle (calendar-based, not a technical indicator).
     tlt_monthly_cycle: TltMonthlyCycleStrategy | None = None
+    # Strategy 11 (TQQQ/TMF/IEF's own data, all symbols — cross-cutting
+    # like Risk-On/Risk-Off and TLT Monthly Cycle above): TQQQ / TMF / IEF
+    # Rebalancing, a portfolio-allocation strategy, not a technical
+    # indicator.
+    tqqq_tmf_ief_rebalancing: TqqqTmfIefRebalancingStrategy | None = None
