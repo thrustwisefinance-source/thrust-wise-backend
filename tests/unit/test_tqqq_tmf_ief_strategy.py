@@ -22,7 +22,6 @@ from app.services import strategies as strat
 def _make_price(symbol: str, date: datetime.date, close: float):
     class _P:
         pass
-
     p = _P()
     p.symbol = symbol
     p.date = date
