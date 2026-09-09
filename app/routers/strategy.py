@@ -57,6 +57,18 @@ TQQQ_SYMBOL = "TQQQ"
 TMF_SYMBOL = "TMF"
 IEF_SYMBOL = "IEF"
 
+# Mswing Momentum's relative-strength leg needs the index's (QQQ's) own
+# Mswing reading. QQQ is already part of ETF_REGISTRY, so — same
+# cross-cutting treatment as TLT Monthly Cycle and TQQQ/TMF/IEF above —
+# it's computed once and cached separately rather than recomputed per
+# symbol (avoiding an extra DB round-trip on every /strategies request).
+MSWING_INDEX_CACHE_KEY = "tw:v1:strategy:mswing_index_value"
+
+
+async def _load_mswing_index_value(db: AsyncSession) -> float | None:
+    index_prices = await load_prices(db, strategies.MSWING_INDEX_SYMBOL)
+    return strategies.compute_mswing_index_value(index_prices)
+
 
 async def _load_tlt_monthly_cycle(db: AsyncSession) -> dict | None:
     tlt_prices = await load_prices(db, TLT_SYMBOL)
@@ -115,18 +127,27 @@ async def get_strategy_analytics(symbol: str, db: AsyncSession = Depends(get_db)
       _load_tqqq_tmf_ief_rebalancing), same cross-cutting treatment as
       TLT Monthly Cycle and Risk-On/Risk-Off above.
 
+    - Mswing Momentum (a single-symbol technical strategy — see
+      services.strategies Strategy 12) for every symbol, computed from
+      that symbol's own price history the same way as the six core
+      technical strategies above. Its relative-strength leg uses QQQ's
+      own Mswing reading, computed once and cached separately (see
+      _load_mswing_index_value) since it doesn't depend on which symbol
+      was requested — same cross-cutting treatment as TLT Monthly Cycle
+      and TQQQ/TMF/IEF Rebalancing above.
+
     Reuses the existing price retrieval (`load_prices`) and symbol
     validation (`resolve_meta`, `require_prices`) helpers, and follows
     the same cache-then-compute pattern as the other /etfs routes.
 
-    NOTE: bumping the cache key version (v5 -> v6) so previously cached
-    responses (which don't contain tqqq_tmf_ief_rebalancing) are not
-    served for the new field; the response shape stays backward
-    compatible either way since all fields are optional.
+    NOTE: bumping the cache key version (v6 -> v7) so previously cached
+    responses (which don't contain mswing) are not served for the new
+    field; the response shape stays backward compatible either way since
+    all fields are optional.
     """
     meta = resolve_meta(symbol)
 
-    cache_key = f"tw:v6:strategies:{meta.symbol}"
+    cache_key = f"tw:v7:strategies:{meta.symbol}"
     cached = await cache.get_json(cache_key)
     if cached is not None:
         result = cached
@@ -147,6 +168,7 @@ async def get_strategy_analytics(symbol: str, db: AsyncSession = Depends(get_db)
             "triple_ma_pullback": strategies.compute_triple_ma_pullback(prices),
             "tlt_monthly_cycle": None,
             "tqqq_tmf_ief_rebalancing": None,
+            "mswing": None,
         }
 
         if meta.symbol == PORTFOLIO_COMPARISON_SYMBOL:
@@ -173,6 +195,13 @@ async def get_strategy_analytics(symbol: str, db: AsyncSession = Depends(get_db)
             TQQQ_TMF_IEF_CACHE_KEY, lambda: _load_tqqq_tmf_ief_rebalancing(db)
         )
 
+        mswing_index_value = await cache.get_or_compute(
+            MSWING_INDEX_CACHE_KEY, lambda: _load_mswing_index_value(db)
+        )
+        result["mswing"] = strategies.compute_mswing(
+            prices, index_mswing=mswing_index_value
+        )
+
         await cache.set_json(cache_key, result)
 
     # Insufficient history is not an error — surface it as an informational
@@ -190,6 +219,7 @@ async def get_strategy_analytics(symbol: str, db: AsyncSession = Depends(get_db)
         "triple_ma_pullback": "Triple-MA Pullback",
         "tlt_monthly_cycle": "TLT Monthly Cycle",
         "tqqq_tmf_ief_rebalancing": "TQQQ / TMF / IEF Rebalancing",
+        "mswing": "Mswing Momentum",
     }
     if meta.symbol == PORTFOLIO_COMPARISON_SYMBOL:
         strategy_labels["vt_vs_vti_vxus"] = "VT vs VTI+VXUS Portfolio Comparison"

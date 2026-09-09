@@ -1,3 +1,4 @@
+from app.schemas.canslim import CanslimResult, CanslimScreenerResponse
 from app.schemas.common import ApiResponse, CamelModel
 from app.schemas.compare import (
     AllocationItem,
@@ -23,6 +24,8 @@ from app.schemas.strategy import (
     EvarRiskChartPoint,
     EvarRiskStrategy,
     MacdStrategy,
+    MswingChartPoint,
+    MswingStrategy,
     RiskOnRiskOffChartPoint,
     RiskOnRiskOffStrategy,
     SmaTrendStrategy,
@@ -45,6 +48,8 @@ __all__ = [
     "BetterBreakoutStrategy",
     "BollingerBandsStrategy",
     "CamelModel",
+    "CanslimResult",
+    "CanslimScreenerResponse",
     "CompareResult",
     "DashboardMover",
     "DashboardSummary",
@@ -59,6 +64,8 @@ __all__ = [
     "Holding",
     "MacdStrategy",
     "MarketIndex",
+    "MswingChartPoint",
+    "MswingStrategy",
     "PerformancePoint",
     "PerformanceStats",
     "RiskMetrics",

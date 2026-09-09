@@ -18,7 +18,7 @@ from app.config import settings
 from app.database import Base, engine, get_db
 from app.exceptions import register_exception_handlers
 from app.middleware import RequestIDMiddleware
-from app.routers import admin, compare, dashboard, etfs, health, strategy
+from app.routers import admin, canslim, compare, dashboard, etfs, health, strategy
 from app.services import cache, ingestion
 
 
@@ -144,6 +144,7 @@ app.add_middleware(
 app.include_router(compare.router, prefix="/api")
 app.include_router(etfs.router, prefix="/api")
 app.include_router(strategy.router, prefix="/api")
+app.include_router(canslim.router, prefix="/api")
 app.include_router(dashboard.router, prefix="/api")
 app.include_router(admin.router, prefix="/api")
 app.include_router(health.router)
@@ -193,6 +194,7 @@ async def api_root():
             "/api/etfs/{symbol}/strategies",
             "/api/etfs/compare",
             "/api/compare",
+            "/api/strategies/canslim",
             "/api/dashboard",
             "/api/dashboard/market",
             "/health/live",

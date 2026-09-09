@@ -1356,3 +1356,200 @@ def compute_tqqq_tmf_ief_rebalancing(
         "disclaimer": TQQQ_TMF_IEF_DISCLAIMER,
         "chart_data": chart_rows,
     }
+
+
+# ---------------------------------------------------------------------------
+# Strategy 12: Mswing Momentum
+#
+# Single-symbol momentum strategy — same "pure function over
+# list[DailyPrice], returns None when there isn't enough history"
+# convention as every other strategy in this module (most similar in
+# shape to Strategy 8, Triple-MA Pullback: a momentum/trend readout with
+# a documented default entry/exit condition, not a signal or
+# recommendation).
+#
+#   Mswing = pct_change(close, 20) + pct_change(close, 50)     (percent)
+#   Mswing EMA9  = EMA(Mswing, 9)
+#   SMA50        = SMA(close, 50)
+#
+# STATE (exactly four, per the source article — no additional states are
+# invented):
+#   Strong bullish momentum      Mswing > 0 and Mswing > EMA9
+#   Weakening bullish momentum   Mswing > 0 and Mswing < EMA9
+#   Recovering bearish momentum  Mswing < 0 and Mswing > EMA9
+#   Bearish momentum             Mswing < 0 and Mswing < EMA9
+#
+# The source material does not define a fifth "Mswing == 0" case. Since a
+# reading of exactly zero represents no net momentum rather than positive
+# momentum, it is treated as satisfying the "Mswing < 0" bucket for state
+# classification only (a documented default, same spirit as the
+# TRIPLE_MA_PERIOD assumption above) — this only affects the boundary
+# value itself, never values strictly above or below zero.
+#
+# DEFAULT STRATEGY CONDITIONS (descriptive/analytical only — no order is
+# ever placed, matching the "no trading execution" convention used by
+# every strategy in this codebase):
+#   Bullish:      Mswing > 0 and Mswing > EMA9 and Close > SMA50
+#   Bearish/Exit: Mswing < 0 or Close < SMA50 or Mswing >= 4
+#
+# RELATIVE STRENGTH: Mswing(stock) - Mswing(index). QQQ is used as the
+# index because it is already part of the existing ETF universe/price
+# infrastructure (app.constants.ETF_REGISTRY) — no new external data
+# source is introduced. When the index's own Mswing value is unavailable
+# (insufficient history), relative_strength is null rather than
+# fabricated, same "unavailable" convention as everywhere else in this
+# module. See routers/strategy.py for how the index value is loaded and
+# cached (cross-cutting, once per request cycle — same treatment as TLT
+# Monthly Cycle and TQQQ/TMF/IEF above).
+# ---------------------------------------------------------------------------
+
+MSWING_SHORT_LENGTH = 20
+MSWING_LONG_LENGTH = 50
+MSWING_EMA_LENGTH = 9
+MSWING_SMA_LENGTH = 50
+
+# Bearish/exit condition also fires on an overextended reading, per the
+# source article's default strategy conditions.
+MSWING_OVEREXTENDED_THRESHOLD = 4.0
+
+# Needs close[t-50] for the long-length pct-change leg, plus EMA(9)
+# warm-up on the resulting Mswing series, plus a small buffer — same
+# period-plus-buffer sizing convention as every other MIN_ROWS_* constant
+# in this module (e.g. MIN_ROWS_EMA50_RSI).
+MIN_ROWS_MSWING = MSWING_LONG_LENGTH + MSWING_EMA_LENGTH + 10
+
+MSWING_INDEX_SYMBOL = "QQQ"
+
+
+def _mswing_series(series: pd.Series) -> pd.DataFrame:
+    """Mswing, its EMA9, and SMA50 of close — vectorized over the full
+    close-price series. Shared by compute_mswing (full result) and
+    compute_mswing_index_value (index-only raw value for relative
+    strength) so the calculation is defined in exactly one place.
+    """
+    short_pct = (series / series.shift(MSWING_SHORT_LENGTH) - 1) * 100
+    long_pct = (series / series.shift(MSWING_LONG_LENGTH) - 1) * 100
+    mswing = short_pct + long_pct
+    mswing_ema9 = _ema(mswing, MSWING_EMA_LENGTH)
+    sma50 = series.rolling(window=MSWING_SMA_LENGTH).mean()
+
+    return pd.DataFrame(
+        {
+            "close": series,
+            "mswing": mswing,
+            "mswing_ema9": mswing_ema9,
+            "sma50": sma50,
+        }
+    )
+
+
+def compute_mswing_index_value(prices: list[DailyPrice]) -> float | None:
+    """The index's (QQQ's) own latest Mswing reading, used only as the
+    subtrahend for relative_strength in compute_mswing below. Returns
+    None when there isn't enough index price history — never fabricated.
+    """
+    series = to_close_series(prices)
+    if len(series) < MIN_ROWS_MSWING:
+        return None
+    df = _mswing_series(series).dropna(subset=["mswing"])
+    if df.empty:
+        return None
+    return float(df.iloc[-1]["mswing"])
+
+
+def compute_mswing(
+    prices: list[DailyPrice],
+    *,
+    index_mswing: float | None = None,
+    index_symbol: str = MSWING_INDEX_SYMBOL,
+) -> dict | None:
+    """Mswing Momentum strategy.
+
+    Returns None when there isn't enough price history for a stable
+    Mswing/EMA9/SMA50 reading (see MIN_ROWS_MSWING) — same "unavailable"
+    convention as every other strategy in this module.
+
+    `index_mswing` is the index's (QQQ's) own latest Mswing value,
+    computed separately via compute_mswing_index_value and passed in by
+    the caller (see routers/strategy.py) — this function never loads
+    index data itself, staying a pure function over its own `prices`
+    like every other strategy here.
+    """
+    series = to_close_series(prices)
+    if len(series) < MIN_ROWS_MSWING:
+        return None
+
+    df = _mswing_series(series).dropna()
+    if df.empty:
+        return None
+
+    last = df.iloc[-1]
+    price = float(last["close"])
+    mswing_val = float(last["mswing"])
+    mswing_ema9_val = float(last["mswing_ema9"])
+    sma50_val = float(last["sma50"])
+
+    mswing_above_zero = mswing_val > 0
+    mswing_above_ema = mswing_val > mswing_ema9_val
+    price_above_sma50 = price > sma50_val
+
+    # See module note above: an exact-zero Mswing reading is bucketed
+    # with "< 0" for state classification (no fifth state is invented).
+    if mswing_above_zero:
+        mswing_state = (
+            "Strong bullish momentum"
+            if mswing_above_ema
+            else "Weakening bullish momentum"
+        )
+    else:
+        mswing_state = (
+            "Recovering bearish momentum"
+            if mswing_above_ema
+            else "Bearish momentum"
+        )
+
+    zero_line_bullish_cross = False
+    zero_line_bearish_cross = False
+    ema_bullish_cross = False
+    ema_bearish_cross = False
+    if len(df) > 1:
+        prev = df.iloc[-2]
+        prev_mswing = float(prev["mswing"])
+        prev_ema9 = float(prev["mswing_ema9"])
+        zero_line_bullish_cross = prev_mswing <= 0 and mswing_val > 0
+        zero_line_bearish_cross = prev_mswing >= 0 and mswing_val < 0
+        ema_bullish_cross = prev_mswing <= prev_ema9 and mswing_val > mswing_ema9_val
+        ema_bearish_cross = prev_mswing >= prev_ema9 and mswing_val < mswing_ema9_val
+
+    bullish_condition_active = (
+        mswing_above_zero and mswing_above_ema and price_above_sma50
+    )
+    bearish_exit_condition_active = (
+        not mswing_above_zero
+        or not price_above_sma50
+        or mswing_val >= MSWING_OVEREXTENDED_THRESHOLD
+    )
+
+    relative_strength = (
+        _round(mswing_val - index_mswing) if index_mswing is not None else None
+    )
+
+    return {
+        "price": _round(price),
+        "mswing": _round(mswing_val),
+        "mswing_ema9": _round(mswing_ema9_val),
+        "sma50": _round(sma50_val),
+        "mswing_state": mswing_state,
+        "mswing_above_zero": mswing_above_zero,
+        "mswing_above_ema": mswing_above_ema,
+        "price_above_sma50": price_above_sma50,
+        "zero_line_bullish_cross": zero_line_bullish_cross,
+        "zero_line_bearish_cross": zero_line_bearish_cross,
+        "ema_bullish_cross": ema_bullish_cross,
+        "ema_bearish_cross": ema_bearish_cross,
+        "bullish_condition_active": bullish_condition_active,
+        "bearish_exit_condition_active": bearish_exit_condition_active,
+        "relative_strength": relative_strength,
+        "relative_strength_index_symbol": index_symbol,
+        "chart_data": _chart_rows(df, ["close", "mswing", "mswing_ema9", "sma50"]),
+    }

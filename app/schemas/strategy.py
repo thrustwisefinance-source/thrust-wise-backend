@@ -349,6 +349,51 @@ class TqqqTmfIefRebalancingStrategy(CamelModel):
     chart_data: list[TqqqTmfIefChartPoint]
 
 
+class MswingChartPoint(CamelModel):
+    date: str
+    close: float | None = None
+    mswing: float | None = None
+    mswing_ema9: float | None = None
+    sma50: float | None = None
+
+
+class MswingStrategy(CamelModel):
+    """Mswing Momentum.
+
+    Single-symbol momentum strategy: Mswing = 20-day + 50-day close
+    percent-change, confirmed by its own 9-period EMA and by price
+    relative to SMA50. Descriptive momentum state and default
+    entry/exit conditions only — no buy/sell signal, matching every
+    other strategy in this module. See services.strategies module
+    docstring (Strategy 12) for the full formula, the four-state
+    classification, and the documented Mswing == 0 boundary assumption.
+
+    `relative_strength` is Mswing(this symbol) - Mswing(QQQ), reusing
+    the existing ETF price infrastructure as the index (see
+    services.strategies MSWING_INDEX_SYMBOL) — null when the index
+    reading itself is unavailable rather than fabricated.
+    """
+
+    price: float
+    mswing: float
+    mswing_ema9: float
+    sma50: float
+    mswing_state: str  # "Strong bullish momentum" | "Weakening bullish momentum" |
+    # "Recovering bearish momentum" | "Bearish momentum"
+    mswing_above_zero: bool
+    mswing_above_ema: bool
+    price_above_sma50: bool
+    zero_line_bullish_cross: bool
+    zero_line_bearish_cross: bool
+    ema_bullish_cross: bool
+    ema_bearish_cross: bool
+    bullish_condition_active: bool
+    bearish_exit_condition_active: bool
+    relative_strength: float | None = None
+    relative_strength_index_symbol: str
+    chart_data: list[MswingChartPoint]
+
+
 class StrategyAnalytics(CamelModel):
     """Top-level payload for GET /etfs/{symbol}/strategies.
 
@@ -382,3 +427,5 @@ class StrategyAnalytics(CamelModel):
     # Rebalancing, a portfolio-allocation strategy, not a technical
     # indicator.
     tqqq_tmf_ief_rebalancing: TqqqTmfIefRebalancingStrategy | None = None
+    # Strategy 12 (single-ETF, all symbols): Mswing Momentum.
+    mswing: MswingStrategy | None = None
