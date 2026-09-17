@@ -19,6 +19,7 @@ import math
 import numpy as np
 import pandas as pd
 
+from app.constants import ETF_REGISTRY
 from app.models import DailyPrice
 
 # Chart payload: last N trading days of indicator history for the frontend
@@ -1552,4 +1553,616 @@ def compute_mswing(
         "relative_strength": relative_strength,
         "relative_strength_index_symbol": index_symbol,
         "chart_data": _chart_rows(df, ["close", "mswing", "mswing_ema9", "sma50"]),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Strategy 13: Momentum Reversal
+#
+# Single-symbol contrarian strategy — same "pure function over
+# list[DailyPrice], returns None when there isn't enough history"
+# convention as every other strategy in this module.
+#
+# SOURCE MATERIAL NOTE: the reference article demonstrates this strategy
+# on 1-minute TSLA bars:
+#
+#   returns = close.pct_change()
+#   if returns < -0.001: go long   (BUY)
+#   if returns >  0.001: go short  (SELL)
+#   otherwise: no new signal, retain the previous position
+#
+# The article's own backtest is on a single symbol (TSLA) at 1-minute
+# resolution and is not treated here as evidence the rule is profitable
+# on any other symbol or timeframe.
+#
+# DATA LIMITATION: this codebase's ingestion pipeline (services/
+# ingestion.py) only stores end-of-day bars (see app.models.DailyPrice —
+# one row per trading day, no intraday timestamps), the same data source
+# every other strategy in this module already uses. No new data pipeline
+# or external data source is introduced to chase 1-minute bars; instead
+# the identical threshold rule is applied to daily close-to-close returns
+# (`to_close_series(prices).pct_change()`), i.e. the closest existing
+# data resolution actually available. Because daily returns are far
+# larger in magnitude than 1-minute returns, the same 0.1% thresholds
+# fire on essentially every trading day at daily resolution — this is a
+# faithful, undiluted application of the article's stated rule, not a
+# retuned/optimized variant, and is documented here rather than silently
+# rescaled.
+# ---------------------------------------------------------------------------
+
+# Exact thresholds from the source article (0.1%), applied to
+# `close.pct_change()` — see module note above for the daily-vs-1-minute
+# data-resolution caveat.
+MOMENTUM_REVERSAL_BUY_THRESHOLD = -0.001  # return below this => bullish reversal
+MOMENTUM_REVERSAL_SELL_THRESHOLD = 0.001  # return above this => bearish reversal
+
+# Small fixed floor: the rule itself only needs two consecutive closes,
+# but a short buffer is required so the position-retention chart is
+# meaningful rather than a single point — same "small fixed floor"
+# convention as MIN_ROWS_TLT_MONTHLY_CYCLE above.
+MIN_ROWS_MOMENTUM_REVERSAL = 15
+
+
+def compute_momentum_reversal(prices: list[DailyPrice]) -> dict | None:
+    """Momentum Reversal strategy.
+
+    Returns None when there isn't enough price history for even a short
+    position-retention readout (see MIN_ROWS_MOMENTUM_REVERSAL) — same
+    "unavailable" convention as every other strategy in this module.
+    Never returns a zeroed-out result for insufficient data.
+
+    Analytical/descriptive only: `reversal_signal` and `current_position`
+    describe what the rule would flag today and the position it would be
+    holding given the "retain previous position" rule — this is not a
+    buy/sell recommendation or an executed trade, matching every other
+    strategy in this module.
+    """
+    series = to_close_series(prices)
+    if len(series) < MIN_ROWS_MOMENTUM_REVERSAL:
+        return None
+
+    returns = series.pct_change()
+    df = pd.DataFrame({"close": series, "return": returns}).dropna()
+    if df.empty:
+        return None
+
+    signal = np.where(
+        df["return"] < MOMENTUM_REVERSAL_BUY_THRESHOLD,
+        "Bullish Reversal",
+        np.where(
+            df["return"] > MOMENTUM_REVERSAL_SELL_THRESHOLD,
+            "Bearish Reversal",
+            "No Signal",
+        ),
+    )
+    df["signal"] = signal
+
+    # Position retention: "Otherwise ... retain previous position" per
+    # the article's rule — a signal-less day never resets the position
+    # back to flat.
+    position: list[str] = []
+    current_position = "Flat"
+    for s in df["signal"]:
+        if s == "Bullish Reversal":
+            current_position = "Long"
+        elif s == "Bearish Reversal":
+            current_position = "Short"
+        position.append(current_position)
+    df["position"] = position
+
+    last = df.iloc[-1]
+    price = float(last["close"])
+    return_pct = float(last["return"]) * 100
+    reversal_signal = str(last["signal"])
+    current_position_val = str(last["position"])
+
+    position_changed_today = False
+    if len(df) > 1:
+        position_changed_today = str(df.iloc[-2]["position"]) != current_position_val
+
+    tail = df.tail(CHART_LOOKBACK_DAYS)
+    chart_data = [
+        {
+            "date": ts.date().isoformat(),
+            "close": _round(row["close"]),
+            "daily_return_percent": _round(row["return"] * 100, 3),
+            "position": row["position"],
+        }
+        for ts, row in tail.iterrows()
+    ]
+
+    return {
+        "price": _round(price),
+        "daily_return_percent": _round(return_pct, 3),
+        "buy_threshold_percent": _round(MOMENTUM_REVERSAL_BUY_THRESHOLD * 100, 3),
+        "sell_threshold_percent": _round(MOMENTUM_REVERSAL_SELL_THRESHOLD * 100, 3),
+        "reversal_signal": reversal_signal,
+        "current_position": current_position_val,
+        "position_changed_today": position_changed_today,
+        "chart_data": chart_data,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Strategy 14: One-Month Factor Momentum
+#
+# Cross-ETF strategy — same cross-cutting treatment as Risk-On/Risk-Off
+# (services/regime.py): computed once across the whole ETF universe and
+# cached separately (see routers/strategy.py), then sliced per symbol via
+# extract_factor_momentum_view below, rather than recomputed per symbol.
+#
+# SOURCE MATERIAL: the reference article's "factor momentum" measures the
+# *previous month's* factor performance (rather than the traditional
+# 12-month lookback) and rotates toward whichever factors led over that
+# window.
+#
+# FACTOR-DATA LIMITATION (read before changing this section): this
+# codebase does not ingest or compute genuine style-factor index data —
+# there are no Value/Quality/Low-Volatility/Momentum factor series (e.g.
+# no MTUM/VLUE/QUAL-style holdings or factor-return time series exist
+# anywhere in app.constants or app.services). Fabricating one would mean
+# inventing factor-return data that was never actually observed, which
+# this implementation deliberately does not do.
+#
+# What DOES already exist in the codebase is app.constants.ETF_REGISTRY's
+# `tags` field — the same category labels ("Equity", "Index",
+# "Technology", "Gold", "Treasury") already used to drive the ETF
+# Explorer's filter chips (app.constants.FILTER_CATEGORIES). This
+# strategy reuses that existing categorical grouping as the "factor"
+# grouping: a "factor's" one-month performance is the average one-month
+# price return of every ETF in the existing universe that already carries
+# that tag. This is a documented adaptation built entirely from data
+# already present in the codebase — NOT literal Fama-French/MSCI style
+# factors, and it is reported as such (see `factor_data_basis` in the
+# response) so it is never mistaken for genuine factor-index data.
+# ---------------------------------------------------------------------------
+
+# ~1 trading month, matching the article's "previous 1-month" lookback
+# (as opposed to the traditional 12-month factor-momentum lookback).
+FACTOR_MOMENTUM_LOOKBACK_TRADING_DAYS = 21
+
+# Needs the lookback window plus one extra day (t and t-21) plus a small
+# buffer, same "period plus buffer" convention as every other MIN_ROWS_*
+# constant in this module.
+MIN_ROWS_FACTOR_MOMENTUM = FACTOR_MOMENTUM_LOOKBACK_TRADING_DAYS + 5
+
+# Suggested exposure is bounded, same spirit (and same bounded-sizing
+# convention) as EVAR_MIN/MAX_EXPOSURE_PERCENT above — this informs
+# sizing, it never suggests fully exiting a position from a single
+# cross-sectional read.
+FACTOR_MOMENTUM_MIN_EXPOSURE_PERCENT = 30.0
+FACTOR_MOMENTUM_MAX_EXPOSURE_PERCENT = 100.0
+
+FACTOR_MOMENTUM_DATA_BASIS = (
+    "Existing ETF_REGISTRY category tags (Equity, Index, Technology, "
+    "Gold, Treasury) used as a factor-grouping proxy — not standalone "
+    "style-factor (Value/Quality/Low-Vol) index data, which this "
+    "codebase does not ingest."
+)
+
+
+def _one_month_return_percent(series: pd.Series) -> float | None:
+    """Close-to-close return over FACTOR_MOMENTUM_LOOKBACK_TRADING_DAYS
+    trading days, in percent. None when there isn't enough history or
+    the lookback price is zero/unusable — never fabricated."""
+    if len(series) < MIN_ROWS_FACTOR_MOMENTUM:
+        return None
+    recent = series.iloc[-1]
+    lookback = series.iloc[-(FACTOR_MOMENTUM_LOOKBACK_TRADING_DAYS + 1)]
+    if lookback in (0, None) or pd.isna(lookback) or pd.isna(recent):
+        return None
+    return float((recent / lookback - 1) * 100)
+
+
+def compute_factor_momentum(
+    prices_by_symbol: dict[str, list[DailyPrice]],
+) -> dict | None:
+    """One-Month Factor Momentum — cross-ETF computation shared by every
+    symbol's response (see module note above and routers/strategy.py).
+
+    `prices_by_symbol` is every ETF_REGISTRY symbol's own daily-bar
+    history (loaded the same way as the Risk-On/Risk-Off universe load —
+    see routers/strategy.py `_load_factor_momentum`). Returns None when
+    fewer than two ETFs have enough history for a one-month return, since
+    a meaningful factor-group ranking needs at least two ETFs.
+    """
+    returns_by_symbol: dict[str, float] = {}
+    for symbol, prices in prices_by_symbol.items():
+        series = to_close_series(prices)
+        one_month_return = _one_month_return_percent(series)
+        if one_month_return is not None:
+            returns_by_symbol[symbol] = one_month_return
+
+    if len(returns_by_symbol) < 2:
+        return None
+
+    tag_returns: dict[str, list[float]] = {}
+    for symbol, one_month_return in returns_by_symbol.items():
+        meta = ETF_REGISTRY.get(symbol)
+        if meta is None:
+            continue
+        for tag in meta.tags:
+            tag_returns.setdefault(tag, []).append(one_month_return)
+
+    if not tag_returns:
+        return None
+
+    factor_performance = {
+        tag: sum(vals) / len(vals) for tag, vals in tag_returns.items()
+    }
+    ranked_factors = sorted(
+        factor_performance.items(), key=lambda kv: kv[1], reverse=True
+    )
+    factor_rankings = [
+        {
+            "factor": tag,
+            "one_month_return_percent": _round(ret, 2),
+            "rank": i + 1,
+        }
+        for i, (tag, ret) in enumerate(ranked_factors)
+    ]
+    leading_factor = ranked_factors[0][0]
+    lagging_factor = ranked_factors[-1][0]
+
+    # Symbol-level factor-momentum score: equal-weighted average of the
+    # factor performance of every tag THIS symbol itself carries (a
+    # symbol with no recognized tags gets no score, same "unavailable"
+    # convention as everywhere else).
+    symbol_scores: dict[str, float] = {}
+    for symbol in returns_by_symbol:
+        meta = ETF_REGISTRY.get(symbol)
+        if meta is None or not meta.tags:
+            continue
+        tag_vals = [
+            factor_performance[tag] for tag in meta.tags if tag in factor_performance
+        ]
+        if tag_vals:
+            symbol_scores[symbol] = sum(tag_vals) / len(tag_vals)
+
+    return {
+        "lookback_trading_days": FACTOR_MOMENTUM_LOOKBACK_TRADING_DAYS,
+        "factor_rankings": factor_rankings,
+        "leading_factor": leading_factor,
+        "lagging_factor": lagging_factor,
+        "etf_universe": sorted(returns_by_symbol.keys()),
+        "symbol_returns": returns_by_symbol,
+        "symbol_scores": symbol_scores,
+        "factor_data_basis": FACTOR_MOMENTUM_DATA_BASIS,
+    }
+
+
+def extract_factor_momentum_view(
+    factor_momentum: dict | None,
+    symbol: str,
+    own_prices: list[DailyPrice],
+) -> dict | None:
+    """Per-symbol response slice from the shared cross-ETF computation
+    (see compute_factor_momentum above), plus a symbol-own chart series —
+    same pattern as regime.extract_symbol_view for Risk-On/Risk-Off.
+
+    Returns None if the cross-ETF computation is unavailable, or if
+    `symbol` specifically didn't have a usable one-month return or any
+    recognized ETF_REGISTRY tags.
+    """
+    if factor_momentum is None:
+        return None
+
+    symbol_return = factor_momentum["symbol_returns"].get(symbol)
+    symbol_score = factor_momentum["symbol_scores"].get(symbol)
+    meta = ETF_REGISTRY.get(symbol)
+    if symbol_return is None or symbol_score is None or meta is None:
+        return None
+
+    symbol_tags = meta.tags
+    scores = list(factor_momentum["symbol_scores"].values())
+    if len(scores) > 1:
+        percentile = sum(1 for s in scores if s <= symbol_score) / len(scores) * 100
+    else:
+        percentile = 100.0
+
+    suggested_exposure = FACTOR_MOMENTUM_MIN_EXPOSURE_PERCENT + (
+        FACTOR_MOMENTUM_MAX_EXPOSURE_PERCENT - FACTOR_MOMENTUM_MIN_EXPOSURE_PERCENT
+    ) * (percentile / 100)
+
+    is_aligned_with_leading_factor = factor_momentum["leading_factor"] in symbol_tags
+    is_aligned_with_lagging_factor = factor_momentum["lagging_factor"] in symbol_tags
+
+    if is_aligned_with_leading_factor:
+        # "Maintain/increase exposure to stronger factors" per the
+        # source article's conceptual rule.
+        exposure_guidance = "Maintain / Increase Exposure"
+    elif is_aligned_with_lagging_factor:
+        exposure_guidance = "Reduce Exposure"
+    else:
+        exposure_guidance = "Neutral"
+
+    series = to_close_series(own_prices)
+    rolling_return_pct = (
+        series.pct_change(periods=FACTOR_MOMENTUM_LOOKBACK_TRADING_DAYS) * 100
+    )
+    chart_df = pd.DataFrame(
+        {"close": series, "one_month_return_percent": rolling_return_pct}
+    ).dropna()
+    chart_data = (
+        _chart_rows(chart_df, ["close", "one_month_return_percent"])
+        if not chart_df.empty
+        else []
+    )
+
+    return {
+        "symbol": symbol,
+        "symbol_tags": symbol_tags,
+        "one_month_return_percent": _round(symbol_return, 2),
+        "factor_momentum_score": _round(symbol_score, 2),
+        "factor_rankings": factor_momentum["factor_rankings"],
+        "leading_factor": factor_momentum["leading_factor"],
+        "lagging_factor": factor_momentum["lagging_factor"],
+        "is_aligned_with_leading_factor": is_aligned_with_leading_factor,
+        "exposure_guidance": exposure_guidance,
+        "suggested_exposure_percent": _round(suggested_exposure, 2),
+        "etf_universe": factor_momentum["etf_universe"],
+        "lookback_trading_days": factor_momentum["lookback_trading_days"],
+        "factor_data_basis": factor_momentum["factor_data_basis"],
+        "chart_data": chart_data,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Strategy 15: HMM Regime-Switching
+#
+# Single-symbol strategy — same "pure function over list[DailyPrice],
+# returns None when there isn't enough history" convention as every other
+# strategy in this module.
+#
+# SOURCE MATERIAL: the reference article uses a Hidden Markov Model to
+# classify market regimes (e.g. bull/trending vs bear/high-volatility)
+# and uses that regime classification to switch between a Momentum
+# approach and a Mean-Reversion approach.
+#
+# NO DEPENDENCY CHANGE: no HMM library (e.g. hmmlearn) is a dependency of
+# this project (see requirements.txt) and none is added here. A minimal,
+# 2-state Gaussian Hidden Markov Model is instead implemented directly
+# with numpy — Baum-Welch (EM) parameter estimation via the standard
+# forward-backward algorithm — the same "implemented directly with
+# pandas/numpy, no external library" convention already used by
+# services/regime.py for its own DTW/clustering step (see that module's
+# docstring) and by every indicator in this module (EMA/RSI/MACD/ATR are
+# all hand-rolled above, not pulled from a TA library).
+#
+# MODEL: 2 hidden states over the daily log-return series (the same
+# close-price data every other single-symbol strategy in this module
+# uses). The discriminating feature between the two fitted states is
+# volatility (variance of returns) — the lower-variance state is reported
+# as "Trending / Momentum-Favorable", the higher-variance state as
+# "High-Volatility / Mean-Reversion-Favorable", the standard practical
+# reading of a 2-state Gaussian return-regime model. `recommended_approach`
+# ("Momentum" | "Mean Reversion") reflects that regime-to-approach
+# switch, same descriptive/analytical convention as every other strategy
+# in this module — it is not a buy/sell recommendation or an executed
+# trade.
+# ---------------------------------------------------------------------------
+
+HMM_N_STATES = 2
+HMM_MAX_ITER = 100
+HMM_TOLERANCE = 1e-4
+
+# Trailing window of daily log returns used to fit the HMM. ~1 trading
+# year — long enough to let both a "calm" and a "stressed" regime show up
+# in-sample, short enough that the fit reflects the recent regime mix
+# rather than the symbol's entire history.
+HMM_RETURN_LOOKBACK_DAYS = 252
+
+# Minimum daily bars required before a 2-state fit is considered
+# meaningful — same "unavailable rather than zeroed-out" convention as
+# every MIN_ROWS_* constant in this module.
+MIN_ROWS_HMM_REGIME = 120
+
+
+def _hmm_fit_gaussian_2state(x: np.ndarray) -> dict:
+    """Minimal Baum-Welch (EM) fit of a 2-state Gaussian HMM on a 1-D
+    observation series, implemented directly with numpy (see module note
+    above for why no HMM library is used).
+
+    Initialization is deterministic (median split of the observations,
+    not a random draw), so this stays a pure function of its input like
+    every other strategy in this module — the same result is produced
+    for the same price history every time.
+    """
+    n = len(x)
+    k = HMM_N_STATES
+
+    median = np.median(x)
+    low_obs = x[x <= median]
+    high_obs = x[x > median]
+    if len(low_obs) < 2 or len(high_obs) < 2:
+        # Degenerate split (e.g. many repeated values) — fall back to a
+        # simple positional split so the fit still has two distinct
+        # starting points.
+        half = max(n // 2, 1)
+        low_obs = x[:half] if half >= 2 else x
+        high_obs = x[half:] if (n - half) >= 2 else x
+
+    means = np.array([float(low_obs.mean()), float(high_obs.mean())])
+    variances = np.array(
+        [max(float(low_obs.var()), 1e-10), max(float(high_obs.var()), 1e-10)]
+    )
+    # Order states by mean return (ascending) as a stable, deterministic
+    # starting point — final state identity is reassigned by volatility
+    # after fitting (see compute_hmm_regime_switching below).
+    order = np.argsort(means)
+    means = means[order]
+    variances = variances[order]
+
+    # Sticky prior (regimes persist day-to-day far more often than they
+    # switch) — a standard, documented starting point for daily-return
+    # regime models, refined by EM below.
+    transition = np.full((k, k), 0.05)
+    np.fill_diagonal(transition, 0.95)
+    initial = np.full(k, 1.0 / k)
+
+    log_likelihood_prev = -np.inf
+    for _ in range(HMM_MAX_ITER):
+        emission = np.zeros((n, k))
+        for state in range(k):
+            var_state = max(float(variances[state]), 1e-10)
+            emission[:, state] = np.exp(
+                -0.5 * (x - means[state]) ** 2 / var_state
+            ) / np.sqrt(2 * np.pi * var_state)
+        emission = np.clip(emission, 1e-300, None)
+
+        # Forward pass (scaled, to avoid numerical underflow over long
+        # observation windows).
+        alpha = np.zeros((n, k))
+        scale = np.zeros(n)
+        alpha[0] = initial * emission[0]
+        scale[0] = alpha[0].sum() or 1e-300
+        alpha[0] /= scale[0]
+        for t in range(1, n):
+            alpha[t] = (alpha[t - 1] @ transition) * emission[t]
+            scale[t] = alpha[t].sum() or 1e-300
+            alpha[t] /= scale[t]
+
+        # Backward pass (scaled with the same factors as the forward pass).
+        beta = np.zeros((n, k))
+        beta[-1] = 1.0
+        for t in range(n - 2, -1, -1):
+            beta[t] = (transition @ (emission[t + 1] * beta[t + 1])) / scale[t + 1]
+
+        gamma = alpha * beta
+        gamma_row_sums = gamma.sum(axis=1, keepdims=True)
+        gamma_row_sums[gamma_row_sums == 0] = 1e-300
+        gamma /= gamma_row_sums
+
+        xi_sum = np.zeros((k, k))
+        for t in range(n - 1):
+            xi_t = (
+                alpha[t][:, None]
+                * transition
+                * emission[t + 1][None, :]
+                * beta[t + 1][None, :]
+            ) / (scale[t + 1] or 1e-300)
+            xi_sum += xi_t
+
+        initial = gamma[0]
+        gamma_sum_excl_last = gamma[:-1].sum(axis=0)
+        gamma_sum_excl_last[gamma_sum_excl_last == 0] = 1e-300
+        transition = xi_sum / gamma_sum_excl_last[:, None]
+
+        gamma_total = gamma.sum(axis=0)
+        gamma_total[gamma_total == 0] = 1e-300
+        means = (gamma * x[:, None]).sum(axis=0) / gamma_total
+        variances = (gamma * (x[:, None] - means[None, :]) ** 2).sum(
+            axis=0
+        ) / gamma_total
+        variances = np.clip(variances, 1e-10, None)
+
+        log_likelihood = float(np.sum(np.log(scale)))
+        if abs(log_likelihood - log_likelihood_prev) < HMM_TOLERANCE:
+            break
+        log_likelihood_prev = log_likelihood
+
+    return {
+        "means": means,
+        "variances": variances,
+        "transition": transition,
+        "gamma": gamma,
+        "log_likelihood": log_likelihood_prev,
+    }
+
+
+def compute_hmm_regime_switching(prices: list[DailyPrice]) -> dict | None:
+    """HMM Regime-Switching strategy.
+
+    Returns None when there isn't enough daily price history for a
+    meaningful 2-state fit (see MIN_ROWS_HMM_REGIME) — same "unavailable"
+    convention as every other strategy in this module.
+    """
+    series = to_close_series(prices)
+    if len(series) < MIN_ROWS_HMM_REGIME:
+        return None
+
+    log_returns = np.log(series / series.shift(1)).dropna()
+    log_returns = log_returns.tail(HMM_RETURN_LOOKBACK_DAYS)
+    if len(log_returns) < MIN_ROWS_HMM_REGIME:
+        return None
+
+    x = log_returns.to_numpy(dtype=float)
+    fit = _hmm_fit_gaussian_2state(x)
+    means, variances = fit["means"], fit["variances"]
+    transition, gamma = fit["transition"], fit["gamma"]
+
+    trending_state = int(np.argmin(variances))
+    high_vol_state = 1 - trending_state
+
+    current_probs = gamma[-1]
+    current_state = int(np.argmax(current_probs))
+    current_regime = (
+        "Trending / Momentum-Favorable"
+        if current_state == trending_state
+        else "High-Volatility / Mean-Reversion-Favorable"
+    )
+    recommended_approach = (
+        "Momentum" if current_state == trending_state else "Mean Reversion"
+    )
+
+    regime_changed_today = False
+    if len(gamma) > 1:
+        previous_state = int(np.argmax(gamma[-2]))
+        regime_changed_today = previous_state != current_state
+
+    dates = log_returns.index
+    state_path = np.argmax(gamma, axis=1)
+    regime_labels = pd.Series(state_path, index=dates).map(
+        {trending_state: "Trending", high_vol_state: "High-Volatility"}
+    )
+    chart_df = pd.DataFrame(
+        {
+            "close": series.reindex(dates),
+            "log_return_percent": log_returns * 100,
+            "trending_probability_percent": gamma[:, trending_state] * 100,
+        }
+    )
+    tail = chart_df.tail(CHART_LOOKBACK_DAYS)
+    regime_tail = regime_labels.tail(CHART_LOOKBACK_DAYS)
+    chart_data = [
+        {
+            "date": ts.date().isoformat(),
+            "close": _round(row["close"]),
+            "log_return_percent": _round(row["log_return_percent"], 3),
+            "trending_probability_percent": _round(
+                row["trending_probability_percent"], 2
+            ),
+            "regime": regime_tail.loc[ts],
+        }
+        for ts, row in tail.iterrows()
+    ]
+
+    return {
+        "price": _round(float(series.iloc[-1])),
+        "current_regime": current_regime,
+        "recommended_approach": recommended_approach,
+        "trending_probability_percent": _round(
+            float(current_probs[trending_state]) * 100, 2
+        ),
+        "high_volatility_probability_percent": _round(
+            float(current_probs[high_vol_state]) * 100, 2
+        ),
+        "regime_persistence_probability_percent": _round(
+            float(transition[current_state, current_state]) * 100, 2
+        ),
+        "regime_changed_today": regime_changed_today,
+        "trending_state_mean_return_percent": _round(
+            float(means[trending_state]) * 100, 4
+        ),
+        "trending_state_volatility_percent": _round(
+            float(np.sqrt(variances[trending_state])) * 100, 4
+        ),
+        "high_vol_state_mean_return_percent": _round(
+            float(means[high_vol_state]) * 100, 4
+        ),
+        "high_vol_state_volatility_percent": _round(
+            float(np.sqrt(variances[high_vol_state])) * 100, 4
+        ),
+        "lookback_days": len(log_returns),
+        "chart_data": chart_data,
     }

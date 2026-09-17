@@ -14,14 +14,27 @@ Covers:
 - compute_mswing (Strategy 12): insufficient history, calculation,
   EMA9/SMA50, the four momentum states, zero-line/EMA crossovers, the
   default bullish/bearish-exit conditions, and chart output.
+- compute_momentum_reversal (Strategy 13): insufficient history,
+  buy/sell threshold detection, "retain previous position" behavior,
+  position-changed flag, and chart output.
+- compute_factor_momentum / extract_factor_momentum_view (Strategy 14):
+  insufficient/degenerate universes, factor ranking from ETF_REGISTRY
+  tags, leading/lagging factor identification, per-symbol exposure
+  guidance, and graceful handling of a symbol missing from the universe.
+- compute_hmm_regime_switching (Strategy 15): insufficient history,
+  regime detection across a synthetic low-vol/high-vol two-regime
+  series, probability/NaN sanity, and the degenerate (zero-variance)
+  input case.
 - Graceful handling of insufficient history (returns None, no crash)
 """
 
 import datetime
+import random
 from unittest.mock import MagicMock
 
 import pytest
 
+from app.constants import ETF_REGISTRY
 from app.services import strategies
 
 
@@ -1058,3 +1071,378 @@ class TestMswingRelativeStrength:
         )
         assert result is not None
         assert result["relative_strength_index_symbol"] == "SPY"
+
+
+# ---------------------------------------------------------------------------
+# Strategy 13: Momentum Reversal
+# ---------------------------------------------------------------------------
+
+
+class TestMomentumReversalInsufficientHistory:
+    def test_empty_prices_return_none(self):
+        assert strategies.compute_momentum_reversal([]) is None
+
+    def test_too_few_rows_return_none(self):
+        prices = _make_series(
+            "VOO",
+            datetime.date(2024, 1, 2),
+            [100.0] * (strategies.MIN_ROWS_MOMENTUM_REVERSAL - 1),
+        )
+        assert strategies.compute_momentum_reversal(prices) is None
+
+
+class TestMomentumReversalSignals:
+    def test_thresholds_match_source_article(self):
+        # 0.1% in each direction, per the source article's rule.
+        assert strategies.MOMENTUM_REVERSAL_BUY_THRESHOLD == pytest.approx(-0.001)
+        assert strategies.MOMENTUM_REVERSAL_SELL_THRESHOLD == pytest.approx(0.001)
+
+    def test_bullish_reversal_on_sharp_down_day(self):
+        # Flat, then a >0.1% drop on the final bar.
+        closes = [100.0] * 14 + [99.0]
+        prices = _make_series("VOO", datetime.date(2024, 1, 2), closes)
+        result = strategies.compute_momentum_reversal(prices)
+
+        assert result is not None
+        assert result["reversal_signal"] == "Bullish Reversal"
+        assert result["current_position"] == "Long"
+        assert result["position_changed_today"] is True
+        assert result["daily_return_percent"] == pytest.approx(-1.0, abs=0.01)
+
+    def test_bearish_reversal_on_sharp_up_day(self):
+        closes = [100.0] * 14 + [101.0]
+        prices = _make_series("VOO", datetime.date(2024, 1, 2), closes)
+        result = strategies.compute_momentum_reversal(prices)
+
+        assert result is not None
+        assert result["reversal_signal"] == "Bearish Reversal"
+        assert result["current_position"] == "Short"
+        assert result["position_changed_today"] is True
+
+    def test_no_signal_within_thresholds(self):
+        # A tiny final-day move, well inside +/-0.1%.
+        closes = [100.0] * 14 + [100.02]
+        prices = _make_series("VOO", datetime.date(2024, 1, 2), closes)
+        result = strategies.compute_momentum_reversal(prices)
+
+        assert result is not None
+        assert result["reversal_signal"] == "No Signal"
+
+
+class TestMomentumReversalPositionRetention:
+    def test_position_retained_on_a_no_signal_day(self):
+        # Day 14 triggers a Buy (-1%); day 15 is flat (no new signal), so
+        # the article's "otherwise retain previous position" rule should
+        # keep the position Long.
+        closes = [100.0] * 13 + [99.0, 99.0]
+        prices = _make_series("VOO", datetime.date(2024, 1, 2), closes)
+        result = strategies.compute_momentum_reversal(prices)
+
+        assert result is not None
+        assert result["reversal_signal"] == "No Signal"
+        assert result["current_position"] == "Long"
+        assert result["position_changed_today"] is False
+
+    def test_position_flips_from_long_to_short(self):
+        closes = [100.0] * 13 + [99.0, 101.0]
+        prices = _make_series("VOO", datetime.date(2024, 1, 2), closes)
+        result = strategies.compute_momentum_reversal(prices)
+
+        assert result is not None
+        assert result["current_position"] == "Short"
+        assert result["position_changed_today"] is True
+
+    def test_flat_before_any_signal_has_fired(self):
+        # No day ever crosses either threshold -> position stays Flat.
+        closes = [100.0] * 20
+        prices = _make_series("VOO", datetime.date(2024, 1, 2), closes)
+        result = strategies.compute_momentum_reversal(prices)
+
+        assert result is not None
+        assert result["current_position"] == "Flat"
+        assert result["position_changed_today"] is False
+
+
+class TestMomentumReversalChartData:
+    def test_chart_data_present_and_bounded(self):
+        closes = [100.0 * (1.001**i) for i in range(300)]
+        prices = _make_series("VOO", datetime.date(2023, 1, 2), closes)
+        result = strategies.compute_momentum_reversal(prices)
+
+        assert result is not None
+        assert len(result["chart_data"]) <= strategies.CHART_LOOKBACK_DAYS
+        row = result["chart_data"][-1]
+        assert set(row.keys()) == {
+            "date",
+            "close",
+            "daily_return_percent",
+            "position",
+        }
+        assert row["position"] in {"Long", "Short", "Flat"}
+
+
+# ---------------------------------------------------------------------------
+# Strategy 14: One-Month Factor Momentum
+# ---------------------------------------------------------------------------
+
+
+class TestFactorMomentumInsufficientUniverse:
+    def test_empty_universe_returns_none(self):
+        assert strategies.compute_factor_momentum({}) is None
+
+    def test_single_symbol_universe_returns_none(self):
+        n = strategies.MIN_ROWS_FACTOR_MOMENTUM + 5
+        prices = _make_series(
+            "QQQ", datetime.date(2024, 1, 2), [100.0 * (1.01**i) for i in range(n)]
+        )
+        assert strategies.compute_factor_momentum({"QQQ": prices}) is None
+
+    def test_extract_view_returns_none_when_universe_unavailable(self):
+        assert strategies.extract_factor_momentum_view(None, "QQQ", []) is None
+
+
+class TestFactorMomentumRanking:
+    def _build_universe(self) -> dict[str, list[MagicMock]]:
+        n = strategies.MIN_ROWS_FACTOR_MOMENTUM + 5
+        start = datetime.date(2024, 1, 2)
+        return {
+            # Technology/Equity/Index: strong uptrend -> leading factor
+            "QQQ": _make_series(
+                "QQQ", start, [100.0 * (1.01**i) for i in range(n)]
+            ),
+            # Equity/Index: modest uptrend
+            "VOO": _make_series(
+                "VOO", start, [100.0 * (1.002**i) for i in range(n)]
+            ),
+            # Gold: decline -> lagging factor
+            "GLD": _make_series(
+                "GLD", start, [100.0 * (0.995**i) for i in range(n)]
+            ),
+            # Treasury: roughly flat
+            "SHY": _make_series(
+                "SHY", start, [100.0 * (1.0005**i) for i in range(n)]
+            ),
+        }
+
+    def test_uses_etf_registry_tags_as_factor_groups(self):
+        universe = self._build_universe()
+        result = strategies.compute_factor_momentum(universe)
+        assert result is not None
+
+        ranked_tags = {row["factor"] for row in result["factor_rankings"]}
+        expected_tags = {"Equity", "Index", "Technology", "Gold", "Treasury"}
+        assert ranked_tags == expected_tags
+        assert "Existing ETF_REGISTRY category tags" in result["factor_data_basis"]
+
+    def test_leading_and_lagging_factor(self):
+        universe = self._build_universe()
+        result = strategies.compute_factor_momentum(universe)
+        assert result is not None
+        assert result["leading_factor"] == "Technology"
+        assert result["lagging_factor"] == "Gold"
+
+    def test_rankings_sorted_descending_by_return(self):
+        universe = self._build_universe()
+        result = strategies.compute_factor_momentum(universe)
+        assert result is not None
+        returns = [row["one_month_return_percent"] for row in result["factor_rankings"]]
+        assert returns == sorted(returns, reverse=True)
+        ranks = [row["rank"] for row in result["factor_rankings"]]
+        assert ranks == list(range(1, len(ranks) + 1))
+
+    def test_no_nan_or_inf_in_rankings(self):
+        universe = self._build_universe()
+        result = strategies.compute_factor_momentum(universe)
+        assert result is not None
+        for row in result["factor_rankings"]:
+            value = row["one_month_return_percent"]
+            assert value == value  # not NaN
+            assert abs(value) != float("inf")
+
+
+class TestFactorMomentumSymbolView:
+    def _factor_momentum_and_universe(self):
+        n = strategies.MIN_ROWS_FACTOR_MOMENTUM + 5
+        start = datetime.date(2024, 1, 2)
+        universe = {
+            "QQQ": _make_series(
+                "QQQ", start, [100.0 * (1.01**i) for i in range(n)]
+            ),
+            "VOO": _make_series(
+                "VOO", start, [100.0 * (1.002**i) for i in range(n)]
+            ),
+            "GLD": _make_series(
+                "GLD", start, [100.0 * (0.995**i) for i in range(n)]
+            ),
+            "SHY": _make_series(
+                "SHY", start, [100.0 * (1.0005**i) for i in range(n)]
+            ),
+        }
+        return strategies.compute_factor_momentum(universe), universe
+
+    def test_symbol_aligned_with_leading_factor(self):
+        factor_momentum, universe = self._factor_momentum_and_universe()
+        view = strategies.extract_factor_momentum_view(
+            factor_momentum, "QQQ", universe["QQQ"]
+        )
+        assert view is not None
+        assert view["symbol"] == "QQQ"
+        assert view["symbol_tags"] == ETF_REGISTRY["QQQ"].tags
+        assert view["is_aligned_with_leading_factor"] is True
+        assert view["exposure_guidance"] == "Maintain / Increase Exposure"
+        assert view["suggested_exposure_percent"] == pytest.approx(100.0)
+
+    def test_symbol_aligned_with_lagging_factor(self):
+        factor_momentum, universe = self._factor_momentum_and_universe()
+        view = strategies.extract_factor_momentum_view(
+            factor_momentum, "GLD", universe["GLD"]
+        )
+        assert view is not None
+        assert view["is_aligned_with_leading_factor"] is False
+        assert view["exposure_guidance"] == "Reduce Exposure"
+        assert (
+            strategies.FACTOR_MOMENTUM_MIN_EXPOSURE_PERCENT
+            <= view["suggested_exposure_percent"]
+            <= strategies.FACTOR_MOMENTUM_MAX_EXPOSURE_PERCENT
+        )
+
+    def test_symbol_missing_from_universe_returns_none(self):
+        n = strategies.MIN_ROWS_FACTOR_MOMENTUM + 5
+        start = datetime.date(2024, 1, 2)
+        # SHY intentionally excluded from the universe passed to compute_*.
+        universe = {
+            "QQQ": _make_series(
+                "QQQ", start, [100.0 * (1.01**i) for i in range(n)]
+            ),
+            "VOO": _make_series(
+                "VOO", start, [100.0 * (1.002**i) for i in range(n)]
+            ),
+            "GLD": _make_series(
+                "GLD", start, [100.0 * (0.995**i) for i in range(n)]
+            ),
+        }
+        factor_momentum = strategies.compute_factor_momentum(universe)
+        shy_prices = _make_series(
+            "SHY", start, [100.0 * (1.0005**i) for i in range(n)]
+        )
+        view = strategies.extract_factor_momentum_view(
+            factor_momentum, "SHY", shy_prices
+        )
+        assert view is None
+
+    def test_chart_data_present_and_bounded(self):
+        factor_momentum, universe = self._factor_momentum_and_universe()
+        view = strategies.extract_factor_momentum_view(
+            factor_momentum, "VOO", universe["VOO"]
+        )
+        assert view is not None
+        assert len(view["chart_data"]) <= strategies.CHART_LOOKBACK_DAYS
+        if view["chart_data"]:
+            row = view["chart_data"][-1]
+            assert set(row.keys()) == {"date", "close", "one_month_return_percent"}
+
+
+# ---------------------------------------------------------------------------
+# Strategy 15: HMM Regime-Switching
+# ---------------------------------------------------------------------------
+
+
+def _two_regime_prices(symbol: str = "HMT", seed: int = 2024) -> list[MagicMock]:
+    """~1 trading year of a calm/trending regime followed by a volatile,
+    choppy regime — a fixed local Random instance (not the global `random`
+    module) keeps this deterministic regardless of test execution order.
+    """
+    rng = random.Random(seed)
+    start = datetime.date(2022, 1, 3)
+    closes = [100.0]
+    for i in range(300):
+        if i < 150:
+            drift, vol = 0.0009, 0.004  # calm, trending
+        else:
+            drift, vol = -0.0003, 0.03  # volatile, choppy
+        closes.append(closes[-1] * (1 + rng.gauss(drift, vol)))
+    return _make_series(symbol, start, closes)
+
+
+class TestHmmRegimeSwitchingInsufficientHistory:
+    def test_empty_prices_return_none(self):
+        assert strategies.compute_hmm_regime_switching([]) is None
+
+    def test_too_few_rows_return_none(self):
+        prices = _make_series(
+            "VOO",
+            datetime.date(2024, 1, 2),
+            [100.0] * (strategies.MIN_ROWS_HMM_REGIME - 1),
+        )
+        assert strategies.compute_hmm_regime_switching(prices) is None
+
+
+class TestHmmRegimeSwitchingCalculation:
+    def test_detects_high_volatility_regime_after_a_vol_spike(self):
+        prices = _two_regime_prices()
+        result = strategies.compute_hmm_regime_switching(prices)
+
+        assert result is not None
+        assert result["current_regime"] == "High-Volatility / Mean-Reversion-Favorable"
+        assert result["recommended_approach"] == "Mean Reversion"
+        # The two fitted states should be clearly separated by volatility,
+        # matching the synthetic calm-then-choppy construction.
+        assert (
+            result["high_vol_state_volatility_percent"]
+            > result["trending_state_volatility_percent"]
+        )
+
+    def test_probabilities_sum_to_one_hundred(self):
+        prices = _two_regime_prices()
+        result = strategies.compute_hmm_regime_switching(prices)
+        assert result is not None
+        total = (
+            result["trending_probability_percent"]
+            + result["high_volatility_probability_percent"]
+        )
+        assert total == pytest.approx(100.0, abs=0.01)
+
+    def test_no_nan_or_inf_in_output(self):
+        prices = _two_regime_prices()
+        result = strategies.compute_hmm_regime_switching(prices)
+        assert result is not None
+        for key, value in result.items():
+            if isinstance(value, float):
+                assert value == value, key  # not NaN
+                assert abs(value) != float("inf"), key
+
+    def test_regime_persistence_is_a_valid_probability(self):
+        prices = _two_regime_prices()
+        result = strategies.compute_hmm_regime_switching(prices)
+        assert result is not None
+        assert 0.0 <= result["regime_persistence_probability_percent"] <= 100.0
+
+    def test_zero_variance_input_does_not_crash(self):
+        # Degenerate case: perfectly flat prices (zero variance) must be
+        # handled gracefully, never raise, never emit NaN/Inf.
+        prices = _make_series(
+            "FLAT", datetime.date(2022, 1, 3), [100.0] * 200
+        )
+        result = strategies.compute_hmm_regime_switching(prices)
+        assert result is not None
+        for key, value in result.items():
+            if isinstance(value, float):
+                assert value == value, key
+                assert abs(value) != float("inf"), key
+
+
+class TestHmmRegimeSwitchingChartData:
+    def test_chart_data_present_and_bounded(self):
+        prices = _two_regime_prices()
+        result = strategies.compute_hmm_regime_switching(prices)
+        assert result is not None
+        assert len(result["chart_data"]) <= strategies.CHART_LOOKBACK_DAYS
+        row = result["chart_data"][-1]
+        assert set(row.keys()) == {
+            "date",
+            "close",
+            "log_return_percent",
+            "trending_probability_percent",
+            "regime",
+        }
+        assert row["regime"] in {"Trending", "High-Volatility"}

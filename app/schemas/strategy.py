@@ -394,6 +394,119 @@ class MswingStrategy(CamelModel):
     chart_data: list[MswingChartPoint]
 
 
+class MomentumReversalChartPoint(CamelModel):
+    date: str
+    close: float | None = None
+    daily_return_percent: float | None = None
+    position: str | None = None  # "Long" | "Short" | "Flat"
+
+
+class MomentumReversalStrategy(CamelModel):
+    """Momentum Reversal.
+
+    Contrarian single-symbol strategy: close.pct_change() below -0.1%
+    flags a Bullish Reversal, above +0.1% flags a Bearish Reversal,
+    otherwise the previous position is retained. The source article
+    demonstrates this on 1-minute TSLA bars; this codebase only ingests
+    daily bars (see app.models.DailyPrice), so the identical rule and
+    thresholds are applied to daily close-to-close returns instead of
+    introducing a new intraday data pipeline. See services.strategies
+    module docstring (Strategy 13) for the full data-resolution caveat.
+    Descriptive/analytical only — not a buy/sell recommendation.
+    """
+
+    price: float
+    daily_return_percent: float
+    buy_threshold_percent: float
+    sell_threshold_percent: float
+    reversal_signal: str  # "Bullish Reversal" | "Bearish Reversal" | "No Signal"
+    current_position: str  # "Long" | "Short" | "Flat"
+    position_changed_today: bool
+    chart_data: list[MomentumReversalChartPoint]
+
+
+class FactorRanking(CamelModel):
+    factor: str
+    one_month_return_percent: float
+    rank: int
+
+
+class FactorMomentumChartPoint(CamelModel):
+    date: str
+    close: float | None = None
+    one_month_return_percent: float | None = None
+
+
+class FactorMomentumStrategy(CamelModel):
+    """One-Month Factor Momentum.
+
+    Cross-ETF strategy: ranks "factors" by their previous ONE-MONTH
+    (not the traditional 12-month) average return, then reads whether
+    this symbol is aligned with the leading or lagging factor.
+    `factor_data_basis` documents exactly what stands in for factor data
+    here — this codebase has no standalone style-factor (Value/Quality/
+    Low-Vol) index data, so the existing ETF_REGISTRY category tags
+    (Equity, Index, Technology, Gold, Treasury — the same tags used by
+    the ETF Explorer's filter chips) are reused as the factor grouping.
+    See services.strategies module docstring (Strategy 14) for the full
+    methodology and this limitation. Descriptive/analytical only — not a
+    buy/sell recommendation.
+    """
+
+    symbol: str
+    symbol_tags: list[str]
+    one_month_return_percent: float
+    factor_momentum_score: float
+    factor_rankings: list[FactorRanking]
+    leading_factor: str
+    lagging_factor: str
+    is_aligned_with_leading_factor: bool
+    exposure_guidance: str  # "Maintain / Increase Exposure" | "Neutral" | "Reduce Exposure"
+    suggested_exposure_percent: float
+    etf_universe: list[str]
+    lookback_trading_days: int
+    factor_data_basis: str
+    chart_data: list[FactorMomentumChartPoint]
+
+
+class HmmRegimeSwitchingChartPoint(CamelModel):
+    date: str
+    close: float | None = None
+    log_return_percent: float | None = None
+    trending_probability_percent: float | None = None
+    regime: str | None = None  # "Trending" | "High-Volatility"
+
+
+class HmmRegimeSwitchingStrategy(CamelModel):
+    """HMM Regime-Switching.
+
+    Single-symbol strategy: a 2-state Gaussian Hidden Markov Model is
+    fit on daily log returns (Baum-Welch / forward-backward, implemented
+    directly with numpy — no HMM library is a dependency of this
+    project). The lower-variance fitted state is read as "Trending /
+    Momentum-Favorable", the higher-variance state as "High-Volatility /
+    Mean-Reversion-Favorable"; `recommended_approach` reflects that
+    regime-to-approach switch described in the source article. See
+    services.strategies module docstring (Strategy 15) for the full
+    model and assumptions. Descriptive/analytical only — not a buy/sell
+    recommendation.
+    """
+
+    price: float
+    current_regime: str  # "Trending / Momentum-Favorable" | "High-Volatility / Mean-Reversion-Favorable"
+    recommended_approach: str  # "Momentum" | "Mean Reversion"
+    trending_probability_percent: float
+    high_volatility_probability_percent: float
+    regime_persistence_probability_percent: float
+    regime_changed_today: bool
+    trending_state_mean_return_percent: float
+    trending_state_volatility_percent: float
+    high_vol_state_mean_return_percent: float
+    high_vol_state_volatility_percent: float
+    lookback_days: int
+    chart_data: list[HmmRegimeSwitchingChartPoint]
+
+
 class StrategyAnalytics(CamelModel):
     """Top-level payload for GET /etfs/{symbol}/strategies.
 
@@ -429,3 +542,10 @@ class StrategyAnalytics(CamelModel):
     tqqq_tmf_ief_rebalancing: TqqqTmfIefRebalancingStrategy | None = None
     # Strategy 12 (single-ETF, all symbols): Mswing Momentum.
     mswing: MswingStrategy | None = None
+    # Strategy 13 (single-ETF, all symbols): Momentum Reversal.
+    momentum_reversal: MomentumReversalStrategy | None = None
+    # Strategy 14 (cross-ETF, all symbols — same cross-cutting treatment
+    # as Risk-On/Risk-Off): One-Month Factor Momentum.
+    factor_momentum: FactorMomentumStrategy | None = None
+    # Strategy 15 (single-ETF, all symbols): HMM Regime-Switching.
+    hmm_regime_switching: HmmRegimeSwitchingStrategy | None = None

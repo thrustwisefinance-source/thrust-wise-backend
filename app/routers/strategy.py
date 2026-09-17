@@ -64,6 +64,14 @@ IEF_SYMBOL = "IEF"
 # symbol (avoiding an extra DB round-trip on every /strategies request).
 MSWING_INDEX_CACHE_KEY = "tw:v1:strategy:mswing_index_value"
 
+# One-Month Factor Momentum is cross-ETF (it ranks the existing
+# ETF_REGISTRY category tags by their previous-month average return) and
+# its result doesn't depend on which symbol the frontend is currently
+# viewing — same cross-cutting treatment as Risk-On/Risk-Off, TLT Monthly
+# Cycle, and TQQQ/TMF/IEF Rebalancing above. See
+# services.strategies.compute_factor_momentum (Strategy 14).
+FACTOR_MOMENTUM_CACHE_KEY = "tw:v1:strategy:factor_momentum"
+
 
 async def _load_mswing_index_value(db: AsyncSession) -> float | None:
     index_prices = await load_prices(db, strategies.MSWING_INDEX_SYMBOL)
@@ -82,6 +90,19 @@ async def _load_tqqq_tmf_ief_rebalancing(db: AsyncSession) -> dict | None:
     return strategies.compute_tqqq_tmf_ief_rebalancing(
         tqqq_prices=tqqq_prices, tmf_prices=tmf_prices, ief_prices=ief_prices
     )
+
+
+async def _load_factor_momentum(db: AsyncSession) -> dict | None:
+    """Load each ETF_REGISTRY symbol's own daily price history and run
+    the One-Month Factor Momentum ranking once. Only called on a cache
+    miss for FACTOR_MOMENTUM_CACHE_KEY (via cache.get_or_compute below),
+    same pattern as _load_market_regime above.
+    """
+    prices_by_symbol = {
+        registry_symbol: await load_prices(db, registry_symbol)
+        for registry_symbol in ETF_REGISTRY
+    }
+    return strategies.compute_factor_momentum(prices_by_symbol)
 
 
 async def _load_market_regime(db: AsyncSession) -> dict | None:
@@ -135,19 +156,34 @@ async def get_strategy_analytics(symbol: str, db: AsyncSession = Depends(get_db)
       _load_mswing_index_value) since it doesn't depend on which symbol
       was requested — same cross-cutting treatment as TLT Monthly Cycle
       and TQQQ/TMF/IEF Rebalancing above.
+    - Momentum Reversal (a single-symbol strategy — see
+      services.strategies Strategy 13) for every symbol, computed from
+      that symbol's own price history the same way as the six core
+      technical strategies above.
+    - One-Month Factor Momentum (a cross-ETF strategy — see
+      services.strategies Strategy 14) for every symbol, computed once
+      across the whole ETF universe and cached separately (see
+      _load_factor_momentum) since the factor ranking itself doesn't
+      depend on which symbol was requested — same cross-cutting
+      treatment as Risk-On/Risk-Off above.
+    - HMM Regime-Switching (a single-symbol strategy — see
+      services.strategies Strategy 15) for every symbol, computed from
+      that symbol's own price history the same way as the six core
+      technical strategies above.
 
     Reuses the existing price retrieval (`load_prices`) and symbol
     validation (`resolve_meta`, `require_prices`) helpers, and follows
     the same cache-then-compute pattern as the other /etfs routes.
 
-    NOTE: bumping the cache key version (v6 -> v7) so previously cached
-    responses (which don't contain mswing) are not served for the new
-    field; the response shape stays backward compatible either way since
-    all fields are optional.
+    NOTE: bumping the cache key version (v7 -> v8) so previously cached
+    responses (which don't contain momentum_reversal / factor_momentum /
+    hmm_regime_switching) are not served for the new fields; the response
+    shape stays backward compatible either way since all fields are
+    optional.
     """
     meta = resolve_meta(symbol)
 
-    cache_key = f"tw:v7:strategies:{meta.symbol}"
+    cache_key = f"tw:v8:strategies:{meta.symbol}"
     cached = await cache.get_json(cache_key)
     if cached is not None:
         result = cached
@@ -169,6 +205,9 @@ async def get_strategy_analytics(symbol: str, db: AsyncSession = Depends(get_db)
             "tlt_monthly_cycle": None,
             "tqqq_tmf_ief_rebalancing": None,
             "mswing": None,
+            "momentum_reversal": strategies.compute_momentum_reversal(prices),
+            "factor_momentum": None,
+            "hmm_regime_switching": strategies.compute_hmm_regime_switching(prices),
         }
 
         if meta.symbol == PORTFOLIO_COMPARISON_SYMBOL:
@@ -202,6 +241,13 @@ async def get_strategy_analytics(symbol: str, db: AsyncSession = Depends(get_db)
             prices, index_mswing=mswing_index_value
         )
 
+        factor_momentum = await cache.get_or_compute(
+            FACTOR_MOMENTUM_CACHE_KEY, lambda: _load_factor_momentum(db)
+        )
+        result["factor_momentum"] = strategies.extract_factor_momentum_view(
+            factor_momentum, meta.symbol, prices
+        )
+
         await cache.set_json(cache_key, result)
 
     # Insufficient history is not an error — surface it as an informational
@@ -220,6 +266,9 @@ async def get_strategy_analytics(symbol: str, db: AsyncSession = Depends(get_db)
         "tlt_monthly_cycle": "TLT Monthly Cycle",
         "tqqq_tmf_ief_rebalancing": "TQQQ / TMF / IEF Rebalancing",
         "mswing": "Mswing Momentum",
+        "momentum_reversal": "Momentum Reversal",
+        "factor_momentum": "One-Month Factor Momentum",
+        "hmm_regime_switching": "HMM Regime Switching",
     }
     if meta.symbol == PORTFOLIO_COMPARISON_SYMBOL:
         strategy_labels["vt_vs_vti_vxus"] = "VT vs VTI+VXUS Portfolio Comparison"
