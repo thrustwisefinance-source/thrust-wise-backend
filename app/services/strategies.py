@@ -2166,3 +2166,894 @@ def compute_hmm_regime_switching(prices: list[DailyPrice]) -> dict | None:
         "lookback_days": len(log_returns),
         "chart_data": chart_data,
     }
+
+
+# ---------------------------------------------------------------------------
+# Strategy 16: Squeeze Momentum Indicator
+#
+# Source article: "I Found a New Indicator on Substack — Then Backtested
+# It on 50 Random Stocks". Combines Bollinger Bands and Keltner Channels
+# to detect a volatility "squeeze" (Bollinger Bands compress inside the
+# Keltner Channel = low-volatility coiling) and its "release" (Bollinger
+# Bands expand back outside the Keltner Channel), plus a rolling
+# linear-regression momentum oscillator.
+#
+# IMPORTANT: `momentum` below is the LAST FITTED VALUE of the rolling
+# linear regression line over the window (matching Pine's
+# ta.linreg(source, length, 0)) — i.e. intercept + slope * (length - 1)
+# — NOT the regression slope by itself. See _linreg_last_value.
+#
+# Descriptive/analytical only: the article's own basic strategy logic
+# (squeeze_off => entry, squeeze_on => exit) is surfaced here purely as
+# `squeeze_state` / `momentum_direction` / `momentum_state` fields to
+# read, never as an executed or recommended trade — same convention as
+# every other strategy in this module.
+# ---------------------------------------------------------------------------
+
+SMI_LENGTH = 20
+SMI_MULT_BB = 2.0
+SMI_MULT_KC = 1.5
+MIN_ROWS_SQUEEZE_MOMENTUM = SMI_LENGTH + 20
+
+
+def _true_range(frame: pd.DataFrame) -> pd.Series:
+    """Wilder's True Range from an OHLC frame (see to_ohlc_frame)."""
+    prev_close = frame["close"].shift(1)
+    return pd.concat(
+        [
+            (frame["high"] - frame["low"]).abs(),
+            (frame["high"] - prev_close).abs(),
+            (frame["low"] - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+
+
+def _linreg_last_value(series: pd.Series, length: int) -> pd.Series:
+    """Rolling linear-regression LAST FITTED VALUE (matches Pine's
+    ta.linreg(source, length, 0)): for each trailing window of `length`
+    points, fit y = a + b*x over x = 0..length-1 (oldest to newest) via
+    ordinary least squares and return a + b*(length-1) — the fitted
+    line's value at the most recent point in the window — NOT the slope
+    b alone. The source article specifically warns this is an easy
+    implementation mistake.
+    """
+    x = np.arange(length, dtype=float)
+    x_mean = x.mean()
+    x_var = ((x - x_mean) ** 2).sum()
+
+    def _fit(window: np.ndarray) -> float:
+        y_mean = window.mean()
+        slope = ((x - x_mean) * (window - y_mean)).sum() / x_var
+        intercept = y_mean - slope * x_mean
+        return intercept + slope * x[-1]
+
+    return series.rolling(window=length).apply(_fit, raw=True)
+
+
+def compute_squeeze_momentum(prices: list[DailyPrice]) -> dict | None:
+    """Squeeze Momentum Indicator strategy.
+
+    Returns None when there isn't enough OHLC history for a stable
+    Bollinger/Keltner/linear-regression reading (see
+    MIN_ROWS_SQUEEZE_MOMENTUM) — same "unavailable" convention as every
+    other strategy in this module. Uses the existing OHLC price
+    infrastructure (to_ohlc_frame) — no new data source.
+    """
+    frame = to_ohlc_frame(prices)
+    if len(frame) < MIN_ROWS_SQUEEZE_MOMENTUM:
+        return None
+
+    close = frame["close"]
+    basis = close.rolling(SMI_LENGTH).mean()
+    dev = SMI_MULT_BB * close.rolling(SMI_LENGTH).std(ddof=0)
+    upper_bb = basis + dev
+    lower_bb = basis - dev
+
+    kc_ma = close.rolling(SMI_LENGTH).mean()
+    true_range = _true_range(frame)
+    range_ma = true_range.rolling(SMI_LENGTH).mean()
+    upper_kc = kc_ma + range_ma * SMI_MULT_KC
+    lower_kc = kc_ma - range_ma * SMI_MULT_KC
+
+    squeeze_on = (lower_bb > lower_kc) & (upper_bb < upper_kc)
+    squeeze_off = (lower_bb < lower_kc) & (upper_bb > upper_kc)
+
+    highest_high = frame["high"].rolling(SMI_LENGTH).max()
+    lowest_low = frame["low"].rolling(SMI_LENGTH).min()
+    midline = ((highest_high + lowest_low) / 2 + kc_ma) / 2
+    momentum_source = close - midline
+    momentum = _linreg_last_value(momentum_source, SMI_LENGTH)
+
+    df = pd.DataFrame(
+        {
+            "close": close,
+            "upper_bb": upper_bb,
+            "lower_bb": lower_bb,
+            "upper_kc": upper_kc,
+            "lower_kc": lower_kc,
+            "squeeze_on": squeeze_on,
+            "squeeze_off": squeeze_off,
+            "momentum": momentum,
+        }
+    ).dropna(subset=["upper_bb", "lower_bb", "upper_kc", "lower_kc", "momentum"])
+    if df.empty:
+        return None
+
+    df["squeeze_state"] = np.where(
+        df["squeeze_on"], "on", np.where(df["squeeze_off"], "off", "none")
+    )
+
+    last = df.iloc[-1]
+    momentum_val = float(last["momentum"])
+    squeeze_on_val = bool(last["squeeze_on"])
+    squeeze_off_val = bool(last["squeeze_off"])
+    squeeze_state = (
+        "Squeeze On"
+        if squeeze_on_val
+        else ("Squeeze Released" if squeeze_off_val else "No Squeeze")
+    )
+
+    momentum_increasing = False
+    momentum_direction = "Flat"
+    squeeze_released_today = False
+    if len(df) > 1:
+        prev = df.iloc[-2]
+        prev_momentum = float(prev["momentum"])
+        momentum_increasing = momentum_val > prev_momentum
+        momentum_direction = (
+            "Rising"
+            if momentum_increasing
+            else ("Falling" if momentum_val < prev_momentum else "Flat")
+        )
+        squeeze_released_today = bool(prev["squeeze_on"]) and squeeze_off_val
+
+    if momentum_val > 0:
+        momentum_state = (
+            "Bullish Momentum (Strengthening)"
+            if momentum_increasing
+            else "Bullish Momentum (Weakening)"
+        )
+    else:
+        momentum_state = (
+            "Bearish Momentum (Weakening)"
+            if momentum_increasing
+            else "Bearish Momentum (Strengthening)"
+        )
+
+    tail = df.tail(CHART_LOOKBACK_DAYS)
+    chart_data = [
+        {
+            "date": ts.date().isoformat(),
+            "close": _round(row["close"]),
+            "upper_bb": _round(row["upper_bb"]),
+            "lower_bb": _round(row["lower_bb"]),
+            "upper_kc": _round(row["upper_kc"]),
+            "lower_kc": _round(row["lower_kc"]),
+            "momentum": _round(row["momentum"]),
+            "squeeze_state": row["squeeze_state"],
+        }
+        for ts, row in tail.iterrows()
+    ]
+
+    return {
+        "price": _round(float(last["close"])),
+        "upper_bb": _round(float(last["upper_bb"])),
+        "lower_bb": _round(float(last["lower_bb"])),
+        "upper_kc": _round(float(last["upper_kc"])),
+        "lower_kc": _round(float(last["lower_kc"])),
+        "momentum": _round(momentum_val),
+        "momentum_direction": momentum_direction,
+        "momentum_state": momentum_state,
+        "squeeze_state": squeeze_state,
+        "squeeze_on": squeeze_on_val,
+        "squeeze_off": squeeze_off_val,
+        "squeeze_released_today": squeeze_released_today,
+        "bb_length": SMI_LENGTH,
+        "bb_mult": SMI_MULT_BB,
+        "kc_mult": SMI_MULT_KC,
+        "chart_data": chart_data,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Strategy 17: Self-Organized Criticality — Avalanche Distribution
+#
+# Econophysics-style read: treats drawdown episodes ("avalanches" — a
+# cascade of losses from a local price peak down to the next new peak)
+# the way Self-Organized-Criticality models (e.g. the Bak-Tang-Wiesenfeld
+# sandpile) treat avalanche sizes, and asks whether their size
+# distribution follows a power law — a signature of a system operating
+# near a critical point.
+#
+# METHODOLOGY NOTE — the source article describes the concept (SOC,
+# power-law avalanche sizes, an alpha exponent, logarithmic binning, and
+# the four alpha-range regimes below) but does not specify exactly how
+# an "avalanche" is delimited in price data. Rather than inventing a
+# hidden methodology, this implementation documents its own explicit,
+# transparent definition:
+#
+#   1. Track the running all-time-high closing price (cummax) — no
+#      look-ahead, uses only past/current data.
+#   2. An "avalanche" is every maximal run of consecutive trading days
+#      where the close stays below that running peak.
+#   3. Its "size" is the run's maximum peak-to-trough percentage
+#      drawdown.
+#
+# alpha is then estimated via a log-log linear least-squares fit of a
+# logarithmically-binned histogram of avalanche sizes ("logarithmic
+# binning" per the article), implemented with numpy only (no scipy
+# dependency in this project).
+#
+# This does NOT claim to predict crashes — it is a descriptive read of
+# how heavy-tailed the current drawdown-size distribution is.
+# ---------------------------------------------------------------------------
+
+SOC_MIN_TRADING_DAYS = 300
+SOC_MIN_AVALANCHES = 15  # need enough events for a meaningful alpha fit
+SOC_LOG_BINS = 12
+
+
+def _extract_avalanches(series: pd.Series) -> pd.Series:
+    """Percentage peak-to-trough drawdown size of every maximal run of
+    consecutive days spent below the running all-time-high close so
+    far. Only past/current prices are used (running max via .cummax()),
+    so this carries no look-ahead bias.
+    """
+    running_peak = series.cummax()
+    drawdown_pct = (series - running_peak) / running_peak * 100  # <= 0
+
+    in_drawdown = drawdown_pct < 0
+    run_id = (in_drawdown != in_drawdown.shift(1)).cumsum()
+    sizes = (
+        drawdown_pct[in_drawdown]
+        .groupby(run_id[in_drawdown])
+        .min()  # most negative = largest drawdown reached in the run
+        .abs()
+    )
+    return sizes  # positive magnitudes, percent
+
+
+def _fit_power_law_alpha(sizes: pd.Series) -> dict | None:
+    """Log-log linear regression on a logarithmically-binned histogram
+    of avalanche sizes -> alpha exponent. Returns None if there isn't
+    enough distinct, positive-sized data for a meaningful fit — never
+    fabricates alpha from an unreliable sample.
+    """
+    sizes = sizes[sizes > 0]
+    if len(sizes) < SOC_MIN_AVALANCHES:
+        return None
+
+    log_min, log_max = math.log10(float(sizes.min())), math.log10(float(sizes.max()))
+    if not math.isfinite(log_min) or not math.isfinite(log_max) or log_max <= log_min:
+        return None
+
+    bin_edges = np.logspace(log_min, log_max, SOC_LOG_BINS + 1)
+    counts, edges = np.histogram(sizes.to_numpy(), bins=bin_edges)
+    bin_widths = np.diff(edges)
+    bin_centers = np.sqrt(edges[:-1] * edges[1:])  # geometric bin center
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        density = counts / bin_widths
+    mask = counts > 0
+    if mask.sum() < 3:  # need at least 3 populated bins for a stable fit
+        return None
+
+    log_x = np.log10(bin_centers[mask])
+    log_y = np.log10(density[mask])
+    slope, intercept = np.polyfit(log_x, log_y, 1)
+    alpha = -slope  # P(x) ~ x^-alpha  =>  log P = -alpha * log x + const
+
+    fitted_log_y = slope * log_x + intercept
+    residual = log_y - fitted_log_y
+    ss_res = float((residual**2).sum())
+    ss_tot = float(((log_y - log_y.mean()) ** 2).sum())
+    r_squared = (1 - ss_res / ss_tot) if ss_tot > 0 else None
+
+    return {
+        "alpha": float(alpha),
+        "r_squared": r_squared,
+        "bin_centers": bin_centers[mask].tolist(),
+        "bin_density": density[mask].tolist(),
+        "sample_size": int(len(sizes)),
+    }
+
+
+def _soc_classification(alpha: float) -> str:
+    """Regime classification exactly per the article's alpha ranges."""
+    if alpha >= 2.8:
+        return "Gaussian"
+    if alpha >= 1.8:
+        return "Transitional"
+    if alpha >= 1.0:
+        return "Critical"
+    return "Super-critical"
+
+
+def compute_soc_avalanche(prices: list[DailyPrice]) -> dict | None:
+    """Self-Organized Criticality — Avalanche Distribution strategy.
+
+    Returns None when there isn't enough price history, or too few
+    distinct drawdown "avalanches", for a meaningful power-law fit (see
+    SOC_MIN_TRADING_DAYS / SOC_MIN_AVALANCHES). Never fabricates alpha
+    from an unreliable sample; this is a deterministic, pure function of
+    `prices` like every other strategy in this module.
+    """
+    series = to_close_series(prices)
+    if len(series) < SOC_MIN_TRADING_DAYS:
+        return None
+
+    sizes = _extract_avalanches(series)
+    fit = _fit_power_law_alpha(sizes)
+    if fit is None:
+        return None
+
+    alpha = fit["alpha"]
+    regime = _soc_classification(alpha)
+
+    running_peak = series.cummax()
+    current_drawdown_pct = float(
+        (series.iloc[-1] - running_peak.iloc[-1]) / running_peak.iloc[-1] * 100
+    )
+
+    chart_data = [
+        {"size": _round(c, 4), "density": _round(d, 6)}
+        for c, d in zip(fit["bin_centers"], fit["bin_density"])
+    ]
+    avalanche_tail = sizes.tail(CHART_LOOKBACK_DAYS)
+    avalanche_history = [
+        {"avalanche_index": int(i), "size_percent": _round(float(v))}
+        for i, v in enumerate(avalanche_tail.tolist())
+    ]
+
+    return {
+        "price": _round(float(series.iloc[-1])),
+        "alpha": _round(alpha, 3),
+        "criticality_regime": regime,
+        "r_squared": (
+            _round(fit["r_squared"], 3) if fit["r_squared"] is not None else None
+        ),
+        "avalanche_count": fit["sample_size"],
+        "mean_avalanche_size_percent": _round(float(sizes.mean())),
+        "max_avalanche_size_percent": _round(float(sizes.max())),
+        "current_drawdown_percent": _round(current_drawdown_pct),
+        "log_bins_used": SOC_LOG_BINS,
+        "chart_data": chart_data,
+        "avalanche_history": avalanche_history,
+        "methodology_note": (
+            "Avalanches are runs of consecutive trading days below the "
+            "running all-time-high close; alpha is fit via a log-log "
+            "linear regression on a logarithmically-binned histogram of "
+            "avalanche sizes. This is a documented, transparent "
+            "approximation (see module docstring above), not a "
+            "reproduction of an undisclosed methodology, and it does "
+            "not predict crashes."
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Strategy 18: Adaptive Causal Wavelet Trend Filter
+#
+# Causal (no look-ahead) approximation of a Mexican Hat / Ricker wavelet
+# trend filter: psi(t) = (1 - t^2) * e^(-t^2 / 2). The textbook Ricker
+# wavelet is symmetric around t=0 (it uses both past AND future data),
+# which would introduce look-ahead bias in a live indicator. This
+# implementation uses only the CAUSAL half of the kernel (t >= 0, i.e.
+# "now" and the past), convolved with daily log returns via a rolling
+# dot product — every value at day t is a function of day t and earlier
+# only (see _causal_wavelet_filter).
+#
+# MULTI-RESOLUTION: the same causal kernel shape is evaluated at three
+# time scales (short/medium/long trading-day windows), each acting as a
+# band-pass-ish filter that smooths noise while remaining responsive to
+# the underlying trend.
+#
+# ADAPTIVE VOLATILITY ADJUSTMENT: each scale's raw filtered value is
+# divided by the trailing standard deviation of returns over that same
+# window, so the trend reading is comparable across calm and turbulent
+# periods rather than simply scaling with raw price volatility.
+# ---------------------------------------------------------------------------
+
+WAVELET_SCALES: dict[str, int] = {"short": 5, "medium": 10, "long": 20}
+WAVELET_KERNEL_WIDTH_MULTIPLIER = 3  # kernel window length = scale * multiplier
+MIN_ROWS_WAVELET = max(WAVELET_SCALES.values()) * WAVELET_KERNEL_WIDTH_MULTIPLIER + 30
+
+
+def _causal_ricker_kernel(
+    scale: int, width_multiplier: int = WAVELET_KERNEL_WIDTH_MULTIPLIER
+) -> np.ndarray:
+    """Causal half (t >= 0, "now" back into the past) of the Mexican
+    Hat/Ricker wavelet, sampled at unit lags and scaled by `scale`.
+    kernel[0] is the weight for today (lag 0), kernel[k] the weight for
+    k trading days ago.
+    """
+    length = scale * width_multiplier
+    t = np.arange(length, dtype=float) / scale
+    return (1 - t**2) * np.exp(-(t**2) / 2)
+
+
+def _causal_wavelet_filter(returns: pd.Series, scale: int) -> pd.Series:
+    """Rolling causal convolution of `returns` with the scaled causal
+    Ricker kernel — every output value depends only on the current and
+    past `length` return observations, never future ones."""
+    kernel = _causal_ricker_kernel(scale)
+    length = len(kernel)
+
+    def _apply(window: np.ndarray) -> float:
+        # `window` arrives oldest -> newest (pandas rolling convention);
+        # reverse it so index 0 aligns with "today" (lag 0), matching
+        # kernel[0].
+        return float(np.dot(window[::-1], kernel))
+
+    return returns.rolling(window=length).apply(_apply, raw=True)
+
+
+def compute_wavelet_trend_filter(prices: list[DailyPrice]) -> dict | None:
+    """Adaptive Causal Wavelet Trend Filter strategy.
+
+    Returns None when there isn't enough price history for the longest
+    scale's kernel plus a volatility warm-up window (see
+    MIN_ROWS_WAVELET). Never returns a zeroed-out result for
+    insufficient data, and never uses future price data (see module
+    note above — every filtered value is a rolling, backward-looking
+    function of `prices` only).
+    """
+    series = to_close_series(prices)
+    if len(series) < MIN_ROWS_WAVELET:
+        return None
+
+    log_returns = np.log(series / series.shift(1))
+
+    trend_columns: dict[str, pd.Series] = {}
+    for label, scale in WAVELET_SCALES.items():
+        raw = _causal_wavelet_filter(log_returns, scale)
+        window = scale * WAVELET_KERNEL_WIDTH_MULTIPLIER
+        vol = log_returns.rolling(window=window).std()
+        trend_columns[f"trend_{label}"] = raw / vol.replace(0, np.nan)
+
+    df = pd.DataFrame({"close": series, **trend_columns}).dropna()
+    if df.empty:
+        return None
+
+    last = df.iloc[-1]
+    trend_short = float(last["trend_short"])
+    trend_medium = float(last["trend_medium"])
+    trend_long = float(last["trend_long"])
+
+    signs = [trend_short > 0, trend_medium > 0, trend_long > 0]
+    if all(signs):
+        current_trend_state = "Strong Uptrend"
+    elif not any(signs):
+        current_trend_state = "Strong Downtrend"
+    elif trend_medium > 0:
+        current_trend_state = "Uptrend (Mixed Confirmation)"
+    elif trend_medium < 0:
+        current_trend_state = "Downtrend (Mixed Confirmation)"
+    else:
+        current_trend_state = "Transitional / Mixed"
+
+    medium_window = WAVELET_SCALES["medium"] * WAVELET_KERNEL_WIDTH_MULTIPLIER
+    medium_vol = log_returns.rolling(window=medium_window).std().dropna()
+    volatility_adjustment_percent = (
+        _round(float(medium_vol.iloc[-1]) * 100, 3) if not medium_vol.empty else None
+    )
+
+    tail = df.tail(CHART_LOOKBACK_DAYS)
+    chart_data = [
+        {
+            "date": ts.date().isoformat(),
+            "close": _round(row["close"]),
+            "trend_short": _round(row["trend_short"], 4),
+            "trend_medium": _round(row["trend_medium"], 4),
+            "trend_long": _round(row["trend_long"], 4),
+        }
+        for ts, row in tail.iterrows()
+    ]
+
+    return {
+        "price": _round(float(last["close"])),
+        "current_trend_state": current_trend_state,
+        "wavelet_trend_value": _round(trend_medium, 4),
+        "trend_short": _round(trend_short, 4),
+        "trend_medium": _round(trend_medium, 4),
+        "trend_long": _round(trend_long, 4),
+        "volatility_adjustment_percent": volatility_adjustment_percent,
+        "scales_days": dict(WAVELET_SCALES),
+        "chart_data": chart_data,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Strategy 19: First Passage Time Distribution Analysis
+#
+# Estimates, under a Brownian-motion-with-drift approximation of daily
+# log returns (mu, sigma fit from trailing history), the probability
+# that cumulative log-returns reach a given upside or downside target
+# within a fixed horizon, and the expected time to do so. This uses the
+# standard closed-form first-passage-time (inverse-Gaussian) result for
+# drifted Brownian motion, implemented directly with numpy/math — no
+# scipy dependency.
+#
+# ASSUMPTIONS (documented, not hidden):
+#   - Daily log returns are treated as i.i.d. Normal(mu, sigma^2) — the
+#     textbook Brownian-motion-with-drift approximation. Real markets
+#     have fatter tails than this (see the EVaR strategy above, which
+#     explicitly models tail-fatness); this strategy intentionally uses
+#     the simpler, analytically tractable Normal/Brownian assumption
+#     because the closed-form first-passage-time formulas rely on it.
+#   - Default target levels (+/-10%) and horizon (252 trading days,
+#     ~1 year) are documented defaults for this analytics surface, not
+#     values taken from the source article (which discusses the concept
+#     without prescribing universal defaults) and not backtested/
+#     optimized figures.
+#   - Probabilities and expected times are outputs of the model given
+#     its stated assumptions — not guarantees about actual future price
+#     paths.
+# ---------------------------------------------------------------------------
+
+FPT_LOOKBACK_DAYS = 252
+MIN_ROWS_FIRST_PASSAGE_TIME = FPT_LOOKBACK_DAYS // 2 + 30
+FPT_MIN_RETURN_OBSERVATIONS = 30
+FPT_UPSIDE_TARGET_PERCENT = 10.0
+FPT_DOWNSIDE_TARGET_PERCENT = -10.0
+FPT_HORIZON_DAYS = 252
+
+
+def _norm_cdf(x: np.ndarray) -> np.ndarray:
+    """Standard normal CDF, implemented via math.erf (no scipy
+    dependency in this project)."""
+    erf_vec = np.vectorize(math.erf)
+    return 0.5 * (1.0 + erf_vec(x / math.sqrt(2.0)))
+
+
+def _first_passage_cdf(
+    mu: float, sigma: float, level: float, horizon_days: int
+) -> np.ndarray | None:
+    """P(a Brownian motion X_t = mu*t + sigma*W_t has reached `level` > 0
+    by time t), evaluated for every t = 1..horizon_days — the standard
+    closed-form inverse-Gaussian first-passage-time CDF. Returns None
+    for degenerate inputs (sigma <= 0, level <= 0, horizon <= 0).
+    """
+    if sigma <= 0 or level <= 0 or horizon_days <= 0:
+        return None
+    t = np.arange(1, horizon_days + 1, dtype=float)
+    sqrt_t = np.sqrt(t)
+    term1 = _norm_cdf((mu * t - level) / (sigma * sqrt_t))
+    # exp(2*mu*level/sigma^2) can overflow for a large level/mu ratio;
+    # clip the exponent defensively rather than silently producing inf.
+    exponent = np.clip(2 * mu * level / (sigma**2), -700, 700)
+    term2 = np.exp(exponent) * _norm_cdf((-mu * t - level) / (sigma * sqrt_t))
+    return term1 + term2
+
+
+def compute_first_passage_time(prices: list[DailyPrice]) -> dict | None:
+    """First Passage Time Distribution Analysis strategy.
+
+    Returns None when there isn't enough price history for a stable
+    mu/sigma estimate of daily log returns (see
+    MIN_ROWS_FIRST_PASSAGE_TIME) — same "unavailable" convention as
+    every other strategy in this module.
+    """
+    series = to_close_series(prices)
+    if len(series) < MIN_ROWS_FIRST_PASSAGE_TIME:
+        return None
+
+    log_returns = np.log(series / series.shift(1)).dropna().tail(FPT_LOOKBACK_DAYS)
+    if len(log_returns) < FPT_MIN_RETURN_OBSERVATIONS:
+        return None
+
+    mu = float(log_returns.mean())
+    sigma = float(log_returns.std())
+    if sigma <= 0 or not math.isfinite(mu) or not math.isfinite(sigma):
+        return None
+
+    price = float(series.iloc[-1])
+    upside_level = math.log(1 + FPT_UPSIDE_TARGET_PERCENT / 100)
+    downside_level = -math.log(1 + FPT_DOWNSIDE_TARGET_PERCENT / 100)  # positive
+
+    # Downside case computed by symmetry: reaching -downside_level under
+    # drift mu is the same as the mirrored process (negated) reaching
+    # +downside_level under drift -mu.
+    upside_cdf = _first_passage_cdf(mu, sigma, upside_level, FPT_HORIZON_DAYS)
+    downside_cdf = _first_passage_cdf(-mu, sigma, downside_level, FPT_HORIZON_DAYS)
+
+    upside_probability_percent = (
+        _round(float(upside_cdf[-1]) * 100) if upside_cdf is not None else None
+    )
+    downside_probability_percent = (
+        _round(float(downside_cdf[-1]) * 100) if downside_cdf is not None else None
+    )
+
+    # E[first passage time] = level / mu, and is only finite when the
+    # drift actually points toward that barrier; otherwise (in a pure
+    # Brownian model) expected time to reach it is infinite, so this is
+    # left null rather than fabricated — see assumptions_note below.
+    expected_days_upside = _round(upside_level / mu, 1) if mu > 0 else None
+    expected_days_downside = _round(downside_level / -mu, 1) if mu < 0 else None
+
+    upside_target_price = _round(price * math.exp(upside_level))
+    downside_target_price = _round(price * math.exp(-downside_level))
+
+    last_date = series.index[-1]
+    future_dates = pd.bdate_range(start=last_date, periods=FPT_HORIZON_DAYS + 1)[1:]
+    chart_data = [
+        {
+            "date": ts.date().isoformat(),
+            "trading_day": i + 1,
+            "upside_hit_probability_percent": (
+                _round(float(upside_cdf[i]) * 100) if upside_cdf is not None else None
+            ),
+            "downside_hit_probability_percent": (
+                _round(float(downside_cdf[i]) * 100)
+                if downside_cdf is not None
+                else None
+            ),
+        }
+        for i, ts in enumerate(future_dates)
+    ]
+
+    return {
+        "price": _round(price),
+        "mean_daily_log_return_percent": _round(mu * 100, 4),
+        "daily_volatility_percent": _round(sigma * 100, 4),
+        "horizon_trading_days": FPT_HORIZON_DAYS,
+        "upside_target_percent": FPT_UPSIDE_TARGET_PERCENT,
+        "downside_target_percent": FPT_DOWNSIDE_TARGET_PERCENT,
+        "upside_target_price": upside_target_price,
+        "downside_target_price": downside_target_price,
+        "upside_target_probability_percent": upside_probability_percent,
+        "downside_target_probability_percent": downside_probability_percent,
+        "expected_days_to_upside_target": expected_days_upside,
+        "expected_days_to_downside_target": expected_days_downside,
+        "lookback_days": len(log_returns),
+        "assumptions_note": (
+            "Assumes daily log returns are i.i.d. Normal(mu, sigma) "
+            "(Brownian motion with drift) fit from trailing history; "
+            "expected time to a target is null when the estimated "
+            "drift points away from that target (expected first-"
+            "passage time in that direction is infinite under a pure "
+            "Brownian model). Not a guarantee about actual future price "
+            "paths."
+        ),
+        "chart_data": chart_data,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Portfolio Optimization: Kelly Criterion + Mean-Variance Optimization
+#
+# Genuinely multi-asset (unlike every strategy above, which is a pure
+# function of ONE symbol's own price history): given a basket of
+# symbols, estimates annualized expected returns and a covariance matrix
+# from daily log returns, then reports:
+#   - the global minimum-volatility portfolio
+#   - the maximum-Sharpe-ratio ("tangency") portfolio
+#   - an efficient frontier (closed-form Markowitz Lagrangian solution
+#     swept across a range of target returns)
+#   - per-asset and portfolio-level Kelly Criterion sizing information
+#
+# Implemented with closed-form linear algebra (numpy) only — this
+# project has no scipy.optimize dependency, so there is no general
+# quadratic-programming solver here. The unconstrained Markowitz
+# closed-form solution can produce negative (short) weights; this
+# implementation floors negative weights at 0 and renormalizes to sum
+# to 100% as a documented LONG-ONLY APPROXIMATION of the true
+# box-constrained problem — see _long_only_projection.
+#
+# Treated as Portfolio Optimization (see routers/strategy.py's dedicated
+# POST /portfolio/optimization endpoint), NOT as a single-symbol
+# /etfs/{symbol}/strategies indicator, per the reorg spec.
+#
+# Descriptive/analytical only: NOT a guaranteed-optimal allocation, and
+# NOT investment advice.
+# ---------------------------------------------------------------------------
+
+PORTFOLIO_OPT_TRADING_DAYS_PER_YEAR = 252
+PORTFOLIO_OPT_MIN_ROWS = 60  # minimum overlapping daily observations
+PORTFOLIO_OPT_MIN_ASSETS = 2
+PORTFOLIO_OPT_MAX_ASSETS = 8
+PORTFOLIO_OPT_FRONTIER_POINTS = 15
+# Kelly fraction is capped purely for sane display — this is not a
+# leverage recommendation, just keeps a near-zero-variance asset from
+# producing an absurd raw f* = mu/sigma^2 value.
+PORTFOLIO_OPT_KELLY_DISPLAY_CAP = 3.0
+
+
+def _long_only_projection(weights: np.ndarray) -> np.ndarray:
+    """Floor negative weights at 0 and renormalize to sum to 1.
+
+    Documented simplification: this is NOT a true long-only
+    mean-variance QP solve (which would re-optimize subject to the
+    constraint) — just a floor-and-renormalize projection of the
+    unconstrained closed-form solution (see module note above). If
+    every weight is non-positive (degenerate), falls back to equal
+    weighting rather than fabricating a direction.
+    """
+    floored = np.clip(weights, 0, None)
+    total = floored.sum()
+    if total <= 0:
+        return np.full_like(weights, 1.0 / len(weights))
+    return floored / total
+
+
+def _portfolio_stats(
+    weights: np.ndarray, mu: np.ndarray, cov: np.ndarray, risk_free_rate: float
+) -> tuple[float, float, float]:
+    expected_return = float(weights @ mu)
+    variance = float(weights @ cov @ weights)
+    volatility = math.sqrt(max(variance, 0.0))
+    sharpe = (expected_return - risk_free_rate) / volatility if volatility > 0 else 0.0
+    return expected_return, volatility, sharpe
+
+
+def _weights_payload(symbols: list[str], weights: np.ndarray) -> list[dict]:
+    return [
+        {"symbol": symbol, "weight_percent": _round(float(w) * 100)}
+        for symbol, w in zip(symbols, weights)
+    ]
+
+
+def compute_portfolio_optimization(
+    prices_by_symbol: dict[str, list[DailyPrice]],
+    *,
+    risk_free_rate_percent: float = 0.0,
+) -> dict | None:
+    """Kelly Criterion + Mean-Variance Optimization across a basket of
+    symbols.
+
+    `prices_by_symbol` values are each symbol's own daily price history
+    (already loaded by the caller — see routers/strategy.py's dedicated
+    portfolio-optimization endpoint). Returns None when fewer than
+    PORTFOLIO_OPT_MIN_ASSETS symbols have enough overlapping trading-day
+    history, or the resulting covariance matrix is degenerate.
+    """
+    series_by_symbol = {
+        symbol: to_close_series(prices)
+        for symbol, prices in prices_by_symbol.items()
+        if prices
+    }
+    series_by_symbol = {k: v for k, v in series_by_symbol.items() if not v.empty}
+    if len(series_by_symbol) < PORTFOLIO_OPT_MIN_ASSETS:
+        return None
+
+    # Inner join on date, same alignment convention as
+    # portfolio_comparison.compute_vt_vs_vti_vxus — never interpolate or
+    # fabricate a missing price.
+    combined = pd.concat(series_by_symbol, axis=1, join="inner").dropna()
+    if len(combined) < PORTFOLIO_OPT_MIN_ROWS:
+        return None
+
+    symbols = list(combined.columns)
+    n = len(symbols)
+
+    log_returns = np.log(combined / combined.shift(1)).dropna()
+    if len(log_returns) < PORTFOLIO_OPT_MIN_ROWS - 1:
+        return None
+
+    mu_daily = log_returns.mean().to_numpy()
+    cov_daily = log_returns.cov().to_numpy()
+
+    mu = mu_daily * PORTFOLIO_OPT_TRADING_DAYS_PER_YEAR
+    cov = cov_daily * PORTFOLIO_OPT_TRADING_DAYS_PER_YEAR
+
+    try:
+        cov_inv = np.linalg.pinv(cov)
+    except np.linalg.LinAlgError:
+        return None
+
+    ones = np.ones(n)
+    risk_free_rate = risk_free_rate_percent / 100
+
+    denom_minvol = float(ones @ cov_inv @ ones)
+    if denom_minvol == 0:
+        return None
+    w_minvol_raw = (cov_inv @ ones) / denom_minvol
+    w_minvol = _long_only_projection(w_minvol_raw)
+
+    excess_mu = mu - risk_free_rate
+    denom_sharpe = float(ones @ cov_inv @ excess_mu)
+    w_maxsharpe_raw = (
+        (cov_inv @ excess_mu) / denom_sharpe if abs(denom_sharpe) >= 1e-12 else w_minvol_raw
+    )
+    w_maxsharpe = _long_only_projection(w_maxsharpe_raw)
+
+    minvol_return, minvol_vol, minvol_sharpe = _portfolio_stats(
+        w_minvol, mu, cov, risk_free_rate
+    )
+    maxsharpe_return, maxsharpe_vol, maxsharpe_sharpe = _portfolio_stats(
+        w_maxsharpe, mu, cov, risk_free_rate
+    )
+
+    # Closed-form efficient frontier (classic two-fund/Lagrangian
+    # Markowitz solution), swept across target returns spanning the
+    # asset universe's own return range, then long-only projected (see
+    # module note above — realized return after projection may differ
+    # slightly from the target).
+    A = float(ones @ cov_inv @ ones)
+    B = float(ones @ cov_inv @ mu)
+    C = float(mu @ cov_inv @ mu)
+    D = A * C - B**2
+
+    efficient_frontier = []
+    if abs(D) > 1e-12:
+        target_low, target_high = float(mu.min()), float(mu.max())
+        if target_high > target_low:
+            targets = np.linspace(
+                target_low, target_high, PORTFOLIO_OPT_FRONTIER_POINTS
+            )
+            for target in targets:
+                w_raw = (
+                    (C - B * target) * (cov_inv @ ones)
+                    + (A * target - B) * (cov_inv @ mu)
+                ) / D
+                w = _long_only_projection(w_raw)
+                ret, vol, sharpe = _portfolio_stats(w, mu, cov, risk_free_rate)
+                efficient_frontier.append(
+                    {
+                        "target_return_percent": _round(target * 100),
+                        "expected_return_percent": _round(ret * 100),
+                        "volatility_percent": _round(vol * 100),
+                        "sharpe_ratio": _round(sharpe, 3),
+                        "weights": _weights_payload(symbols, w),
+                    }
+                )
+
+    # Kelly sizing: single-asset continuous Kelly fraction f* = mu/sigma^2
+    # per symbol (descriptive only), plus the portfolio-level Kelly
+    # direction — proportional to Sigma^-1 * excess_mu, the same
+    # direction as the max-Sharpe/tangency portfolio (a standard Kelly/
+    # Markowitz equivalence result under Normal returns) — shown at
+    # full-Kelly and a conservative half-Kelly scaling.
+    variances = np.diag(cov)
+    kelly_sizing = []
+    for i, symbol in enumerate(symbols):
+        single_kelly = float(mu[i] / variances[i]) if variances[i] > 0 else 0.0
+        single_kelly = float(
+            np.clip(
+                single_kelly,
+                -PORTFOLIO_OPT_KELLY_DISPLAY_CAP,
+                PORTFOLIO_OPT_KELLY_DISPLAY_CAP,
+            )
+        )
+        kelly_sizing.append(
+            {
+                "symbol": symbol,
+                "single_asset_kelly_fraction_percent": _round(single_kelly * 100),
+                "portfolio_kelly_weight_percent": _round(
+                    float(w_maxsharpe[i]) * 100
+                ),
+                "half_kelly_weight_percent": _round(float(w_maxsharpe[i]) * 50),
+            }
+        )
+
+    return {
+        "symbols": symbols,
+        "lookback_trading_days": len(log_returns),
+        "risk_free_rate_percent": risk_free_rate_percent,
+        "min_volatility_portfolio": {
+            "weights": _weights_payload(symbols, w_minvol),
+            "expected_return_percent": _round(minvol_return * 100),
+            "volatility_percent": _round(minvol_vol * 100),
+            "sharpe_ratio": _round(minvol_sharpe, 3),
+        },
+        "max_sharpe_portfolio": {
+            "weights": _weights_payload(symbols, w_maxsharpe),
+            "expected_return_percent": _round(maxsharpe_return * 100),
+            "volatility_percent": _round(maxsharpe_vol * 100),
+            "sharpe_ratio": _round(maxsharpe_sharpe, 3),
+        },
+        "efficient_frontier": efficient_frontier,
+        "kelly_sizing": kelly_sizing,
+        "long_only_note": (
+            "Weights are floored at 0% and renormalized to 100% as a "
+            "long-only approximation of the unconstrained closed-form "
+            "Markowitz solution (see _long_only_projection) — not a "
+            "full box-constrained optimization solve."
+        ),
+        "disclaimer": (
+            "Analytical output only, derived from historical price "
+            "history — not a guaranteed-optimal allocation, not "
+            "investment advice, and not a prediction of future returns."
+        ),
+    }

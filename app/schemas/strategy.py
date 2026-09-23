@@ -507,6 +507,252 @@ class HmmRegimeSwitchingStrategy(CamelModel):
     chart_data: list[HmmRegimeSwitchingChartPoint]
 
 
+class SqueezeMomentumChartPoint(CamelModel):
+    date: str
+    close: float | None = None
+    upper_bb: float | None = None
+    lower_bb: float | None = None
+    upper_kc: float | None = None
+    lower_kc: float | None = None
+    momentum: float | None = None
+    squeeze_state: str | None = None  # "on" | "off" | "none"
+
+
+class SqueezeMomentumStrategy(CamelModel):
+    """Squeeze Momentum Indicator.
+
+    Bollinger Bands vs. Keltner Channels volatility-compression
+    ("squeeze") detector plus a rolling linear-regression momentum
+    oscillator. `momentum` is the LAST FITTED VALUE of the regression
+    line (not the slope) — see services.strategies module docstring
+    (Strategy 16) for the full formula and the article's
+    squeeze_on/squeeze_off definitions. Descriptive/analytical only —
+    the article's entry-on-release / exit-on-squeeze logic is exposed
+    as `squeeze_state` / `momentum_direction` to read, never as an
+    executed or recommended trade.
+    """
+
+    price: float
+    upper_bb: float
+    lower_bb: float
+    upper_kc: float
+    lower_kc: float
+    momentum: float
+    momentum_direction: str  # "Rising" | "Falling" | "Flat"
+    momentum_state: str
+    squeeze_state: str  # "Squeeze On" | "Squeeze Released" | "No Squeeze"
+    squeeze_on: bool
+    squeeze_off: bool
+    squeeze_released_today: bool
+    bb_length: int
+    bb_mult: float
+    kc_mult: float
+    chart_data: list[SqueezeMomentumChartPoint]
+
+
+class SocAvalancheChartPoint(CamelModel):
+    """One point of the log-log avalanche-size histogram (not a
+    date-indexed time series — see services.strategies Strategy 17)."""
+
+    size: float | None = None
+    density: float | None = None
+
+
+class SocAvalancheHistoryPoint(CamelModel):
+    avalanche_index: int
+    size_percent: float | None = None
+
+
+class SocAvalancheStrategy(CamelModel):
+    """Self-Organized Criticality — Avalanche Distribution.
+
+    Fits a power-law exponent (alpha) to the distribution of drawdown
+    "avalanche" sizes (see services.strategies module docstring,
+    Strategy 17, for the exact avalanche definition and the log-log
+    fitting methodology — documented explicitly since the source
+    material does not specify one). Descriptive only: does not predict
+    crashes and does not guarantee any future outcome.
+    """
+
+    price: float
+    alpha: float
+    criticality_regime: str  # "Gaussian" | "Transitional" | "Critical" | "Super-critical"
+    r_squared: float | None = None
+    avalanche_count: int
+    mean_avalanche_size_percent: float
+    max_avalanche_size_percent: float
+    current_drawdown_percent: float
+    log_bins_used: int
+    chart_data: list[SocAvalancheChartPoint]
+    avalanche_history: list[SocAvalancheHistoryPoint]
+    methodology_note: str
+
+
+class WaveletTrendChartPoint(CamelModel):
+    date: str
+    close: float | None = None
+    trend_short: float | None = None
+    trend_medium: float | None = None
+    trend_long: float | None = None
+
+
+class WaveletTrendStrategy(CamelModel):
+    """Adaptive Causal Wavelet Trend Filter.
+
+    Causal (no look-ahead) multi-resolution Mexican Hat/Ricker wavelet
+    trend filter, volatility-adjusted. See services.strategies module
+    docstring (Strategy 18) for the exact causal-truncation methodology
+    and the three time scales. Descriptive only — not a buy/sell
+    recommendation.
+    """
+
+    price: float
+    current_trend_state: str
+    wavelet_trend_value: float
+    trend_short: float
+    trend_medium: float
+    trend_long: float
+    volatility_adjustment_percent: float | None = None
+    scales_days: dict[str, int]
+    chart_data: list[WaveletTrendChartPoint]
+
+
+class FirstPassageTimeChartPoint(CamelModel):
+    date: str
+    trading_day: int
+    upside_hit_probability_percent: float | None = None
+    downside_hit_probability_percent: float | None = None
+
+
+class FirstPassageTimeStrategy(CamelModel):
+    """First Passage Time Distribution Analysis.
+
+    Closed-form first-passage-time (inverse-Gaussian) probability and
+    expected-time-to-target estimates under a Brownian-motion-with-drift
+    approximation of daily log returns. See services.strategies module
+    docstring (Strategy 19) for the full formula and documented
+    assumptions. Descriptive/probabilistic only — never a certainty.
+    """
+
+    price: float
+    mean_daily_log_return_percent: float
+    daily_volatility_percent: float
+    horizon_trading_days: int
+    upside_target_percent: float
+    downside_target_percent: float
+    upside_target_price: float
+    downside_target_price: float
+    upside_target_probability_percent: float | None = None
+    downside_target_probability_percent: float | None = None
+    expected_days_to_upside_target: float | None = None
+    expected_days_to_downside_target: float | None = None
+    lookback_days: int
+    assumptions_note: str
+    chart_data: list[FirstPassageTimeChartPoint]
+
+
+class PortfolioAssetWeight(CamelModel):
+    symbol: str
+    weight_percent: float
+
+
+class PortfolioSummary(CamelModel):
+    weights: list[PortfolioAssetWeight]
+    expected_return_percent: float
+    volatility_percent: float
+    sharpe_ratio: float
+
+
+class EfficientFrontierPoint(CamelModel):
+    target_return_percent: float
+    expected_return_percent: float
+    volatility_percent: float
+    sharpe_ratio: float
+    weights: list[PortfolioAssetWeight]
+
+
+class KellySizing(CamelModel):
+    symbol: str
+    single_asset_kelly_fraction_percent: float
+    portfolio_kelly_weight_percent: float
+    half_kelly_weight_percent: float
+
+
+class PortfolioOptimizationRequest(CamelModel):
+    """POST body for /api/portfolio/optimization."""
+
+    symbols: list[str]
+    risk_free_rate_percent: float = 0.0
+
+
+class PortfolioOptimizationResult(CamelModel):
+    """Kelly Criterion + Mean-Variance Optimization across a basket of
+    symbols — genuinely multi-asset, unlike every other strategy in
+    this module (each of which is a function of one symbol's own price
+    history). See services.strategies.compute_portfolio_optimization
+    for the full methodology, assumptions, and the documented long-only
+    approximation. Descriptive/analytical only — not a guaranteed-
+    optimal allocation and not investment advice.
+    """
+
+    symbols: list[str]
+    lookback_trading_days: int
+    risk_free_rate_percent: float
+    min_volatility_portfolio: PortfolioSummary
+    max_sharpe_portfolio: PortfolioSummary
+    efficient_frontier: list[EfficientFrontierPoint]
+    kelly_sizing: list[KellySizing]
+    long_only_note: str
+    disclaimer: str
+
+
+# ---------------------------------------------------------------------------
+# Strategy categories (see section 10/11 of the reorg spec).
+#
+# These are an ADDITIVE, category-organized view of the exact same data
+# already carried by StrategyAnalytics' flat fields below — they do NOT
+# replace those flat fields. This keeps any existing consumer that reads
+# e.g. `data.emaRsi` / `data.evarRisk` directly working unchanged, while
+# giving a new consumer `data.technicalStrategies` / etc. as a
+# convenience grouping.
+# ---------------------------------------------------------------------------
+
+
+class TechnicalStrategies(CamelModel):
+    ema50_rsi: Ema50RsiStrategy | None = None
+    ema821: Ema8Ema21Strategy | None = None
+    macd: MacdStrategy | None = None
+    bollinger_bands: BollingerBandsStrategy | None = None
+    better_breakout: BetterBreakoutStrategy | None = None
+    sma_trend: SmaTrendStrategy | None = None
+    triple_ma_pullback: TripleMaPullbackStrategy | None = None
+    mswing: MswingStrategy | None = None
+
+
+class QuantitativeStrategies(CamelModel):
+    evar_risk: EvarRiskStrategy | None = None
+    momentum_reversal: MomentumReversalStrategy | None = None
+    squeeze_momentum: SqueezeMomentumStrategy | None = None
+    soc_avalanche: SocAvalancheStrategy | None = None
+    wavelet_trend_filter: WaveletTrendStrategy | None = None
+    first_passage_time: FirstPassageTimeStrategy | None = None
+
+
+class RegimeStrategies(CamelModel):
+    risk_on_risk_off: RiskOnRiskOffStrategy | None = None
+    hmm_regime_switching: HmmRegimeSwitchingStrategy | None = None
+    factor_momentum: FactorMomentumStrategy | None = None
+
+
+class CalendarStrategies(CamelModel):
+    tlt_monthly_cycle: TltMonthlyCycleStrategy | None = None
+
+
+class PortfolioStrategies(CamelModel):
+    tqqq_tmf_ief_rebalancing: TqqqTmfIefRebalancingStrategy | None = None
+    vt_vs_vti_vxus: VtVsVtiVxusStrategy | None = None
+
+
 class StrategyAnalytics(CamelModel):
     """Top-level payload for GET /etfs/{symbol}/strategies.
 
@@ -549,3 +795,22 @@ class StrategyAnalytics(CamelModel):
     factor_momentum: FactorMomentumStrategy | None = None
     # Strategy 15 (single-ETF, all symbols): HMM Regime-Switching.
     hmm_regime_switching: HmmRegimeSwitchingStrategy | None = None
+    # Strategy 16 (single-ETF, all symbols): Squeeze Momentum Indicator.
+    squeeze_momentum: SqueezeMomentumStrategy | None = None
+    # Strategy 17 (single-ETF, all symbols): Self-Organized Criticality —
+    # Avalanche Distribution.
+    soc_avalanche: SocAvalancheStrategy | None = None
+    # Strategy 18 (single-ETF, all symbols): Adaptive Causal Wavelet
+    # Trend Filter.
+    wavelet_trend_filter: WaveletTrendStrategy | None = None
+    # Strategy 19 (single-ETF, all symbols): First Passage Time
+    # Distribution Analysis.
+    first_passage_time: FirstPassageTimeStrategy | None = None
+
+    # Category-organized view of the SAME strategies above (additive —
+    # see the "Strategy categories" note preceding TechnicalStrategies).
+    technical_strategies: TechnicalStrategies | None = None
+    quantitative_strategies: QuantitativeStrategies | None = None
+    regime_strategies: RegimeStrategies | None = None
+    calendar_strategies: CalendarStrategies | None = None
+    portfolio_strategies: PortfolioStrategies | None = None

@@ -9,18 +9,24 @@ or anything ML-derived.
 
 import logging
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.constants import ETF_REGISTRY
+from app.constants import ETF_REGISTRY, PORTFOLIO_COMPARISON_REGISTRY, STRATEGY_ONLY_REGISTRY
 from app.database import get_db
 from app.routers.deps import load_prices, require_prices, resolve_meta
-from app.schemas import ApiResponse, StrategyAnalytics
+from app.schemas import ApiResponse, PortfolioOptimizationRequest, PortfolioOptimizationResult, StrategyAnalytics
 from app.services import cache, portfolio_comparison, regime, strategies
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/etfs", tags=["strategy-analytics"])
+
+# Portfolio Optimization (Kelly Criterion + Mean-Variance Optimization,
+# see services.strategies.compute_portfolio_optimization) is genuinely
+# multi-asset — the one dedicated endpoint the reorg spec calls for,
+# separate from the single-symbol /etfs/{symbol}/strategies route above.
+portfolio_router = APIRouter(prefix="/portfolio", tags=["portfolio-optimization"])
 
 # Symbol under which the VT vs VTI+VXUS portfolio comparison is surfaced
 # ("VTI tile" placement per product request). VTI's own price list (already
@@ -175,15 +181,34 @@ async def get_strategy_analytics(symbol: str, db: AsyncSession = Depends(get_db)
     validation (`resolve_meta`, `require_prices`) helpers, and follows
     the same cache-then-compute pattern as the other /etfs routes.
 
-    NOTE: bumping the cache key version (v7 -> v8) so previously cached
-    responses (which don't contain momentum_reversal / factor_momentum /
-    hmm_regime_switching) are not served for the new fields; the response
-    shape stays backward compatible either way since all fields are
-    optional.
+    Also carries four new single-symbol Quantitative Strategies, each
+    computed from the requested symbol's own price history the same way
+    as the existing single-symbol strategies above (see
+    services.strategies Strategies 16-19): Squeeze Momentum Indicator,
+    Self-Organized Criticality (Avalanche Distribution), Adaptive
+    Causal Wavelet Trend Filter, and First Passage Time Distribution
+    Analysis.
+
+    The response additionally groups every strategy above into
+    `technicalStrategies` / `quantitativeStrategies` / `regimeStrategies`
+    / `calendarStrategies` / `portfolioStrategies` (see
+    schemas.strategy's "Strategy categories" note). This is purely an
+    ADDITIVE, alternate view of the same data already carried by the
+    existing flat fields (`data.emaRsi`, `data.evarRisk`, ...) — the
+    flat fields are left in place unchanged for backward compatibility,
+    since this repository ships no frontend code to migrate and an
+    external frontend may depend on them (see BACKEND_TRANSFORMATION_PLAN
+    and the reorg spec's frontend-compatibility requirement).
+
+    NOTE: bumping the cache key version (v8 -> v9) so previously cached
+    responses (which don't contain the new quantitative strategies or
+    the category groupings) are not served for the new fields; the
+    response shape stays backward compatible either way since all
+    fields are optional.
     """
     meta = resolve_meta(symbol)
 
-    cache_key = f"tw:v8:strategies:{meta.symbol}"
+    cache_key = f"tw:v9:strategies:{meta.symbol}"
     cached = await cache.get_json(cache_key)
     if cached is not None:
         result = cached
@@ -208,6 +233,10 @@ async def get_strategy_analytics(symbol: str, db: AsyncSession = Depends(get_db)
             "momentum_reversal": strategies.compute_momentum_reversal(prices),
             "factor_momentum": None,
             "hmm_regime_switching": strategies.compute_hmm_regime_switching(prices),
+            "squeeze_momentum": strategies.compute_squeeze_momentum(prices),
+            "soc_avalanche": strategies.compute_soc_avalanche(prices),
+            "wavelet_trend_filter": strategies.compute_wavelet_trend_filter(prices),
+            "first_passage_time": strategies.compute_first_passage_time(prices),
         }
 
         if meta.symbol == PORTFOLIO_COMPARISON_SYMBOL:
@@ -248,6 +277,40 @@ async def get_strategy_analytics(symbol: str, db: AsyncSession = Depends(get_db)
             factor_momentum, meta.symbol, prices
         )
 
+        # Additive category groupings (see docstring above) — built from
+        # the exact same values already assembled into `result`, so
+        # there is nothing new to compute here.
+        result["technical_strategies"] = {
+            "ema50_rsi": result["ema50_rsi"],
+            "ema821": result["ema821"],
+            "macd": result["macd"],
+            "bollinger_bands": result["bollinger_bands"],
+            "better_breakout": result["better_breakout"],
+            "sma_trend": result["sma_trend"],
+            "triple_ma_pullback": result["triple_ma_pullback"],
+            "mswing": result["mswing"],
+        }
+        result["quantitative_strategies"] = {
+            "evar_risk": result["evar_risk"],
+            "momentum_reversal": result["momentum_reversal"],
+            "squeeze_momentum": result["squeeze_momentum"],
+            "soc_avalanche": result["soc_avalanche"],
+            "wavelet_trend_filter": result["wavelet_trend_filter"],
+            "first_passage_time": result["first_passage_time"],
+        }
+        result["regime_strategies"] = {
+            "risk_on_risk_off": result["risk_on_risk_off"],
+            "hmm_regime_switching": result["hmm_regime_switching"],
+            "factor_momentum": result["factor_momentum"],
+        }
+        result["calendar_strategies"] = {
+            "tlt_monthly_cycle": result["tlt_monthly_cycle"],
+        }
+        result["portfolio_strategies"] = {
+            "tqqq_tmf_ief_rebalancing": result["tqqq_tmf_ief_rebalancing"],
+            "vt_vs_vti_vxus": result["vt_vs_vti_vxus"],
+        }
+
         await cache.set_json(cache_key, result)
 
     # Insufficient history is not an error — surface it as an informational
@@ -269,6 +332,10 @@ async def get_strategy_analytics(symbol: str, db: AsyncSession = Depends(get_db)
         "momentum_reversal": "Momentum Reversal",
         "factor_momentum": "One-Month Factor Momentum",
         "hmm_regime_switching": "HMM Regime Switching",
+        "squeeze_momentum": "Squeeze Momentum Indicator",
+        "soc_avalanche": "Self-Organized Criticality (Avalanche Distribution)",
+        "wavelet_trend_filter": "Adaptive Causal Wavelet Trend Filter",
+        "first_passage_time": "First Passage Time Distribution Analysis",
     }
     if meta.symbol == PORTFOLIO_COMPARISON_SYMBOL:
         strategy_labels["vt_vs_vti_vxus"] = "VT vs VTI+VXUS Portfolio Comparison"
@@ -285,3 +352,99 @@ async def get_strategy_analytics(symbol: str, db: AsyncSession = Depends(get_db)
         )
 
     return ApiResponse(data=result, message=message)
+
+
+# ---------------------------------------------------------------------------
+# Portfolio Optimization: Kelly Criterion + Mean-Variance Optimization
+#
+# Genuinely multi-asset — the request specifies an explicit basket of
+# symbols, unlike every route above (always one symbol's own history).
+# See services.strategies.compute_portfolio_optimization for the full
+# methodology and documented assumptions.
+# ---------------------------------------------------------------------------
+
+PORTFOLIO_OPT_MIN_SYMBOLS = 2
+PORTFOLIO_OPT_MAX_SYMBOLS = 8
+
+
+def _resolve_portfolio_symbol(symbol: str) -> str:
+    """Validates a symbol against every known price-source registry
+    (Explorer ETFs, portfolio-comparison-only symbols, and
+    strategy-only symbols) — Portfolio Optimization is a genuinely
+    multi-asset endpoint that may reasonably span all of them, not just
+    the six Explorer products resolve_meta() checks.
+    """
+    upper = symbol.strip().upper()
+    if (
+        upper in ETF_REGISTRY
+        or upper in PORTFOLIO_COMPARISON_REGISTRY
+        or upper in STRATEGY_ONLY_REGISTRY
+    ):
+        return upper
+    raise HTTPException(status_code=404, detail=f"Unknown symbol: {symbol}")
+
+
+@portfolio_router.post(
+    "/optimization", response_model=ApiResponse[PortfolioOptimizationResult]
+)
+async def post_portfolio_optimization(
+    request: PortfolioOptimizationRequest, db: AsyncSession = Depends(get_db)
+):
+    """Kelly Criterion + Mean-Variance Optimization across a basket of
+    symbols supplied in the request body (see
+    services.strategies.compute_portfolio_optimization).
+
+    Deliberately NOT folded into /etfs/{symbol}/strategies: that route
+    always analyzes one symbol's own price history, while this
+    genuinely combines multiple symbols' return/covariance structure —
+    the one case in this reorg where a dedicated endpoint was called
+    for instead of stretching the existing per-symbol shape.
+    """
+    requested = [s.strip().upper() for s in request.symbols if s and s.strip()]
+    seen: set[str] = set()
+    unique_symbols: list[str] = []
+    for s in requested:
+        if s not in seen:
+            seen.add(s)
+            unique_symbols.append(s)
+
+    if not PORTFOLIO_OPT_MIN_SYMBOLS <= len(unique_symbols) <= PORTFOLIO_OPT_MAX_SYMBOLS:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Provide between {PORTFOLIO_OPT_MIN_SYMBOLS} and "
+                f"{PORTFOLIO_OPT_MAX_SYMBOLS} distinct symbols."
+            ),
+        )
+    for s in unique_symbols:
+        _resolve_portfolio_symbol(s)
+
+    normalized_key = ",".join(sorted(unique_symbols))
+    cache_key = (
+        f"tw:v1:portfolio:optimization:{normalized_key}:"
+        f"{request.risk_free_rate_percent:g}"
+    )
+    cached = await cache.get_json(cache_key)
+    if cached is not None:
+        return ApiResponse(data=cached)
+
+    prices_by_symbol = {}
+    for s in unique_symbols:
+        prices = await load_prices(db, s)
+        require_prices(prices, s)
+        prices_by_symbol[s] = prices
+
+    result = strategies.compute_portfolio_optimization(
+        prices_by_symbol, risk_free_rate_percent=request.risk_free_rate_percent
+    )
+    if result is None:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Insufficient overlapping price history across the "
+                "requested symbols for a portfolio optimization."
+            ),
+        )
+
+    await cache.set_json(cache_key, result)
+    return ApiResponse(data=result)

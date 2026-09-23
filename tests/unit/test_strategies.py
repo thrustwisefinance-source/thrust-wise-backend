@@ -32,6 +32,8 @@ import datetime
 import random
 from unittest.mock import MagicMock
 
+import numpy as np
+import pandas as pd
 import pytest
 
 from app.constants import ETF_REGISTRY
@@ -1446,3 +1448,460 @@ class TestHmmRegimeSwitchingChartData:
             "regime",
         }
         assert row["regime"] in {"Trending", "High-Volatility"}
+
+
+# ---------------------------------------------------------------------------
+# Strategy 16: Squeeze Momentum Indicator
+# ---------------------------------------------------------------------------
+
+
+def _noisy_hlc_series(
+    symbol: str,
+    start: datetime.date,
+    n: int,
+    seed: int = 1,
+    start_price: float = 100.0,
+    vol: float = 0.01,
+    trend: float = 0.0002,
+    intraday_range_frac: float = 0.005,
+) -> list[MagicMock]:
+    """Realistic-ish OHLC series (nonzero high/low range each day, noisy
+    drifting close) for strategies that need genuine volatility/range
+    signal (Squeeze Momentum, SOC, Wavelet, First Passage Time) —
+    unlike `_make_series`'s flat high=low=close bars.
+    """
+    rng = random.Random(seed)
+    price = start_price
+    result = []
+    current = start
+    for _ in range(n):
+        while current.weekday() >= 5:
+            current += datetime.timedelta(days=1)
+        price *= 1 + rng.gauss(trend, vol)
+        price = max(price, 0.01)
+        day_range = abs(rng.gauss(0, vol * intraday_range_frac * 100)) * price
+        result.append(
+            _make_price_hlc(symbol, current, price + day_range, price - day_range, price)
+        )
+        current += datetime.timedelta(days=1)
+    return result
+
+
+class TestSqueezeMomentum:
+    def test_insufficient_data_returns_none(self):
+        prices = _make_hlc_series("VOO", datetime.date(2024, 1, 2), [100.0] * 10)
+        assert strategies.compute_squeeze_momentum(prices) is None
+
+    def test_empty_prices_return_none(self):
+        assert strategies.compute_squeeze_momentum([]) is None
+
+    def test_flat_low_volatility_series_reports_squeeze_on(self):
+        # A tight, essentially flat range keeps Bollinger Bands inside
+        # the Keltner Channel -> squeeze_on.
+        prices = _make_hlc_series(
+            "VOO", datetime.date(2022, 1, 3), [100.0] * 120, daily_range=0.05
+        )
+        result = strategies.compute_squeeze_momentum(prices)
+        assert result is not None
+        assert result["squeeze_on"] is True
+        assert result["squeeze_state"] == "Squeeze On"
+
+    def test_expanding_volatility_reports_squeeze_off(self):
+        # Long flat/tight period (compresses BB inside KC) followed by a
+        # sharp expansion in daily range -> Bollinger Bands should
+        # expand outside the Keltner Channel -> squeeze_off.
+        flat = _make_hlc_series(
+            "VOO", datetime.date(2022, 1, 3), [100.0] * 100, daily_range=0.05
+        )
+        last_date = flat[-1].date + datetime.timedelta(days=1)
+        expanding = _make_hlc_series(
+            "VOO", last_date, [100.0 + i * 3 for i in range(1, 15)], daily_range=6.0
+        )
+        prices = flat + expanding
+        result = strategies.compute_squeeze_momentum(prices)
+        assert result is not None
+        assert result["squeeze_off"] is True
+        assert result["squeeze_state"] == "Squeeze Released"
+
+    def test_momentum_is_last_fitted_value_not_slope(self):
+        # For a perfectly linear momentum-source series, the rolling
+        # linreg's last fitted value should equal the series' own last
+        # value (since a perfect line's fitted endpoint == the actual
+        # endpoint) — this would NOT hold if the slope were returned
+        # instead, which is the exact mistake the article warns about.
+        length = strategies.SMI_LENGTH
+        y = pd.Series(np.arange(length, dtype=float) * 2.0 + 5.0)
+        fitted = strategies._linreg_last_value(y, length)
+        assert abs(float(fitted.iloc[-1]) - float(y.iloc[-1])) < 1e-9
+
+    def test_result_has_expected_fields_and_chart_output(self):
+        prices = _noisy_hlc_series("VOO", datetime.date(2021, 1, 4), 300, seed=3)
+        result = strategies.compute_squeeze_momentum(prices)
+        assert result is not None
+        for key in [
+            "price",
+            "upper_bb",
+            "lower_bb",
+            "upper_kc",
+            "lower_kc",
+            "momentum",
+            "momentum_direction",
+            "momentum_state",
+            "squeeze_state",
+            "squeeze_on",
+            "squeeze_off",
+            "squeeze_released_today",
+            "bb_length",
+            "bb_mult",
+            "kc_mult",
+            "chart_data",
+        ]:
+            assert key in result
+        assert result["momentum_direction"] in {"Rising", "Falling", "Flat"}
+        assert len(result["chart_data"]) <= strategies.CHART_LOOKBACK_DAYS
+        row = result["chart_data"][-1]
+        assert row["squeeze_state"] in {"on", "off", "none"}
+
+    def test_no_lookahead_bias(self):
+        full = _noisy_hlc_series("VOO", datetime.date(2019, 1, 2), 400, seed=11)
+        truncated = full[:-20]
+        result_full = strategies.compute_squeeze_momentum(full)
+        result_trunc = strategies.compute_squeeze_momentum(truncated)
+        assert result_full is not None and result_trunc is not None
+
+        trunc_by_date = {row["date"]: row for row in result_trunc["chart_data"]}
+        overlapping = 0
+        for row in result_full["chart_data"]:
+            if row["date"] in trunc_by_date:
+                overlapping += 1
+                assert row == trunc_by_date[row["date"]]
+        assert overlapping > 0
+
+
+# ---------------------------------------------------------------------------
+# Strategy 17: Self-Organized Criticality — Avalanche Distribution
+# ---------------------------------------------------------------------------
+
+
+class TestSocAvalanche:
+    def test_insufficient_history_returns_none(self):
+        prices = _make_series("VOO", datetime.date(2024, 1, 2), [100.0] * 100)
+        assert strategies.compute_soc_avalanche(prices) is None
+
+    def test_empty_prices_return_none(self):
+        assert strategies.compute_soc_avalanche([]) is None
+
+    def test_insufficient_avalanches_returns_none(self):
+        # Long enough history, but a monotonically rising series never
+        # drops below its running peak -> zero avalanches -> None.
+        closes = [100.0 + i * 0.1 for i in range(400)]
+        prices = _make_series("VOO", datetime.date(2021, 1, 4), closes)
+        assert strategies.compute_soc_avalanche(prices) is None
+
+    def test_alpha_and_classification_are_consistent_and_deterministic(self):
+        prices = _noisy_hlc_series(
+            "VOO", datetime.date(2018, 1, 2), 1400, seed=42, vol=0.012
+        )
+        result_1 = strategies.compute_soc_avalanche(prices)
+        result_2 = strategies.compute_soc_avalanche(prices)
+        assert result_1 is not None
+        # Deterministic: identical input -> identical output.
+        assert result_1 == result_2
+
+        alpha = result_1["alpha"]
+        regime = result_1["criticality_regime"]
+        if alpha >= 2.8:
+            assert regime == "Gaussian"
+        elif alpha >= 1.8:
+            assert regime == "Transitional"
+        elif alpha >= 1.0:
+            assert regime == "Critical"
+        else:
+            assert regime == "Super-critical"
+
+        assert result_1["avalanche_count"] >= strategies.SOC_MIN_AVALANCHES
+        assert result_1["mean_avalanche_size_percent"] > 0
+        assert result_1["max_avalanche_size_percent"] >= result_1["mean_avalanche_size_percent"]
+        assert result_1["current_drawdown_percent"] <= 0
+        assert "chart_data" in result_1
+        assert "avalanche_history" in result_1
+
+    def test_extract_avalanches_identifies_a_known_drawdown(self):
+        # 100 -> 100 -> 80 -> 80 -> 110 (new high) -> one avalanche of
+        # size 20% (peak-to-trough from 100 to 80).
+        series = pd.Series(
+            [100.0, 100.0, 80.0, 80.0, 110.0],
+            index=pd.date_range("2022-01-03", periods=5, freq="B"),
+        )
+        sizes = strategies._extract_avalanches(series)
+        assert len(sizes) == 1
+        assert abs(float(sizes.iloc[0]) - 20.0) < 1e-9
+
+
+# ---------------------------------------------------------------------------
+# Strategy 18: Adaptive Causal Wavelet Trend Filter
+# ---------------------------------------------------------------------------
+
+
+class TestWaveletTrendFilter:
+    def test_insufficient_history_returns_none(self):
+        prices = _make_series("VOO", datetime.date(2024, 1, 2), [100.0] * 20)
+        assert strategies.compute_wavelet_trend_filter(prices) is None
+
+    def test_empty_prices_return_none(self):
+        assert strategies.compute_wavelet_trend_filter([]) is None
+
+    def test_causal_kernel_uses_only_nonnegative_lags(self):
+        kernel = strategies._causal_ricker_kernel(scale=10)
+        # Purely a function of t >= 0 (see module docstring) — sanity
+        # check the peak sits at lag 0 (t=0 -> psi(0) = 1, the maximum
+        # of (1 - t^2) * exp(-t^2/2)).
+        assert kernel[0] == max(kernel)
+        assert abs(kernel[0] - 1.0) < 1e-9
+
+    def test_uptrend_series_reports_bullish_trend_state(self):
+        closes = [100.0 * (1.001**i) for i in range(250)]
+        prices = _make_series("VOO", datetime.date(2021, 1, 4), closes)
+        result = strategies.compute_wavelet_trend_filter(prices)
+        assert result is not None
+        assert result["current_trend_state"] in {
+            "Strong Uptrend",
+            "Uptrend (Mixed Confirmation)",
+        }
+        assert result["trend_short"] > 0 or result["trend_medium"] > 0
+
+    def test_downtrend_series_reports_bearish_trend_state(self):
+        closes = [100.0 * (0.999**i) for i in range(250)]
+        prices = _make_series("VOO", datetime.date(2021, 1, 4), closes)
+        result = strategies.compute_wavelet_trend_filter(prices)
+        assert result is not None
+        assert result["current_trend_state"] in {
+            "Strong Downtrend",
+            "Downtrend (Mixed Confirmation)",
+        }
+
+    def test_no_lookahead_bias(self):
+        full = _noisy_hlc_series("VOO", datetime.date(2019, 1, 2), 600, seed=5)
+        truncated = full[:-20]
+        result_full = strategies.compute_wavelet_trend_filter(full)
+        result_trunc = strategies.compute_wavelet_trend_filter(truncated)
+        assert result_full is not None and result_trunc is not None
+
+        trunc_by_date = {row["date"]: row for row in result_trunc["chart_data"]}
+        overlapping = 0
+        for row in result_full["chart_data"]:
+            if row["date"] in trunc_by_date:
+                overlapping += 1
+                assert row == trunc_by_date[row["date"]]
+        assert overlapping > 0
+
+    def test_result_has_expected_fields(self):
+        prices = _noisy_hlc_series("VOO", datetime.date(2020, 1, 2), 300, seed=8)
+        result = strategies.compute_wavelet_trend_filter(prices)
+        assert result is not None
+        for key in [
+            "price",
+            "current_trend_state",
+            "wavelet_trend_value",
+            "trend_short",
+            "trend_medium",
+            "trend_long",
+            "volatility_adjustment_percent",
+            "scales_days",
+            "chart_data",
+        ]:
+            assert key in result
+        assert set(result["scales_days"].keys()) == {"short", "medium", "long"}
+
+
+# ---------------------------------------------------------------------------
+# Strategy 19: First Passage Time Distribution Analysis
+# ---------------------------------------------------------------------------
+
+
+class TestFirstPassageTime:
+    def test_insufficient_history_returns_none(self):
+        prices = _make_series("VOO", datetime.date(2024, 1, 2), [100.0] * 50)
+        assert strategies.compute_first_passage_time(prices) is None
+
+    def test_empty_prices_return_none(self):
+        assert strategies.compute_first_passage_time([]) is None
+
+    def test_target_probabilities_are_valid_percentages(self):
+        prices = _noisy_hlc_series(
+            "VOO", datetime.date(2020, 1, 2), 400, seed=21, trend=0.0003
+        )
+        result = strategies.compute_first_passage_time(prices)
+        assert result is not None
+        assert 0.0 <= result["upside_target_probability_percent"] <= 100.0
+        assert 0.0 <= result["downside_target_probability_percent"] <= 100.0
+
+    def test_strong_positive_drift_favors_upside_expected_time(self):
+        closes = [100.0 * (1.003**i) for i in range(400)]
+        prices = _make_series("VOO", datetime.date(2020, 1, 2), closes)
+        result = strategies.compute_first_passage_time(prices)
+        assert result is not None
+        # Strong, consistent positive drift -> expected days to the
+        # upside target should be defined (drift points toward it) and
+        # the downside expected time should be undefined (infinite
+        # under a pure Brownian model, since drift points away).
+        assert result["expected_days_to_upside_target"] is not None
+        assert result["expected_days_to_downside_target"] is None
+        assert result["upside_target_probability_percent"] > 50.0
+
+    def test_strong_negative_drift_favors_downside_expected_time(self):
+        closes = [100.0 * (0.997**i) for i in range(400)]
+        prices = _make_series("VOO", datetime.date(2020, 1, 2), closes)
+        result = strategies.compute_first_passage_time(prices)
+        assert result is not None
+        assert result["expected_days_to_downside_target"] is not None
+        assert result["expected_days_to_upside_target"] is None
+
+    def test_result_has_expected_fields_and_chart_output(self):
+        prices = _noisy_hlc_series("VOO", datetime.date(2020, 1, 2), 400, seed=4)
+        result = strategies.compute_first_passage_time(prices)
+        assert result is not None
+        for key in [
+            "price",
+            "mean_daily_log_return_percent",
+            "daily_volatility_percent",
+            "horizon_trading_days",
+            "upside_target_percent",
+            "downside_target_percent",
+            "upside_target_price",
+            "downside_target_price",
+            "upside_target_probability_percent",
+            "downside_target_probability_percent",
+            "expected_days_to_upside_target",
+            "expected_days_to_downside_target",
+            "lookback_days",
+            "assumptions_note",
+            "chart_data",
+        ]:
+            assert key in result
+        assert result["horizon_trading_days"] == strategies.FPT_HORIZON_DAYS
+        assert len(result["chart_data"]) == strategies.FPT_HORIZON_DAYS
+        last_row = result["chart_data"][-1]
+        assert last_row["upside_hit_probability_percent"] == result[
+            "upside_target_probability_percent"
+        ]
+
+    def test_degenerate_zero_variance_input_returns_none(self):
+        prices = _make_series("VOO", datetime.date(2020, 1, 2), [100.0] * 400)
+        assert strategies.compute_first_passage_time(prices) is None
+
+
+# ---------------------------------------------------------------------------
+# Portfolio Optimization: Kelly Criterion + Mean-Variance Optimization
+# ---------------------------------------------------------------------------
+
+
+def _correlated_asset_series(
+    symbols: list[str], n: int = 400, seed: int = 1
+) -> dict[str, list[MagicMock]]:
+    """A small basket of independently-drifting-and-noisy price series
+    (not truly correlated, just independent random walks with distinct
+    drift/vol per asset) — enough for a non-degenerate covariance
+    matrix without needing real market data."""
+    rng = random.Random(seed)
+    result = {}
+    for i, symbol in enumerate(symbols):
+        trend = 0.0001 * (i + 1)
+        vol = 0.008 + 0.004 * i
+        price = 50.0 + i * 25.0
+        closes = []
+        for _ in range(n):
+            price *= 1 + rng.gauss(trend, vol)
+            price = max(price, 0.01)
+            closes.append(price)
+        result[symbol] = _make_series(symbol, datetime.date(2020, 1, 2), closes)
+    return result
+
+
+class TestPortfolioOptimization:
+    def test_insufficient_assets_returns_none(self):
+        prices_by_symbol = _correlated_asset_series(["A"], n=300)
+        assert strategies.compute_portfolio_optimization(prices_by_symbol) is None
+
+    def test_no_overlapping_history_returns_none(self):
+        # Genuinely disjoint date ranges (B's history starts years after
+        # A's ends) -> the inner join produces zero comparable trading
+        # days -> None, never a fabricated/interpolated overlap.
+        a = _make_series("A", datetime.date(2020, 1, 2), [100.0] * 300)
+        b = _make_series("B", datetime.date(2023, 1, 2), [100.0] * 300)
+        assert strategies.compute_portfolio_optimization({"A": a, "B": b}) is None
+
+        # Same-range but too-short overlap also exercises the None path.
+        a_short = _make_series("A", datetime.date(2020, 1, 2), [100.0] * 30)
+        b_short = _make_series("B", datetime.date(2020, 1, 2), [100.0] * 30)
+        assert strategies.compute_portfolio_optimization({"A": a_short, "B": b_short}) is None
+
+    def test_missing_symbol_prices_are_skipped_not_fabricated(self):
+        prices_by_symbol = _correlated_asset_series(["A", "B"], n=300)
+        prices_by_symbol["C"] = []  # no data at all for C
+        result = strategies.compute_portfolio_optimization(prices_by_symbol)
+        assert result is not None
+        assert "C" not in result["symbols"]
+
+    def test_valid_multi_asset_input_produces_normalized_weights(self):
+        prices_by_symbol = _correlated_asset_series(["A", "B", "C"], n=500)
+        result = strategies.compute_portfolio_optimization(prices_by_symbol)
+        assert result is not None
+        assert set(result["symbols"]) == {"A", "B", "C"}
+
+        for portfolio_key in ["min_volatility_portfolio", "max_sharpe_portfolio"]:
+            portfolio = result[portfolio_key]
+            weights = portfolio["weights"]
+            total = sum(w["weight_percent"] for w in weights)
+            assert abs(total - 100.0) < 0.5
+            for w in weights:
+                # Long-only projection (see _long_only_projection):
+                # every weight must be non-negative.
+                assert w["weight_percent"] >= -1e-6
+            assert isinstance(portfolio["expected_return_percent"], float)
+            assert isinstance(portfolio["volatility_percent"], float)
+            assert portfolio["volatility_percent"] >= 0.0
+            assert isinstance(portfolio["sharpe_ratio"], float)
+
+    def test_efficient_frontier_weights_are_normalized(self):
+        prices_by_symbol = _correlated_asset_series(["A", "B", "C"], n=500)
+        result = strategies.compute_portfolio_optimization(prices_by_symbol)
+        assert result is not None
+        assert len(result["efficient_frontier"]) > 0
+        for point in result["efficient_frontier"]:
+            total = sum(w["weight_percent"] for w in point["weights"])
+            assert abs(total - 100.0) < 0.5
+            assert point["volatility_percent"] >= 0.0
+
+    def test_kelly_sizing_present_per_symbol(self):
+        prices_by_symbol = _correlated_asset_series(["A", "B", "C"], n=500)
+        result = strategies.compute_portfolio_optimization(prices_by_symbol)
+        assert result is not None
+        symbols_in_kelly = {k["symbol"] for k in result["kelly_sizing"]}
+        assert symbols_in_kelly == set(result["symbols"])
+        for k in result["kelly_sizing"]:
+            assert isinstance(k["single_asset_kelly_fraction_percent"], float)
+            assert isinstance(k["portfolio_kelly_weight_percent"], float)
+            assert isinstance(k["half_kelly_weight_percent"], float)
+
+    def test_long_only_projection_never_returns_negative_weights(self):
+        # Directly exercise the projection helper with a raw solution
+        # that has negative entries (as the unconstrained closed-form
+        # Markowitz solution can produce).
+        raw = np.array([1.5, -0.3, -0.2])
+        projected = strategies._long_only_projection(raw)
+        assert np.all(projected >= 0)
+        assert abs(projected.sum() - 1.0) < 1e-9
+
+    def test_long_only_projection_falls_back_to_equal_weight_when_degenerate(self):
+        raw = np.array([-1.0, -2.0, -3.0])
+        projected = strategies._long_only_projection(raw)
+        assert np.allclose(projected, 1.0 / 3.0)
+
+    def test_disclaimer_and_notes_present(self):
+        prices_by_symbol = _correlated_asset_series(["A", "B"], n=400)
+        result = strategies.compute_portfolio_optimization(prices_by_symbol)
+        assert result is not None
+        assert "disclaimer" in result and len(result["disclaimer"]) > 0
+        assert "long_only_note" in result and len(result["long_only_note"]) > 0
+        assert "not investment advice" in result["disclaimer"].lower()

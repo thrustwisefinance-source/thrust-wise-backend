@@ -144,6 +144,7 @@ app.add_middleware(
 app.include_router(compare.router, prefix="/api")
 app.include_router(etfs.router, prefix="/api")
 app.include_router(strategy.router, prefix="/api")
+app.include_router(strategy.portfolio_router, prefix="/api")
 app.include_router(canslim.router, prefix="/api")
 app.include_router(dashboard.router, prefix="/api")
 app.include_router(admin.router, prefix="/api")
