@@ -32,6 +32,23 @@ _refresh_lock = asyncio.Lock()
 # by, the unrelated ETF/index nightly refresh above.
 _scanner_refresh_lock = asyncio.Lock()
 
+# asyncio only keeps a WEAK reference to a task created via
+# asyncio.create_task — if nothing else references it, it can be
+# garbage-collected before it finishes, silently, with no exception
+# surfaced anywhere (see https://docs.python.org/3/library/asyncio-task.html#asyncio.create_task,
+# "Important: Save a reference to the result..."). Both background
+# refreshes below run for minutes (500-stock price backfill in
+# particular), so a live reference is kept here for the task's whole
+# lifetime and discarded via the done-callback once it finishes. This
+# does not change either endpoint's request/response contract.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _run_in_background(coro) -> None:
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
 
 def _verify_admin_token(x_admin_token: str | None) -> None:
     """Verify the admin token.
@@ -77,7 +94,7 @@ async def trigger_refresh(
             except Exception:
                 logger.exception("Admin-triggered refresh failed")
 
-    asyncio.create_task(_run_refresh())
+    _run_in_background(_run_refresh())
 
     return JSONResponse(
         status_code=202,
@@ -144,7 +161,7 @@ async def trigger_scanner_refresh(
                     "Admin-triggered scanner refresh failed"
                 )
 
-    asyncio.create_task(_run_scanner_refresh())
+    _run_in_background(_run_scanner_refresh())
 
     return JSONResponse(
         status_code=202,
