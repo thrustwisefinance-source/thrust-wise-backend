@@ -11,6 +11,12 @@ data source approach used for every other symbol in this codebase
 (EODHD), instead of the source article's own hard-coded 503-ticker
 Python list, which goes stale the moment index membership changes.
 
+If EODHD returns 403 for the Components lookup (Index Constituents
+data is a separate entitlement from EODHD's base Fundamentals package;
+see app.scanners.sp500_fallback), sp500 falls back to scraping
+Wikipedia's actively-maintained constituent table instead of leaving
+the universe permanently empty. EODHD is always tried first.
+
 Adding another universe later (NASDAQ 100, Russell 1000, a custom list)
 means adding one entry to UNIVERSE_REGISTRY plus (if it also comes from
 an EODHD index) one EODHD index symbol — no changes to
@@ -19,13 +25,18 @@ app/scanners/canslim.py, app/scanners/data.py, or the router.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
+import httpx
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import StockUniverseMember
+from app.scanners import sp500_fallback
 from app.services import eodhd_client
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -103,13 +114,35 @@ async def refresh_universe(db: AsyncSession, universe_key: str) -> int:
             f"Universe '{universe_key}' has no EODHD index backing configured yet."
         )
 
-    payload = await eodhd_client.fetch_index_fundamentals(source.eodhd_index_symbol)
-    components = (payload or {}).get("Components") or {}
-    if not components:
-        raise RuntimeError(
-            f"EODHD returned no index components for {source.eodhd_index_symbol}; "
-            "refusing to wipe the existing universe."
-        )
+    components_list: list[dict]
+    try:
+        payload = await eodhd_client.fetch_index_fundamentals(source.eodhd_index_symbol)
+        components = (payload or {}).get("Components") or {}
+        if not components:
+            raise RuntimeError(
+                f"EODHD returned no index components for {source.eodhd_index_symbol}; "
+                "refusing to wipe the existing universe."
+            )
+        components_list = list(components.values())
+    except httpx.HTTPStatusError as exc:
+        # A 403 here specifically means EODHD's Index Components data isn't
+        # included in this account's plan/add-ons (see this module's and
+        # app.scanners.sp500_fallback's docstrings) — it is not a symbol,
+        # auth, or logic problem, and retrying won't help. Only sp500 has a
+        # free fallback source wired up today; other index-backed universes
+        # still surface the failure as-is.
+        if exc.response.status_code == 403 and universe_key.lower() == "sp500":
+            logger.warning(
+                "EODHD returned 403 for %s Index Components — this means "
+                "Index Constituents data isn't included in the current EODHD "
+                "plan/add-ons (contact support@eodhistoricaldata.com or check "
+                "https://eodhd.com/pricing), not a bug in this code. Falling "
+                "back to Wikipedia's S&P 500 constituent table for this refresh.",
+                source.eodhd_index_symbol,
+            )
+            components_list = await sp500_fallback.fetch_sp500_constituents_from_wikipedia()
+        else:
+            raise
 
     await db.execute(
         update(StockUniverseMember)
@@ -118,7 +151,7 @@ async def refresh_universe(db: AsyncSession, universe_key: str) -> int:
     )
 
     count = 0
-    for entry in components.values():
+    for entry in components_list:
         code = (entry.get("Code") or "").strip().upper()
         if not code:
             continue
