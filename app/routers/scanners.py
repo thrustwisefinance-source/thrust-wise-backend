@@ -34,11 +34,24 @@ router = APIRouter(prefix="/scanners", tags=["scanners"])
 
 DATA_SOURCE_LIMITATIONS = [
     (
+        "This scanner's stock data (constituent list, fundamentals, "
+        "prices) comes entirely from yfinance/Yahoo Finance — a free, "
+        "unofficial data source, NOT EODHD (EODHD is used only by "
+        "ThrustWise's separate ETF/index ingestion, e.g. GET "
+        "/api/strategies/canslim). yfinance has no enterprise SLA; data "
+        "for a given symbol or field can occasionally be missing or "
+        "delayed — see each criterion's `status`/`data_source` for "
+        "exactly what was and wasn't available."
+    ),
+    (
         "C (current quarterly earnings) and A (annual earnings growth) "
-        "use EODHD Fundamentals Earnings.History / Earnings.Annual and "
-        "Highlights.ReturnOnEquityTTM. A zero/negative denominator (e.g. "
-        "a loss-making prior period) is reported as NOT_APPLICABLE, "
-        "never a fabricated or misleading percentage."
+        "use yfinance's Ticker.get_earnings_dates() (Reported EPS) and "
+        "Ticker.income_stmt (Diluted/Basic EPS) + Ticker.info's "
+        "returnOnEquity. Yahoo typically exposes only ~4 fiscal years "
+        "of annual data (vs. the article's 3-5 year window) and a "
+        "rolling window of recent quarters. A zero/negative denominator "
+        "(e.g. a loss-making prior period) is reported as "
+        "NOT_APPLICABLE, never a fabricated or misleading percentage."
     ),
     (
         "N (New) only evaluates the measurable price-highs component "
@@ -48,7 +61,7 @@ DATA_SOURCE_LIMITATIONS = [
         "explanation."
     ),
     (
-        "S (Supply and Demand) uses EODHD SharesStats.SharesFloat "
+        "S (Supply and Demand) uses yfinance's Ticker.info.floatShares "
         "against the article's 25,000,000-share threshold. Insider "
         "buying and buyback activity are NOT evaluated — ThrustWise "
         "does not ingest a time series of insider transactions or "
@@ -62,18 +75,20 @@ DATA_SOURCE_LIMITATIONS = [
         "has no data source for."
     ),
     (
-        "I (Institutional Sponsorship) uses EODHD's reported "
-        "institutional-holder count against a disclosed interpretive "
-        "minimum (see app.scanners.canslim.CANSLIM_I_MIN_INSTITUTIONAL_HOLDERS) "
+        "I (Institutional Sponsorship) uses yfinance's "
+        "Ticker.institutional_holders — Yahoo's own top-holders table, "
+        "NOT a complete count of every institutional owner — against a "
+        "disclosed interpretive minimum (see "
+        "app.scanners.canslim.CANSLIM_I_MIN_INSTITUTIONAL_HOLDERS) "
         "since the source article gives no exact number for 'a few' "
         "institutional investors. 'Increasing over time' and "
         "'over-owned' are informational only, not gating."
     ),
     (
         "M (Market Direction) is evaluated ONCE per scan from the S&P "
-        "500 INDEX's own price vs. its 200-day SMA, and applied "
-        "identically to every stock — never a per-stock price-vs-its-"
-        "own-SMA200 proxy."
+        "500 INDEX's own price (yfinance '^GSPC') vs. its 200-day SMA, "
+        "and applied identically to every stock — never a per-stock "
+        "price-vs-its-own-SMA200 proxy."
     ),
     (
         "This is a screening/ranking tool, not investment advice. "

@@ -41,6 +41,14 @@ class Settings(BaseSettings):
     # Set to false for extra replicas so only one instance runs the
     # scanner scheduler (same convention as run_scheduler above).
     run_scanner_scheduler: bool = False
+    # How far back to seed historical OHLCV data for the scanner (stocks
+    # + the "^GSPC" market index) via yfinance. Deliberately separate
+    # from `ingestion_history_years` above (which is the OLD EODHD-based
+    # ETF pipeline's setting) so the two pipelines' knobs don't get
+    # tangled together. 2 years comfortably covers the 252-trading-day
+    # lookback (L) and 52-week high (N) with room to spare, without
+    # re-downloading years of daily bars on every scanner refresh.
+    scanner_price_history_years: int = 2
 
     @property
     def scanner_universes_to_ingest_list(self) -> list[str]:

@@ -1,57 +1,83 @@
 """
-Scanner data layer: turns raw EODHD payloads + ingested price history into
-the typed inputs app/scanners/canslim.py's pure functions need.
+Scanner data layer: turns raw yfinance payloads + ingested price history
+into the typed inputs app/scanners/canslim.py's pure functions need.
 
-Two data sources, both already established in this codebase:
+THIS MODULE NO LONGER USES EODHD AT ALL. Two data sources, both via
+app.scanners.yfinance_client:
 
-1. Fundamentals (C, A, S, I inputs) — EODHD Fundamentals API, retrieved
-   in BULK (app.services.eodhd_client.fetch_bulk_fundamentals) in chunks
-   of BULK_FUNDAMENTALS_CHUNK_SIZE symbols per HTTP call, never one
-   request per symbol per criterion. Extracted fields are cached in
-   Postgres (app.models.StockFundamentalsSnapshot) — see that model's
-   docstring for the freshness fields (`fetched_at`,
+1. Fundamentals (C, A, S, I inputs) — yfinance's per-symbol Ticker.info /
+   get_earnings_dates() / income_stmt / institutional_holders (there is
+   no yfinance bulk-fundamentals endpoint, unlike EODHD's, so this is
+   necessarily one set of calls per symbol — see
+   `fetch_and_extract_fundamentals_for_symbol` and
+   `refresh_fundamentals_snapshots` for the bounded-concurrency,
+   per-symbol-resilient orchestration). Extracted fields are cached in
+   Postgres (app.models.StockFundamentalsSnapshot) exactly as before —
+   see that model's docstring for the freshness fields (`fetched_at`,
    `fundamentals_as_of`).
 
-2. Price history (N, L, M inputs) — the EXISTING app.models.DailyPrice
-   table and app.services.eodhd_client.fetch_eod_history, the same ones
-   ETF ingestion already uses. Stock price rows share the same table
-   (symbol is just a plain string column already; nothing ETF-specific
-   about DailyPrice) — no new price-storage model was introduced. The
-   S&P 500 index itself (GSPC) is ALREADY ingested by the existing
-   app.services.ingestion (see app.constants.INDEX_REGISTRY), so M is
-   computed from data this codebase already has, with no new ingestion
-   needed for the market-direction leg.
+   IMPORTANT: the quarter-matching and multi-year-growth CALCULATIONS
+   themselves (`_latest_and_year_ago_quarter`, `_annual_eps_history`) are
+   UNCHANGED from before this migration — they operate on a generic
+   {date_str: {"epsActual": float}} shape that used to be built directly
+   from EODHD's Earnings.History/Earnings.Annual payload shape and is now
+   built from yfinance's very different payload shapes by
+   `_quarterly_eps_dict_from_earnings_dates` /
+   `_annual_eps_dict_from_income_stmt` below. Only the data ACQUISITION
+   and RESHAPING changed; the actual CANSLIM math did not.
 
-No fabrication anywhere in this module: a missing/unparseable EODHD
+2. Price history (N, L, M inputs) — yfinance daily bars
+   (app.scanners.yfinance_client.fetch_price_history_range), stored in
+   the EXISTING app.models.DailyPrice table (symbol is just a plain
+   string column; nothing ETF-specific about it — stock price rows
+   share the same table the OLD ETF pipeline uses, with no new
+   price-storage model introduced). The S&P 500 INDEX itself is now
+   ALSO ingested via yfinance (symbol "^GSPC", see MARKET_INDEX_SYMBOL
+   below) by THIS module's ingestion path — deliberately a different
+   daily_prices symbol than the OLD ETF/dashboard pipeline's
+   EODHD-sourced "GSPC" (app.constants.INDEX_REGISTRY /
+   app.services.ingestion), so the M criterion never depends on EODHD,
+   directly or indirectly, and the two pipelines' rows never collide.
+
+No fabrication anywhere in this module: a missing/unparseable yfinance
 field becomes None and is carried through as None — app/scanners/canslim.py
 is what turns "input is None" into an explicit UNAVAILABLE status, never
-a silently substituted default.
+a silently substituted default (0, False, 0%).
 """
 
 from __future__ import annotations
 
+import asyncio
 import datetime
+import json
 import logging
 from dataclasses import dataclass
 
+import pandas as pd
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.constants import INDEX_REGISTRY
+from app.database import AsyncSessionLocal
 from app.models import DailyPrice, StockFundamentalsSnapshot
+from app.scanners import yfinance_client
 from app.scanners.canslim import CANSLIM_L_LOOKBACK_TRADING_DAYS, CANSLIM_M_SMA_PERIOD
-from app.services import eodhd_client
 from app.services.strategies import _round, to_close_series
 
 logger = logging.getLogger(__name__)
 
-# EODHD's bulk-fundamentals endpoint is documented for up to a couple
-# hundred symbols per call; a conservative chunk size keeps individual
-# requests well within provider limits while still turning a 500-stock
-# universe into ~10 HTTP calls instead of 500 (see scanner performance
-# requirements).
-BULK_FUNDAMENTALS_CHUNK_SIZE = 50
+# yfinance has no bulk-fundamentals endpoint, so fundamentals are fetched
+# one symbol at a time — this bounds how many symbols are in flight at
+# once (on top of, and effectively tighter than,
+# app.scanners.yfinance_client.YFINANCE_MAX_CONCURRENCY, since each
+# symbol here issues several yfinance calls concurrently via
+# asyncio.gather in fetch_and_extract_fundamentals_for_symbol).
+FUNDAMENTALS_CONCURRENCY = 5
+
+# The S&P 500 index itself, via yfinance — used for the M criterion. See
+# module docstring for why this is a DIFFERENT daily_prices symbol than
+# the OLD ETF/dashboard pipeline's EODHD-sourced "GSPC".
+MARKET_INDEX_SYMBOL = "^GSPC"
 
 # 52-week window for the N criterion's high, and floor for a usable
 # trailing-return series for the L criterion — same 252-trading-day
@@ -61,20 +87,22 @@ PRICE_HISTORY_MIN_ROWS = 252
 
 
 # ---------------------------------------------------------------------------
-# Fundamentals: extraction
+# Fundamentals: generic EPS-history parsing (UNCHANGED — see module
+# docstring. These operate on a {date_str: {"epsActual": float}} shape,
+# not on any EODHD- or yfinance-specific payload directly.)
 # ---------------------------------------------------------------------------
 
 
 def _latest_and_year_ago_quarter(
     earnings_history: dict,
 ) -> tuple[float | None, str | None, float | None, str | None]:
-    """From EODHD Earnings.History (keyed by period-end date), return
+    """From a {date_str: {"epsActual": float}} dict, return
     (eps_current, eps_current_period, eps_year_ago, eps_year_ago_period).
 
-    "Year ago" is the reported quarter whose period-end date is closest
-    to exactly 364 days before the latest reported quarter's date
-    (handles the normal ~91-day quarterly cadence without assuming a
-    fixed 4-entries-back offset, which breaks if a quarter is missing).
+    "Year ago" is the reported quarter whose date is closest to exactly
+    364 days before the latest reported quarter's date (handles the
+    normal ~91-day quarterly cadence without assuming a fixed
+    4-entries-back offset, which breaks if a quarter is missing).
     """
     entries = []
     for date_str, entry in (earnings_history or {}).items():
@@ -108,10 +136,10 @@ def _latest_and_year_ago_quarter(
 
 
 def _annual_eps_history(earnings_annual: dict, max_years: int) -> list[dict]:
-    """From EODHD Earnings.Annual (keyed by fiscal-year-end date), return
-    up to `max_years` most recent {"year": int, "eps": float} entries,
-    ascending by year. Skips entries with no reported EPS rather than
-    fabricating one.
+    """From a {date_str: {"epsActual": float}} dict (fiscal-year-end
+    keyed), return up to `max_years` most recent {"year": int, "eps":
+    float} entries, ascending by year. Skips entries with no reported
+    EPS rather than fabricating one.
     """
     entries = []
     for date_str, entry in (earnings_annual or {}).items():
@@ -129,36 +157,100 @@ def _annual_eps_history(earnings_annual: dict, max_years: int) -> list[dict]:
     return [{"year": date.year, "eps": eps} for date, eps in trimmed]
 
 
-def extract_fundamentals_fields(symbol: str, raw: dict) -> dict:
-    """Pure extraction: EODHD's raw /fundamentals (or one entry of
-    /bulk-fundamentals) payload -> the flat fields
-    StockFundamentalsSnapshot stores. Never raises on a missing section —
-    every field independently defaults to None.
+# ---------------------------------------------------------------------------
+# Fundamentals: yfinance payload -> the generic {date_str: {"epsActual"}}
+# shape the parsers above expect
+# ---------------------------------------------------------------------------
+
+
+def _quarterly_eps_dict_from_earnings_dates(df: pd.DataFrame | None) -> dict:
+    """yfinance `Ticker.get_earnings_dates()` -> the same
+    {date_str: {"epsActual": float}} shape `_latest_and_year_ago_quarter`
+    expects. Rows with no reported EPS yet (future/upcoming earnings
+    dates, or Yahoo hasn't posted the actual yet) are skipped, never
+    fabricated as 0.
     """
-    general = raw.get("General") or {}
-    highlights = raw.get("Highlights") or {}
-    shares_stats = raw.get("SharesStats") or {}
-    earnings = raw.get("Earnings") or {}
-    holders = raw.get("Holders") or {}
+    if df is None or "Reported EPS" not in df.columns:
+        return {}
+
+    result: dict = {}
+    for date_index, row in df.iterrows():
+        eps = row.get("Reported EPS")
+        if eps is None or (isinstance(eps, float) and pd.isna(eps)):
+            continue
+        try:
+            date_str = date_index.date().isoformat()
+        except AttributeError:
+            continue
+        result[date_str] = {"epsActual": float(eps)}
+    return result
+
+
+def _annual_eps_dict_from_income_stmt(df: pd.DataFrame | None) -> dict:
+    """yfinance `Ticker.income_stmt` (annual) -> the same
+    {date_str: {"epsActual": float}} shape `_annual_eps_history` expects.
+    Prefers the 'Diluted EPS' row; falls back to 'Basic EPS' if a
+    company's statement doesn't report diluted EPS separately.
+    """
+    if df is None:
+        return {}
+
+    row_label = next(
+        (candidate for candidate in ("Diluted EPS", "Basic EPS") if candidate in df.index),
+        None,
+    )
+    if row_label is None:
+        return {}
+
+    result: dict = {}
+    for column, value in df.loc[row_label].items():
+        if value is None or (isinstance(value, float) and pd.isna(value)):
+            continue
+        date_str = column.date().isoformat() if hasattr(column, "date") else str(column)[:10]
+        result[date_str] = {"epsActual": float(value)}
+    return result
+
+
+async def fetch_and_extract_fundamentals_for_symbol(symbol: str) -> dict | None:
+    """One symbol's full fundamentals fetch + extraction via yfinance.
+
+    Issues info/earnings-dates/income-statement/institutional-holders
+    calls concurrently (each already individually bounded by
+    app.scanners.yfinance_client's own semaphore) then reuses the
+    EXISTING, unchanged EPS parsers above. Returns the same flat-field
+    dict shape app.scanners.data has always produced for a symbol (still
+    carrying "annual_eps_history" as a plain list — the caller JSON-
+    encodes it, same as before), or None if yfinance returned nothing
+    usable at all for this symbol.
+    """
+    info, earnings_dates_df, annual_income_df, holders_df = await asyncio.gather(
+        yfinance_client.fetch_info(symbol),
+        yfinance_client.fetch_earnings_dates(symbol),
+        yfinance_client.fetch_annual_income_stmt(symbol),
+        yfinance_client.fetch_institutional_holders(symbol),
+    )
+
+    if info is None and earnings_dates_df is None and annual_income_df is None:
+        return None
+
+    info = info or {}
+
+    quarterly_eps_dict = _quarterly_eps_dict_from_earnings_dates(earnings_dates_df)
+    annual_eps_dict = _annual_eps_dict_from_income_stmt(annual_income_df)
 
     eps_current, eps_current_period, eps_year_ago, eps_year_ago_period = (
-        _latest_and_year_ago_quarter(earnings.get("History") or {})
+        _latest_and_year_ago_quarter(quarterly_eps_dict)
     )
-    annual_history = _annual_eps_history(earnings.get("Annual") or {}, max_years=5)
+    annual_history = _annual_eps_history(annual_eps_dict, max_years=5)
 
-    institutions = holders.get("Institutions")
-    institutional_holders_count = (
-        len(institutions) if isinstance(institutions, dict) else None
-    )
+    institutional_holders_count = len(holders_df) if holders_df is not None else None
 
-    # EODHD reports SharesStats percentages as whole numbers (e.g. 62.35
-    # meaning 62.35%); normalized to a fraction here so every percentage
-    # field in this codebase (ROE, growth rates, ownership) uses the same
-    # 0-1 convention. ReturnOnEquityTTM in Highlights is already a
-    # fraction per EODHD's convention for that field, so it is NOT
-    # divided by 100 here.
-    percent_institutions = shares_stats.get("PercentInstitutions")
-    percent_insiders = shares_stats.get("PercentInsiders")
+    # yfinance's Ticker.info reports heldPercentInstitutions /
+    # heldPercentInsiders already as a 0-1 fraction (unlike EODHD's
+    # SharesStats, which used a whole number like 62.35 meaning 62.35% —
+    # that /100 normalization doesn't apply here).
+    percent_institutions = info.get("heldPercentInstitutions")
+    percent_insiders = info.get("heldPercentInsiders")
 
     fundamentals_as_of = None
     if annual_history:
@@ -171,87 +263,97 @@ def extract_fundamentals_fields(symbol: str, raw: dict) -> dict:
 
     return {
         "symbol": symbol,
-        "company_name": general.get("Name"),
-        "sector": general.get("Sector"),
-        "industry": general.get("Industry"),
+        "company_name": info.get("longName") or info.get("shortName"),
+        "sector": info.get("sector"),
+        "industry": info.get("industry"),
         "quarterly_eps_current": eps_current,
         "quarterly_eps_current_period": eps_current_period,
         "quarterly_eps_year_ago": eps_year_ago,
         "quarterly_eps_year_ago_period": eps_year_ago_period,
         "annual_eps_history": annual_history,
-        "return_on_equity_ttm": highlights.get("ReturnOnEquityTTM"),
-        "shares_float": shares_stats.get("SharesFloat"),
-        "shares_outstanding": shares_stats.get("SharesOutstanding"),
-        "percent_insiders": (percent_insiders / 100) if percent_insiders is not None else None,
+        "return_on_equity_ttm": info.get("returnOnEquity"),
+        "shares_float": info.get("floatShares"),
+        "shares_outstanding": info.get("sharesOutstanding"),
+        "percent_insiders": percent_insiders,
         "institutional_holders_count": institutional_holders_count,
-        "percent_institutions": (
-            (percent_institutions / 100) if percent_institutions is not None else None
-        ),
+        "percent_institutions": percent_institutions,
         "fundamental_period": eps_current_period,
         "fundamentals_as_of": fundamentals_as_of,
     }
 
 
 # ---------------------------------------------------------------------------
-# Fundamentals: bulk ingestion + DB read-back
+# Fundamentals: per-symbol ingestion (bounded concurrency) + DB read-back
 # ---------------------------------------------------------------------------
 
 
-def _chunk(items: list[str], size: int) -> list[list[str]]:
-    return [items[i : i + size] for i in range(0, len(items), size)]
-
-
 async def refresh_fundamentals_snapshots(
-    db: AsyncSession, symbols: list[str], exchange: str = "US"
-) -> int:
-    """Bulk-fetch + upsert EODHD fundamentals for `symbols`.
+    db: AsyncSession, symbols: list[str]
+) -> tuple[int, int]:
+    """Per-symbol fundamentals refresh via yfinance.
 
-    Chunks into BULK_FUNDAMENTALS_CHUNK_SIZE-symbol batches. One bad
-    chunk (network error, etc.) is logged and skipped rather than
-    aborting the whole refresh — matches the per-symbol resilience
-    convention in app.services.ingestion.ingest_all.
+    No bulk endpoint exists for yfinance (unlike EODHD's
+    bulk-fundamentals), so this fetches each symbol independently, with
+    FUNDAMENTALS_CONCURRENCY bounding how many are in flight at once.
+    Each concurrent task opens its OWN short-lived DB session for its
+    write (a SQLAlchemy AsyncSession is not safe for concurrent use from
+    multiple coroutines — same convention as
+    app.scanners.ingestion._refresh_prices_bounded and
+    app.services.ingestion.ingest_all's per-symbol sessions) rather than
+    sharing the caller's `db`.
 
-    Returns the number of symbols successfully upserted.
+    One bad symbol (no yfinance coverage, transient network error, ...)
+    is logged and skipped — it never aborts the rest of the refresh.
+
+    Returns (succeeded, failed) symbol counts.
     """
-    import json
+    semaphore = asyncio.Semaphore(FUNDAMENTALS_CONCURRENCY)
+    succeeded = 0
+    failed = 0
 
-    updated = 0
-    for chunk in _chunk(symbols, BULK_FUNDAMENTALS_CHUNK_SIZE):
-        try:
-            payload_by_symbol = await eodhd_client.fetch_bulk_fundamentals(
-                exchange, chunk
-            )
-        except Exception:  # noqa: BLE001 — one bad chunk must not stop the rest
-            logger.exception(
-                "Bulk fundamentals fetch failed for chunk starting %s", chunk[0]
-            )
-            continue
+    async def _one(symbol: str) -> None:
+        nonlocal succeeded, failed
+        async with semaphore:
+            try:
+                fields = await fetch_and_extract_fundamentals_for_symbol(symbol)
+            except Exception as exc:  # noqa: BLE001 — one bad symbol must not stop the rest
+                logger.warning("yfinance failed for %s fundamentals: %s", symbol, exc)
+                failed += 1
+                return
 
-        for symbol in chunk:
-            raw = payload_by_symbol.get(symbol) or payload_by_symbol.get(
-                f"{symbol}.{exchange}"
-            )
-            if not raw:
-                continue
-            fields = extract_fundamentals_fields(symbol, raw)
+            if fields is None:
+                logger.warning(
+                    "%s fundamentals: FAILED (no data returned by yfinance)", symbol
+                )
+                failed += 1
+                return
+
             annual_history = fields.pop("annual_eps_history")
             fields["annual_eps_history_json"] = json.dumps(annual_history)
 
-            existing = await db.scalar(
-                select(StockFundamentalsSnapshot).where(
-                    StockFundamentalsSnapshot.symbol == symbol
-                )
-            )
-            if existing:
-                for key, value in fields.items():
-                    setattr(existing, key, value)
-            else:
-                db.add(StockFundamentalsSnapshot(**fields))
-            updated += 1
+            try:
+                async with AsyncSessionLocal() as session:
+                    existing = await session.scalar(
+                        select(StockFundamentalsSnapshot).where(
+                            StockFundamentalsSnapshot.symbol == symbol
+                        )
+                    )
+                    if existing:
+                        for key, value in fields.items():
+                            setattr(existing, key, value)
+                    else:
+                        session.add(StockFundamentalsSnapshot(**fields))
+                    await session.commit()
+            except Exception as exc:  # noqa: BLE001 — a DB hiccup on one symbol must not stop the rest
+                logger.warning("DB write failed for %s fundamentals: %s", symbol, exc)
+                failed += 1
+                return
 
-        await db.commit()
+            logger.info("%s fundamentals: OK", symbol)
+            succeeded += 1
 
-    return updated
+    await asyncio.gather(*(_one(s) for s in symbols))
+    return succeeded, failed
 
 
 async def load_fundamentals_snapshots(
@@ -270,8 +372,6 @@ async def load_fundamentals_snapshots(
 
 
 def annual_eps_history_from_snapshot(snapshot: StockFundamentalsSnapshot | None) -> list[dict]:
-    import json
-
     if snapshot is None or not snapshot.annual_eps_history_json:
         return []
     try:
@@ -285,13 +385,20 @@ def annual_eps_history_from_snapshot(snapshot: StockFundamentalsSnapshot | None)
 # ---------------------------------------------------------------------------
 
 
-async def ingest_stock_prices(
-    db: AsyncSession, symbol: str, history_years: int, exchange: str = "US"
-) -> int:
-    """Same shape as app.services.ingestion.ingest_symbol, generalized to
-    an arbitrary plain stock symbol rather than a static registry entry
-    — reuses DailyPrice and eodhd_client.fetch_eod_history directly
-    instead of duplicating the HTTP/upsert logic in a second place.
+async def ingest_stock_prices(db: AsyncSession, symbol: str, history_years: int) -> int:
+    """Incremental daily-bar ingestion via yfinance for one plain symbol
+    (e.g. "AAPL", or the market index "^GSPC" — see MARKET_INDEX_SYMBOL).
+    Same incremental-append shape as before this migration (only fetch
+    bars since the last ingested date; a fresh symbol backfills
+    `history_years` years), just sourced from yfinance instead of EODHD.
+    Reuses the same DailyPrice table and on_conflict_do_nothing upsert
+    as the OLD ETF pipeline, but is called ONLY from the scanner's
+    ingestion path (app.scanners.ingestion), never from
+    app.services.ingestion.
+
+    yfinance ticker symbols need no exchange suffix for US equities/the
+    S&P 500 index (unlike EODHD's "AAPL.US" / "GSPC.INDX" convention),
+    so `symbol` is used exactly as given.
     """
     from sqlalchemy import func
 
@@ -307,25 +414,28 @@ async def ingest_stock_prices(
     else:
         from_date = today_utc - datetime.timedelta(days=365 * history_years + 30)
 
-    rows = await eodhd_client.fetch_eod_history(f"{symbol}.{exchange}", from_date=from_date)
-    if not rows:
+    df = await yfinance_client.fetch_price_history_range(symbol, from_date, today_utc)
+    if df is None or df.empty:
         return 0
 
     valid_payload = []
-    for row in rows:
-        close_val = row.get("close")
-        if close_val is None or float(close_val) <= 0:
+    for date_index, row in df.iterrows():
+        close_val = row.get("Close")
+        if close_val is None or pd.isna(close_val) or float(close_val) <= 0:
             continue
+        adj_close_val = row.get("Adj Close")
+        if adj_close_val is None or (isinstance(adj_close_val, float) and pd.isna(adj_close_val)):
+            adj_close_val = close_val
         valid_payload.append(
             {
                 "symbol": symbol,
-                "date": datetime.date.fromisoformat(row["date"]),
-                "open": float(row.get("open") or 0),
-                "high": float(row.get("high") or 0),
-                "low": float(row.get("low") or 0),
+                "date": date_index.date(),
+                "open": float(row.get("Open") or 0),
+                "high": float(row.get("High") or 0),
+                "low": float(row.get("Low") or 0),
                 "close": float(close_val),
-                "adjusted_close": float(row.get("adjusted_close") or close_val),
-                "volume": int(row.get("volume") or 0),
+                "adjusted_close": float(adj_close_val),
+                "volume": int(row.get("Volume") or 0),
             }
         )
 
@@ -396,18 +506,18 @@ def compute_price_derived_inputs(prices: list[DailyPrice]) -> PriceDerivedInputs
 async def compute_market_direction_inputs(
     db: AsyncSession,
 ) -> tuple[float | None, float | None]:
-    """(index_price, index_sma200) for the S&P 500 index (GSPC), reusing
-    the daily bars app.services.ingestion already pulls for the
-    dashboard's market-summary indices (app.constants.INDEX_REGISTRY) —
-    no new ingestion path needed for the M criterion.
+    """(index_price, index_sma200) for the S&P 500 index, sourced from
+    yfinance's "^GSPC" ticker and ingested ONLY by this scanner's own
+    ingestion path (app.scanners.ingestion) into the daily_prices table
+    under the MARKET_INDEX_SYMBOL ("^GSPC") symbol — deliberately
+    DIFFERENT from the OLD ETF/dashboard pipeline's EODHD-sourced "GSPC"
+    symbol (app.constants.INDEX_REGISTRY), so M never depends on EODHD,
+    directly or indirectly, and the two pipelines' rows never collide.
     """
-    symbol = "GSPC"
-    assert symbol in INDEX_REGISTRY  # documents the reuse; fails loudly if that ever changes
-
     rows = (
         await db.scalars(
             select(DailyPrice)
-            .where(DailyPrice.symbol == symbol)
+            .where(DailyPrice.symbol == MARKET_INDEX_SYMBOL)
             .order_by(DailyPrice.date.asc())
         )
     ).all()

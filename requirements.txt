@@ -14,4 +14,4 @@ pydantic-settings==2.2.1
 httpx==0.27.0
 slowapi==0.1.9            # rate limiting
 python-json-logger==2.0.7 # structured json logging
- 
+yfinance==1.6.0           # CANSLIM scanner stock data (app/scanners/) — NOT used by the OLD EODHD-based ETF pipeline. Yahoo changes its undocumented endpoints often; bump this (and curl_cffi, pulled in transitively) if scraping starts failing.

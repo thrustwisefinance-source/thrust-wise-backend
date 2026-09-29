@@ -58,7 +58,7 @@ S — Supply and Demand
     uses exactly that threshold (CANSLIM_S_MAX_FLOAT_SHARES =
     25,000,000), NOT the old ETF module's 500,000,000. The article also
     mentions insider buying and buybacks as supply-reducing signals;
-    ThrustWise's EODHD integration does not currently ingest a
+    ThrustWise's yfinance integration does not currently ingest a
     time-series of insider transactions or historical shares-outstanding
     needed to detect "actively repurchasing" — this is documented as a
     known limitation (NOT_APPLICABLE informational field), never
@@ -81,8 +81,10 @@ I — Institutional Sponsorship
     over-owned." No exact counts are given anywhere in the article.
     Implementation uses a documented, disclosed interpretation of "a
     few" (CANSLIM_I_MIN_INSTITUTIONAL_HOLDERS, see constant below) as
-    the pass/fail gate, computed from EODHD's actual reported
-    institutional-holder count — never a fabricated ownership
+    the pass/fail gate, computed from yfinance's reported institutional-
+    holder count (Yahoo's "top institutional holders" table — see
+    app.scanners.yfinance_client for the documented cap on how many
+    holders that table lists) — never a fabricated ownership
     percentage. "Increasing over time" and "over-owned" have no
     article-specified numeric threshold and are NOT used to gate
     pass/fail; ownership percentage is still surfaced as an
@@ -154,7 +156,7 @@ CANSLIM_N_QUALITATIVE_NOTE = (
 CANSLIM_S_MAX_FLOAT_SHARES = 25_000_000  # article: "under 25 million shares, ideally"
 CANSLIM_S_QUALITATIVE_NOTE = (
     "The article also treats insider buying and active share buybacks as "
-    "supply-reducing signals. ThrustWise's EODHD integration does not "
+    "supply-reducing signals. ThrustWise's yfinance integration does not "
     "ingest a time series of insider transactions or historical shares "
     "outstanding, so these two sub-signals cannot be reliably calculated "
     "and are not part of the pass/fail rule (float shares vs. threshold "
@@ -178,7 +180,11 @@ CANSLIM_I_MIN_INSTITUTIONAL_HOLDERS = 3
 
 # --- M: Market Direction (evaluated once for the whole universe) ------------
 CANSLIM_M_SMA_PERIOD = 200
-CANSLIM_M_INDEX_SYMBOL = "GSPC"  # S&P 500 index, per the article's own addendum
+CANSLIM_M_INDEX_SYMBOL = "^GSPC"  # S&P 500 index via yfinance; matches
+# app.scanners.data.MARKET_INDEX_SYMBOL exactly — this is the article's
+# own addendum's "S&P 500 index itself", sourced via yfinance rather
+# than EODHD (see that module's docstring for why this is a DIFFERENT
+# daily_prices symbol than the OLD ETF pipeline's EODHD-sourced "GSPC").
 
 CANSLIM_MAX_CRITERIA = 7
 CANSLIM_DEFAULT_MIN_CRITERIA_PASSED = 5
@@ -229,10 +235,10 @@ def compute_criterion_c(
             unit="percent",
             explanation=(
                 "Quarterly EPS for the current quarter and/or the "
-                "same quarter one year ago is not available from EODHD "
+                "same quarter one year ago is not available from yfinance "
                 "for this symbol."
             ),
-            data_source="EODHD Fundamentals: Earnings.History",
+            data_source="yfinance Ticker.get_earnings_dates() (Reported EPS)",
         )
 
     if eps_year_ago <= 0:
@@ -249,7 +255,7 @@ def compute_criterion_c(
                 "against it would be undefined or misleading. Not "
                 "scored as pass or fail."
             ),
-            data_source="EODHD Fundamentals: Earnings.History",
+            data_source="yfinance Ticker.get_earnings_dates() (Reported EPS)",
         )
 
     growth = (eps_current - eps_year_ago) / eps_year_ago
@@ -268,7 +274,7 @@ def compute_criterion_c(
             f"{eps_year_ago_period or 'year-ago quarter'}: {eps_year_ago:.2f}), "
             f"{'meeting' if passed else 'below'} the {CANSLIM_C_MIN_QUARTERLY_EPS_GROWTH:.0%} minimum."
         ),
-        data_source="EODHD Fundamentals: Earnings.History",
+        data_source="yfinance Ticker.get_earnings_dates() (Reported EPS)",
     )
 
 
@@ -298,7 +304,7 @@ def compute_criterion_a(
             threshold=CANSLIM_A_MIN_ANNUAL_EPS_GROWTH,
             unit="percent",
             explanation="Unavailable: " + "; ".join(missing) + ".",
-            data_source="EODHD Fundamentals: Earnings.Annual, Highlights.ReturnOnEquityTTM",
+            data_source="yfinance Ticker.income_stmt (Diluted/Basic EPS) + Ticker.info.returnOnEquity",
         )
 
     window = annual_eps_history[-CANSLIM_A_MAX_YEARS:]
@@ -317,7 +323,7 @@ def compute_criterion_a(
                 "percentage growth comparison over the window would be "
                 "undefined or misleading. Not scored as pass or fail."
             ),
-            data_source="EODHD Fundamentals: Earnings.Annual, Highlights.ReturnOnEquityTTM",
+            data_source="yfinance Ticker.income_stmt (Diluted/Basic EPS) + Ticker.info.returnOnEquity",
         )
 
     growth = (latest["eps"] - earliest["eps"]) / earliest["eps"]
@@ -340,7 +346,7 @@ def compute_criterion_a(
             f"EPS-growth threshold and {'meets' if roe_pass else 'below'} the "
             f"{CANSLIM_A_MIN_ROE:.0%} ROE threshold — both are required to pass."
         ),
-        data_source="EODHD Fundamentals: Earnings.Annual, Highlights.ReturnOnEquityTTM",
+        data_source="yfinance Ticker.income_stmt (Diluted/Basic EPS) + Ticker.info.returnOnEquity",
     )
 
 
@@ -360,7 +366,7 @@ def compute_criterion_n(
             unit="ratio",
             explanation="Insufficient price history to determine the 52-week high. "
             + CANSLIM_N_QUALITATIVE_NOTE,
-            data_source="Ingested EODHD daily price history",
+            data_source="Ingested yfinance daily price history",
         )
 
     ratio = current_price / week_52_high
@@ -380,7 +386,7 @@ def compute_criterion_n(
             f"{CANSLIM_N_NEAR_HIGH_RATIO:.0%} 'near a 52-week high' band. "
             + CANSLIM_N_QUALITATIVE_NOTE
         ),
-        data_source="Ingested EODHD daily price history",
+        data_source="Ingested yfinance daily price history",
     )
 
 
@@ -396,9 +402,9 @@ def compute_criterion_s(shares_float: float | None) -> dict:
             status=STATUS_UNAVAILABLE,
             threshold=CANSLIM_S_MAX_FLOAT_SHARES,
             unit="shares",
-            explanation="Shares float is not available from EODHD for this symbol. "
+            explanation="Shares float is not available from yfinance for this symbol. "
             + CANSLIM_S_QUALITATIVE_NOTE,
-            data_source="EODHD Fundamentals: SharesStats.SharesFloat",
+            data_source="yfinance Ticker.info.floatShares",
         )
 
     passed = shares_float < CANSLIM_S_MAX_FLOAT_SHARES
@@ -414,7 +420,7 @@ def compute_criterion_s(shares_float: float | None) -> dict:
             f"{CANSLIM_S_MAX_FLOAT_SHARES:,} share threshold. "
             + CANSLIM_S_QUALITATIVE_NOTE
         ),
-        data_source="EODHD Fundamentals: SharesStats.SharesFloat",
+        data_source="yfinance Ticker.info.floatShares",
     )
 
 
@@ -470,7 +476,7 @@ def compute_criterion_l(
                 "symbol was excluded from the universe's relative-"
                 "strength ranking."
             ),
-            data_source=f"Ingested EODHD daily price history — {CANSLIM_L_LABEL}",
+            data_source=f"Ingested yfinance daily price history — {CANSLIM_L_LABEL}",
         )
 
     percentile = relative_strength["percentile"]
@@ -491,7 +497,7 @@ def compute_criterion_l(
             "percentile threshold. This is ThrustWise's own calculated "
             "percentile, NOT an official IBD RS Rating."
         ),
-        data_source=f"Ingested EODHD daily price history — {CANSLIM_L_LABEL}",
+        data_source=f"Ingested yfinance daily price history — {CANSLIM_L_LABEL}",
     )
 
 
@@ -510,10 +516,10 @@ def compute_criterion_i(
             threshold=CANSLIM_I_MIN_INSTITUTIONAL_HOLDERS,
             unit="holders",
             explanation=(
-                "Institutional holder count is not available from EODHD "
+                "Institutional holder count is not available from yfinance "
                 "for this symbol."
             ),
-            data_source="EODHD Fundamentals: Holders.Institutions, SharesStats.PercentInstitutions",
+            data_source="yfinance Ticker.institutional_holders (top holders) + Ticker.info.heldPercentInstitutions",
         )
 
     passed = institutional_holders_count >= CANSLIM_I_MIN_INSTITUTIONAL_HOLDERS
@@ -538,7 +544,7 @@ def compute_criterion_i(
             + " 'Increasing sponsorship over time' and 'over-owned' are not "
             "gated (no article-given threshold) and are informational only."
         ),
-        data_source="EODHD Fundamentals: Holders.Institutions, SharesStats.PercentInstitutions",
+        data_source="yfinance Ticker.institutional_holders (top holders) + Ticker.info.heldPercentInstitutions",
     )
 
 
@@ -559,7 +565,7 @@ def compute_market_direction(
                 f"Insufficient {CANSLIM_M_INDEX_SYMBOL} index price history "
                 f"to compute a {CANSLIM_M_SMA_PERIOD}-day SMA."
             ),
-            data_source=f"Ingested EODHD index price history ({CANSLIM_M_INDEX_SYMBOL}.INDX)",
+            data_source=f"Ingested yfinance daily price history ({CANSLIM_M_INDEX_SYMBOL})",
         )
 
     passed = index_price > index_sma200
@@ -578,7 +584,7 @@ def compute_market_direction(
             "identically to every stock in the scan (it is not computed "
             "per-stock)."
         ),
-        data_source=f"Ingested EODHD index price history ({CANSLIM_M_INDEX_SYMBOL}.INDX)",
+        data_source=f"Ingested yfinance daily price history ({CANSLIM_M_INDEX_SYMBOL})",
     )
 
 

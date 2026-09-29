@@ -449,10 +449,15 @@ def test_compute_price_derived_inputs_full_history():
 # ---------------------------------------------------------------------------
 
 
-def test_universe_registry_has_sp500_with_eodhd_backing():
+def test_universe_registry_sp500_has_no_eodhd_backing():
+    """sp500 no longer depends on EODHD at all (yfinance + Wikipedia
+    replaced it — see app.scanners.universe module docstring). The
+    `eodhd_index_symbol` field is kept only for API-contract stability
+    on GET /api/scanners/universes and is always None now.
+    """
     source = scanner_universe.get_universe_source("sp500")
     assert source is not None
-    assert source.eodhd_index_symbol == "GSPC.INDX"
+    assert source.eodhd_index_symbol is None
 
 
 def test_universe_registry_unknown_key_returns_none():
