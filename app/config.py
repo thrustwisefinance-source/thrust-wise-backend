@@ -30,6 +30,22 @@ class Settings(BaseSettings):
     # When empty, the admin endpoint returns 404 (invisible).
     admin_api_token: str = ""
 
+    # --- CANSLIM stock scanner ingestion (app/scanners/) ---
+    # Comma-separated universe keys (see app.scanners.universe.UNIVERSE_REGISTRY)
+    # to refresh automatically on the nightly scanner schedule below.
+    # Empty by default: a ~500-stock universe refresh is a meaningfully
+    # larger/slower job than the six-ETF nightly ingestion, so it is
+    # opt-in rather than running unconditionally on every deploy. Use
+    # POST /api/admin/scanners/refresh for an on-demand first ingestion.
+    scanner_universes_to_ingest: str = ""
+    # Set to false for extra replicas so only one instance runs the
+    # scanner scheduler (same convention as run_scheduler above).
+    run_scanner_scheduler: bool = False
+
+    @property
+    def scanner_universes_to_ingest_list(self) -> list[str]:
+        return [u.strip() for u in self.scanner_universes_to_ingest.split(",") if u.strip()]
+
     @property
     def cors_origins_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",")]

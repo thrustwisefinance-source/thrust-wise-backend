@@ -18,7 +18,8 @@ from app.config import settings
 from app.database import Base, engine, get_db
 from app.exceptions import register_exception_handlers
 from app.middleware import RequestIDMiddleware
-from app.routers import admin, canslim, compare, dashboard, etfs, health, strategy
+from app.routers import admin, canslim, compare, dashboard, etfs, health, scanners, strategy
+from app.scanners import ingestion as scanner_ingestion
 from app.services import cache, ingestion
 
 
@@ -85,12 +86,19 @@ async def lifespan(app: FastAPI):
         scheduler = ingestion.create_scheduler()
         scheduler.start()
 
+    scanner_scheduler = None
+    if settings.run_scanner_scheduler and settings.scanner_universes_to_ingest_list:
+        scanner_scheduler = scanner_ingestion.create_scanner_scheduler()
+        scanner_scheduler.start()
+
 
     yield
 
 
     if scheduler is not None:
         scheduler.shutdown(wait=False)
+    if scanner_scheduler is not None:
+        scanner_scheduler.shutdown(wait=False)
     ingest_task.cancel()
     await cache.close()
     await engine.dispose()
@@ -146,6 +154,7 @@ app.include_router(etfs.router, prefix="/api")
 app.include_router(strategy.router, prefix="/api")
 app.include_router(strategy.portfolio_router, prefix="/api")
 app.include_router(canslim.router, prefix="/api")
+app.include_router(scanners.router, prefix="/api")
 app.include_router(dashboard.router, prefix="/api")
 app.include_router(admin.router, prefix="/api")
 app.include_router(health.router)
@@ -196,6 +205,9 @@ async def api_root():
             "/api/etfs/compare",
             "/api/compare",
             "/api/strategies/canslim",
+            "/api/scanners/universes",
+            "/api/scanners/canslim",
+            "/api/scanners/canslim/{symbol}",
             "/api/dashboard",
             "/api/dashboard/market",
             "/health/live",
