@@ -200,15 +200,26 @@ async def get_strategy_analytics(symbol: str, db: AsyncSession = Depends(get_db)
     external frontend may depend on them (see BACKEND_TRANSFORMATION_PLAN
     and the reorg spec's frontend-compatibility requirement).
 
-    NOTE: bumping the cache key version (v8 -> v9) so previously cached
-    responses (which don't contain the new quantitative strategies or
-    the category groupings) are not served for the new fields; the
-    response shape stays backward compatible either way since all
-    fields are optional.
+    Also carries seven additional single-symbol TECHNICAL Strategies
+    (services.strategies Strategies 20-26), each computed from the
+    requested symbol's own daily OHLC history like the strategies above
+    and surfaced both as flat fields and inside `technicalStrategies`
+    (no new category): TD Setup / TD 9 (`tdSetup`), Supertrend
+    Confirmation (`supertrendConfirmation`), UFX + Vervoort Heiken Ashi
+    (`ufxVervoortHeikenAshi`, public-formula stand-ins - see its
+    schema), Trend Signals + Trend Tide Oscillator
+    (`trendSignalsTrendTide`, proprietary parts not reproducible), Pivot
+    Levels (`pivotLevels`), CPR (`cpr`), and TA Candles / Trend Health
+    (`taCandlesTrendHealth`). Analytical state only - no action field.
+
+    NOTE: bumping the cache key version (v9 -> v10) so previously cached
+    responses (which don't contain the seven new technical strategies)
+    are not served for the new fields; the response shape stays backward
+    compatible either way since all fields are optional.
     """
     meta = resolve_meta(symbol)
 
-    cache_key = f"tw:v9:strategies:{meta.symbol}"
+    cache_key = f"tw:v10:strategies:{meta.symbol}"
     cached = await cache.get_json(cache_key)
     if cached is not None:
         result = cached
@@ -237,6 +248,13 @@ async def get_strategy_analytics(symbol: str, db: AsyncSession = Depends(get_db)
             "soc_avalanche": strategies.compute_soc_avalanche(prices),
             "wavelet_trend_filter": strategies.compute_wavelet_trend_filter(prices),
             "first_passage_time": strategies.compute_first_passage_time(prices),
+            "td_setup": strategies.compute_td_setup(prices),
+            "supertrend_confirmation": strategies.compute_supertrend_confirmation(prices),
+            "ufx_vervoort_heiken_ashi": strategies.compute_ufx_vervoort_heiken_ashi(prices),
+            "trend_signals_trend_tide": strategies.compute_trend_signals_trend_tide(prices),
+            "pivot_levels": strategies.compute_pivot_levels(prices),
+            "cpr": strategies.compute_cpr(prices),
+            "ta_candles_trend_health": strategies.compute_ta_candles_trend_health(prices),
         }
 
         if meta.symbol == PORTFOLIO_COMPARISON_SYMBOL:
@@ -289,6 +307,13 @@ async def get_strategy_analytics(symbol: str, db: AsyncSession = Depends(get_db)
             "sma_trend": result["sma_trend"],
             "triple_ma_pullback": result["triple_ma_pullback"],
             "mswing": result["mswing"],
+            "td_setup": result["td_setup"],
+            "supertrend_confirmation": result["supertrend_confirmation"],
+            "ufx_vervoort_heiken_ashi": result["ufx_vervoort_heiken_ashi"],
+            "trend_signals_trend_tide": result["trend_signals_trend_tide"],
+            "pivot_levels": result["pivot_levels"],
+            "cpr": result["cpr"],
+            "ta_candles_trend_health": result["ta_candles_trend_health"],
         }
         result["quantitative_strategies"] = {
             "evar_risk": result["evar_risk"],
@@ -336,6 +361,13 @@ async def get_strategy_analytics(symbol: str, db: AsyncSession = Depends(get_db)
         "soc_avalanche": "Self-Organized Criticality (Avalanche Distribution)",
         "wavelet_trend_filter": "Adaptive Causal Wavelet Trend Filter",
         "first_passage_time": "First Passage Time Distribution Analysis",
+        "td_setup": "TD Setup / TD 9",
+        "supertrend_confirmation": "Supertrend Confirmation",
+        "ufx_vervoort_heiken_ashi": "UFX + Vervoort Heiken Ashi",
+        "trend_signals_trend_tide": "Trend Signals + Trend Tide Oscillator",
+        "pivot_levels": "Pivot Levels",
+        "cpr": "CPR (Central Pivot Range)",
+        "ta_candles_trend_health": "TA Candles / Trend Health",
     }
     if meta.symbol == PORTFOLIO_COMPARISON_SYMBOL:
         strategy_labels["vt_vs_vti_vxus"] = "VT vs VTI+VXUS Portfolio Comparison"

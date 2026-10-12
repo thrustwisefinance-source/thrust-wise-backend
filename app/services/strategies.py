@@ -113,15 +113,17 @@ def to_close_series(prices: list[DailyPrice]) -> pd.Series:
 
 
 def to_ohlc_frame(prices: list[DailyPrice]) -> pd.DataFrame:
-    """High/Low/Close frame indexed by date, ascending.
+    """Open/High/Low/Close frame indexed by date, ascending.
 
     Used by strategies (e.g. Better Breakout) that need the daily range,
-    not just the close series.
+    not just the close series. `open` is additive (candle-colour based
+    strategies need it); existing callers only select high/low/close.
     """
     if not prices:
-        return pd.DataFrame(columns=["high", "low", "close"])
+        return pd.DataFrame(columns=["open", "high", "low", "close"])
     return pd.DataFrame(
         {
+            "open": [p.open for p in prices],
             "high": [p.high for p in prices],
             "low": [p.low for p in prices],
             "close": [p.close for p in prices],
@@ -3056,4 +3058,871 @@ def compute_portfolio_optimization(
             "history — not a guaranteed-optimal allocation, not "
             "investment advice, and not a prediction of future returns."
         ),
+    }
+
+
+# ===========================================================================
+# Strategies 20-26: additional Technical Strategies
+#
+#   20. TD Setup / TD 9                      (Tom DeMark, Sequential Part I)
+#   21. Supertrend Confirmation              (Supertrend + two-candle filter)
+#   22. UFX + Vervoort Heiken Ashi           (STAND-IN components - see below)
+#   23. Trend Signals + Trend Tide           (proprietary parts NOT reproducible)
+#   24. Pivot Levels                         (classic floor-trader pivots)
+#   25. CPR (Central Pivot Range)
+#   26. TA Candles / Trend Health            (ThrustWise's own transparent build)
+#
+# All seven belong to the existing "Technical Strategies" category and
+# follow the same conventions as every strategy above: pure functions over
+# `list[DailyPrice]`, `None` when history is insufficient, `chart_data`
+# built from the last CHART_LOOKBACK_DAYS rows, and ANALYTICAL output only
+# (state / condition flags - never an action field).
+#
+# Data basis: this codebase only ingests DAILY bars (app.models.DailyPrice).
+# Every rule below is applied to daily candles, exactly like Momentum
+# Reversal (Strategy 13) does; no intraday pipeline was introduced.
+#
+# EXACTNESS SUMMARY (also repeated in each schema docstring):
+#   exact           - TD Setup / TD 9, Supertrend Confirmation rules,
+#                     Pivot Levels, CPR formulas
+#   partial/stand-in- UFX + Vervoort HA (UFX Pro and Vervoort HA Long Term are
+#                     proprietary TradingView scripts; public-formula
+#                     stand-ins are used and clearly labelled as such)
+#   not reproducible- Trend Signals + Trend Tide (no formula or parameters in
+#                     the source), TA Candles / MasterPiece (same)
+# ===========================================================================
+
+TD_COMPARISON_LAG = 4  # Close[t] vs Close[t-4]
+TD_SETUP_LENGTH = 9
+MIN_ROWS_TD_SETUP = TD_COMPARISON_LAG + TD_SETUP_LENGTH
+
+# The source for Supertrend Confirmation does not state ATR period /
+# multiplier. 10 / 3.0 are the conventional Supertrend defaults and are
+# documented as an assumption (exposed in the response so nothing is hidden).
+SUPERTREND_ATR_PERIOD = 10
+SUPERTREND_MULTIPLIER = 3.0
+SUPERTREND_CONFIRMATION_CANDLES = 2
+MIN_ROWS_SUPERTREND_CONFIRMATION = SUPERTREND_ATR_PERIOD + 20
+
+# UFX + Vervoort HA: settings quoted by the source article.
+UFX_ATR_PERIOD = 6
+UFX_FACTOR = 2.0
+VERVOORT_TIMER_PERIOD = 11  # quoted by the source; NOT mappable (see below)
+VERVOORT_EMA_PERIOD = 44  # quoted by the source; NOT mappable (see below)
+UFX_VERVOORT_RISK_REWARD = 1.5  # 1 : 1.5
+MIN_ROWS_UFX_VERVOORT = 50
+
+TREND_SIGNALS_RISK_REWARD = 1.5  # 1 : 1.5
+MIN_ROWS_TREND_SIGNALS_TREND_TIDE = 20
+
+MIN_ROWS_PIVOT_LEVELS = 5
+
+CPR_WIDTH_LOOKBACK = 60
+CPR_NARROW_PERCENTILE = 0.25  # mid-rank percentile of width <= this -> Narrow
+CPR_WIDE_PERCENTILE = 0.75  # mid-rank percentile of width >= this -> Wide
+CPR_WIDTH_EQUALITY_TOLERANCE = 1e-9
+MIN_ROWS_CPR = CPR_WIDTH_LOOKBACK + 1
+
+TA_EMA_FAST = 21
+TA_EMA_SLOW = 50
+TA_TREND_MIN_SEPARATION_PERCENT = 0.25  # |EMA21-EMA50| / EMA50, else "Mixed"
+TA_ROC_PERIOD = 10
+TA_ATR_PERIOD = 14
+TA_STRENGTH_WINDOW = 10
+TA_VOLATILITY_BASELINE_WINDOW = 50
+TA_VOLATILITY_EXPANDING_RATIO = 1.25
+TA_VOLATILITY_CONTRACTING_RATIO = 0.75
+TA_ALIGNED_CANDLE_RATIO = 0.6
+TA_WEAKENING_CANDLE_RATIO = 0.5
+MIN_ROWS_TA_CANDLES = TA_EMA_SLOW + TA_ATR_PERIOD + 10
+
+
+def _candle_colour(frame: pd.DataFrame) -> pd.Series:
+    """'Green' (close > open), 'Red' (close < open) or 'Neutral' (doji or
+    missing open). Missing data can therefore never confirm a setup."""
+    return pd.Series(
+        np.where(
+            frame["close"] > frame["open"],
+            "Green",
+            np.where(frame["close"] < frame["open"], "Red", "Neutral"),
+        ),
+        index=frame.index,
+    )
+
+
+def _ohlc_clean(prices: list[DailyPrice]) -> pd.DataFrame:
+    """OHLC frame with rows lacking high/low/close removed (they cannot be
+    used by any ATR / pivot calculation). A missing `open` is KEPT as NaN -
+    it simply yields a 'Neutral' candle (see _candle_colour)."""
+    frame = to_ohlc_frame(prices)
+    if frame.empty:
+        return frame
+    return frame.dropna(subset=["high", "low", "close"])
+
+
+# ---------------------------------------------------------------------------
+# Strategy 20: TD Setup / TD 9 (Tom DeMark Sequential - Part I only)
+#
+# BEARISH TD SETUP: Close[t] >  Close[t-4] for N consecutive candles.
+# BULLISH TD SETUP: Close[t] <  Close[t-4] for N consecutive candles.
+# A completed count of 9 marks a POTENTIAL exhaustion area (upside for the
+# bearish setup, downside for the bullish setup) - it is NOT a buy/sell
+# instruction. The TD Sequential COUNTDOWN phase is intentionally not
+# implemented (it is not part of the supplied source).
+#
+# Interruption: any candle that fails the comparison (including equal
+# closes or a missing close) resets that setup's count to 0.
+# ---------------------------------------------------------------------------
+
+
+def _consecutive_run_lengths(hits: np.ndarray) -> np.ndarray:
+    runs = np.zeros(len(hits), dtype=int)
+    run = 0
+    for i, hit in enumerate(hits):
+        run = run + 1 if hit else 0
+        runs[i] = run
+    return runs
+
+
+def compute_td_setup(prices: list[DailyPrice]) -> dict | None:
+    """TD Setup / TD 9. Returns None when there are fewer than
+    MIN_ROWS_TD_SETUP closes or the latest close is missing."""
+    close = to_close_series(prices)
+    if len(close) < MIN_ROWS_TD_SETUP or pd.isna(close.iloc[-1]):
+        return None
+
+    reference = close.shift(TD_COMPARISON_LAG)
+    # NaN compares False, so a missing close interrupts the count.
+    bearish_runs = _consecutive_run_lengths((close > reference).to_numpy())
+    bullish_runs = _consecutive_run_lengths((close < reference).to_numpy())
+
+    bearish_run = int(bearish_runs[-1])
+    bullish_run = int(bullish_runs[-1])
+    if bearish_run > 0:
+        setup_type, run = "Bearish", bearish_run
+    elif bullish_run > 0:
+        setup_type, run = "Bullish", bullish_run
+    else:
+        setup_type, run = "None", 0
+
+    setup_completed = run >= TD_SETUP_LENGTH
+    if setup_completed and setup_type == "Bearish":
+        exhaustion_state = "Potential Upside Exhaustion"
+    elif setup_completed and setup_type == "Bullish":
+        exhaustion_state = "Potential Downside Exhaustion"
+    elif run > 0:
+        exhaustion_state = "Setup In Progress"
+    else:
+        exhaustion_state = "No Active Setup"
+
+    # Most recent bar on which either setup first reached a count of 9.
+    last_completed_type: str | None = None
+    last_completed_date: str | None = None
+    latest_idx = -1
+    for label, runs in (("Bearish", bearish_runs), ("Bullish", bullish_runs)):
+        hits = np.flatnonzero(runs == TD_SETUP_LENGTH)
+        if len(hits) and hits[-1] > latest_idx:
+            latest_idx = int(hits[-1])
+            last_completed_type = label
+            last_completed_date = close.index[latest_idx].date().isoformat()
+
+    df = pd.DataFrame(
+        {
+            "close": close,
+            "bearish_setup_count": np.minimum(bearish_runs, TD_SETUP_LENGTH),
+            "bullish_setup_count": np.minimum(bullish_runs, TD_SETUP_LENGTH),
+        }
+    )
+    chart_data = [
+        {
+            "date": ts.date().isoformat(),
+            "close": _round(row["close"]),
+            "bearish_setup_count": int(row["bearish_setup_count"]),
+            "bullish_setup_count": int(row["bullish_setup_count"]),
+        }
+        for ts, row in df.tail(CHART_LOOKBACK_DAYS).iterrows()
+    ]
+
+    return {
+        "price": _round(float(close.iloc[-1])),
+        "setup_type": setup_type,
+        "setup_count": min(run, TD_SETUP_LENGTH),
+        "setup_completed": setup_completed,
+        "exhaustion_state": exhaustion_state,
+        "consecutive_qualifying_candles": run,
+        "bars_since_completion": (run - TD_SETUP_LENGTH) if setup_completed else None,
+        "comparison_lag_candles": TD_COMPARISON_LAG,
+        "setup_length": TD_SETUP_LENGTH,
+        "last_completed_setup_type": last_completed_type,
+        "last_completed_setup_date": last_completed_date,
+        "chart_data": chart_data,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Supertrend (standard, publicly documented ATR-band algorithm)
+#
+# Reuses the module's existing Wilder `_atr`. Returns the Supertrend line
+# plus direction (+1 bullish / -1 bearish) and the active final bands.
+# ---------------------------------------------------------------------------
+
+
+def _supertrend(
+    frame: pd.DataFrame, period: int, multiplier: float
+) -> pd.DataFrame:
+    hl2 = (frame["high"] + frame["low"]) / 2
+    atr = _atr(frame, period)
+    basic_upper = (hl2 + multiplier * atr).to_numpy()
+    basic_lower = (hl2 - multiplier * atr).to_numpy()
+    close = frame["close"].to_numpy()
+
+    n = len(frame)
+    final_upper = np.full(n, np.nan)
+    final_lower = np.full(n, np.nan)
+    direction = np.zeros(n, dtype=int)
+    line = np.full(n, np.nan)
+
+    start = next((i for i in range(n) if not np.isnan(basic_upper[i])), None)
+    if start is not None:
+        final_upper[start] = basic_upper[start]
+        final_lower[start] = basic_lower[start]
+        direction[start] = 1 if close[start] >= hl2.iloc[start] else -1
+        line[start] = final_lower[start] if direction[start] == 1 else final_upper[start]
+        for i in range(start + 1, n):
+            final_upper[i] = (
+                basic_upper[i]
+                if basic_upper[i] < final_upper[i - 1] or close[i - 1] > final_upper[i - 1]
+                else final_upper[i - 1]
+            )
+            final_lower[i] = (
+                basic_lower[i]
+                if basic_lower[i] > final_lower[i - 1] or close[i - 1] < final_lower[i - 1]
+                else final_lower[i - 1]
+            )
+            if direction[i - 1] == -1 and close[i] > final_upper[i]:
+                direction[i] = 1
+            elif direction[i - 1] == 1 and close[i] < final_lower[i]:
+                direction[i] = -1
+            else:
+                direction[i] = direction[i - 1]
+            line[i] = final_lower[i] if direction[i] == 1 else final_upper[i]
+
+    out = pd.DataFrame(
+        {
+            "supertrend": line,
+            "direction": direction.astype(float),
+            "final_upper": final_upper,
+            "final_lower": final_lower,
+        },
+        index=frame.index,
+    )
+    # Warm-up rows (no valid ATR yet) have no direction.
+    out.loc[out["direction"] == 0, :] = np.nan
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Strategy 21: Supertrend Confirmation
+#
+# BUY  condition: the two candles immediately BEFORE the signal candle are
+#                 GREEN, close > Supertrend, Supertrend is bullish (green).
+# SELL condition: the two candles immediately BEFORE the signal candle are
+#                 RED,   close < Supertrend, Supertrend is bearish (red).
+# If either preceding candle is the wrong colour (or a doji / missing open)
+# the condition is NOT met - a bare Supertrend direction change is never
+# reported as a condition on its own. `supertrend_flipped_today` is exposed
+# separately so a consumer can see whether the trend just changed.
+# Candle colour: green = close > open, red = close < open.
+# ---------------------------------------------------------------------------
+
+
+def compute_supertrend_confirmation(prices: list[DailyPrice]) -> dict | None:
+    frame = _ohlc_clean(prices)
+    if len(frame) < MIN_ROWS_SUPERTREND_CONFIRMATION:
+        return None
+
+    st = _supertrend(frame, SUPERTREND_ATR_PERIOD, SUPERTREND_MULTIPLIER)
+    colour = _candle_colour(frame)
+    green = colour == "Green"
+    red = colour == "Red"
+    n = SUPERTREND_CONFIRMATION_CANDLES
+    prev_green = pd.Series(True, index=frame.index)
+    prev_red = pd.Series(True, index=frame.index)
+    for k in range(1, n + 1):
+        # fill_value=False: rows without k preceding candles never confirm.
+        prev_green &= green.shift(k, fill_value=False)
+        prev_red &= red.shift(k, fill_value=False)
+
+    close = frame["close"]
+    buy = prev_green & (close > st["supertrend"]) & (st["direction"] == 1)
+    sell = prev_red & (close < st["supertrend"]) & (st["direction"] == -1)
+
+    df = pd.DataFrame(
+        {
+            "close": close,
+            "supertrend": st["supertrend"],
+            "direction": st["direction"],
+            "buy": buy,
+            "sell": sell,
+        }
+    ).dropna(subset=["supertrend", "direction"])
+    if df.empty:
+        return None
+    df["confirmation_state"] = np.where(
+        df["buy"], "Buy Confirmed", np.where(df["sell"], "Sell Confirmed", "No Confirmation")
+    )
+
+    last = df.iloc[-1]
+    buy_active, sell_active = bool(last["buy"]), bool(last["sell"])
+    flipped = len(df) > 1 and int(df["direction"].iloc[-2]) != int(last["direction"])
+
+    def _last_date(mask: pd.Series) -> str | None:
+        hits = mask[mask]
+        return hits.index[-1].date().isoformat() if len(hits) else None
+
+    chart_data = [
+        {
+            "date": ts.date().isoformat(),
+            "close": _round(row["close"]),
+            "supertrend": _round(row["supertrend"]),
+            "confirmation_state": row["confirmation_state"],
+        }
+        for ts, row in df.tail(CHART_LOOKBACK_DAYS).iterrows()
+    ]
+
+    return {
+        "price": _round(float(last["close"])),
+        "supertrend": _round(float(last["supertrend"])),
+        "supertrend_trend": "Bullish" if last["direction"] == 1 else "Bearish",
+        "price_above_supertrend": bool(last["close"] > last["supertrend"]),
+        "supertrend_flipped_today": bool(flipped),
+        "previous_two_candles": [
+            colour.iloc[-1 - k] if len(colour) > k else "Neutral" for k in (2, 1)
+        ],
+        "buy_condition_active": buy_active,
+        "sell_condition_active": sell_active,
+        "confirmation_state": str(last["confirmation_state"]),
+        "last_buy_condition_date": _last_date(df["buy"]),
+        "last_sell_condition_date": _last_date(df["sell"]),
+        "confirmation_candles": n,
+        "atr_period": SUPERTREND_ATR_PERIOD,
+        "multiplier": SUPERTREND_MULTIPLIER,
+        "parameters_note": (
+            "The source does not state Supertrend parameters; the conventional "
+            "ATR(10) x 3.0 defaults are used."
+        ),
+        "chart_data": chart_data,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Strategy 22: UFX + Vervoort Heiken Ashi
+#
+# LIMITATION (important): "UFX Pro" and "Vervoort Heiken Ashi - Long Term"
+# are proprietary TradingView scripts whose formulas are NOT in this
+# repository and NOT in the source article (which only quotes settings).
+# This module therefore does NOT claim to reproduce them. It evaluates the
+# article's RULE STRUCTURE using clearly labelled public-formula stand-ins:
+#
+#   UFX Pro stand-in      -> standard Supertrend-style ATR band with the
+#                            article's ATR Period = 6 and Factor = 2. A
+#                            direction flip on the signal candle plays the
+#                            role of the "UFX BUY / SELL".
+#   Vervoort HA stand-in  -> colour of the STANDARD Heikin-Ashi candle
+#                            (HA close = (O+H+L+C)/4, HA open =
+#                            (prev HA open + prev HA close)/2). The
+#                            article's Timer Period = 11 and EMA Period = 44
+#                            cannot be mapped to a documented formula and
+#                            are therefore NOT used (listed in the response
+#                            as `unmapped_source_settings`).
+#
+# BUY  setup: stand-in flips bullish on the bar, HA colour green, bullish
+#             candle (close > open).
+# SELL setup: stand-in flips bearish on the bar, HA colour red, bearish
+#             candle (close < open).
+# Risk model from the article: reward = 1.5 x risk. The article says only
+# "stop-loss at the relevant zone"; the stand-in ATR band at the setup bar
+# is used as that zone (assumption, flagged in the response).
+# ---------------------------------------------------------------------------
+
+
+def _heikin_ashi(frame: pd.DataFrame) -> pd.DataFrame:
+    """Standard Heikin-Ashi candles. Missing `open` falls back to the
+    close for the first HA open only (the recursion then self-corrects)."""
+    ha_close = (frame["open"].fillna(frame["close"]) + frame["high"] + frame["low"] + frame["close"]) / 4
+    ha_open = np.empty(len(frame))
+    first_open = frame["open"].iloc[0]
+    first_open = frame["close"].iloc[0] if pd.isna(first_open) else first_open
+    ha_open[0] = (first_open + frame["close"].iloc[0]) / 2
+    closes = ha_close.to_numpy()
+    for i in range(1, len(frame)):
+        ha_open[i] = (ha_open[i - 1] + closes[i - 1]) / 2
+    return pd.DataFrame({"ha_open": ha_open, "ha_close": closes}, index=frame.index)
+
+
+def compute_ufx_vervoort_heiken_ashi(prices: list[DailyPrice]) -> dict | None:
+    frame = _ohlc_clean(prices)
+    if len(frame) < MIN_ROWS_UFX_VERVOORT:
+        return None
+
+    band = _supertrend(frame, UFX_ATR_PERIOD, UFX_FACTOR)
+    ha = _heikin_ashi(frame)
+    colour = _candle_colour(frame)
+
+    direction = band["direction"]
+    flip_up = (direction == 1) & (direction.shift(1) == -1)
+    flip_down = (direction == -1) & (direction.shift(1) == 1)
+    ha_green = ha["ha_close"] > ha["ha_open"]
+    ha_red = ha["ha_close"] < ha["ha_open"]
+
+    buy = flip_up & ha_green & (colour == "Green")
+    sell = flip_down & ha_red & (colour == "Red")
+
+    df = pd.DataFrame(
+        {
+            "close": frame["close"],
+            "ufx_band": band["supertrend"],
+            "direction": direction,
+            "buy": buy,
+            "sell": sell,
+        }
+    ).dropna(subset=["ufx_band", "direction"])
+    if df.empty:
+        return None
+    df["setup_state"] = np.where(
+        df["buy"], "Buy Setup", np.where(df["sell"], "Sell Setup", "No Setup")
+    )
+
+    last_idx = df.index[-1]
+    setup_mask = df["buy"] | df["sell"]
+    last_setup_type = last_setup_date = None
+    entry = stop = target = None
+    bars_since = None
+    if setup_mask.any():
+        setup_ts = df.index[setup_mask][-1]
+        is_buy = bool(df.loc[setup_ts, "buy"])
+        last_setup_type = "Buy" if is_buy else "Sell"
+        last_setup_date = setup_ts.date().isoformat()
+        bars_since = int(len(df) - 1 - df.index.get_loc(setup_ts))
+        entry_v = float(df.loc[setup_ts, "close"])
+        stop_v = float(df.loc[setup_ts, "ufx_band"])
+        risk = entry_v - stop_v if is_buy else stop_v - entry_v
+        if risk > 0:
+            entry, stop = entry_v, stop_v
+            target = entry_v + UFX_VERVOORT_RISK_REWARD * risk if is_buy else entry_v - UFX_VERVOORT_RISK_REWARD * risk
+
+    last = df.iloc[-1]
+    ha_last_green = bool(ha_green.loc[last_idx])
+    ha_last_red = bool(ha_red.loc[last_idx])
+    chart_data = [
+        {
+            "date": ts.date().isoformat(),
+            "close": _round(row["close"]),
+            "ufx_stand_in_band": _round(row["ufx_band"]),
+            "setup_state": row["setup_state"],
+        }
+        for ts, row in df.tail(CHART_LOOKBACK_DAYS).iterrows()
+    ]
+
+    return {
+        "price": _round(float(last["close"])),
+        "setup_state": str(last["setup_state"]),
+        "buy_setup_active": bool(last["buy"]),
+        "sell_setup_active": bool(last["sell"]),
+        "ufx_stand_in_trend": "Bullish" if last["direction"] == 1 else "Bearish",
+        "ufx_stand_in_flipped_today": bool(flip_up.loc[last_idx] or flip_down.loc[last_idx]),
+        "ufx_stand_in_band": _round(float(last["ufx_band"])),
+        "heiken_ashi_histogram_stand_in": (
+            "Green" if ha_last_green else ("Red" if ha_last_red else "Neutral")
+        ),
+        "candle_confirmation": {"Green": "Bullish", "Red": "Bearish"}.get(
+            str(colour.loc[last_idx]), "Neutral"
+        ),
+        "last_setup_type": last_setup_type,
+        "last_setup_date": last_setup_date,
+        "bars_since_last_setup": bars_since,
+        "last_setup_entry": _round(entry),
+        "last_setup_stop": _round(stop),
+        "last_setup_target": _round(target),
+        "risk_reward_ratio": UFX_VERVOORT_RISK_REWARD,
+        "ufx_atr_period": UFX_ATR_PERIOD,
+        "ufx_factor": UFX_FACTOR,
+        "ufx_pro_exact": False,
+        "vervoort_heiken_ashi_exact": False,
+        "unmapped_source_settings": [
+            f"Vervoort Timer Period = {VERVOORT_TIMER_PERIOD}",
+            f"Vervoort EMA Period = {VERVOORT_EMA_PERIOD}",
+        ],
+        "implementation_note": (
+            "UFX Pro and Vervoort Heiken Ashi (Long Term) are proprietary "
+            "TradingView scripts and are NOT reproduced. A Supertrend-style "
+            "ATR(6) x 2 band and the standard Heiken Ashi candle colour are "
+            "used as labelled stand-ins; Vervoort's Timer/EMA settings are "
+            "not applied. The stop level is the stand-in band at the setup "
+            "candle (the source only says 'the relevant zone')."
+        ),
+        "chart_data": chart_data,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Strategy 23: Trend Signals + Trend Tide Oscillator
+#
+# LIMITATION (important): the source describes the roles (Trend Signals =
+# decision maker, Trend Tide = green/red momentum filter) and a 1 : 1.5
+# TP/SL ratio, but gives NO formula, length or parameter for either
+# indicator, and neither exists in this repository. Inventing them would be
+# fabrication, so this strategy reports ONLY what is reliably derivable:
+# the price-confirmation candle and the (static) risk/reward framework.
+# `trend_signals_available` / `trend_tide_available` are False and the
+# BUY / SELL setup flags can therefore not become True until the exact
+# indicator definitions are supplied.
+# ---------------------------------------------------------------------------
+
+
+def compute_trend_signals_trend_tide(prices: list[DailyPrice]) -> dict | None:
+    frame = _ohlc_clean(prices)
+    if len(frame) < MIN_ROWS_TREND_SIGNALS_TREND_TIDE:
+        return None
+
+    colour = _candle_colour(frame)
+    last_colour = str(colour.iloc[-1])
+    candle_confirmation = {"Green": "Bullish", "Red": "Bearish"}.get(last_colour, "Neutral")
+
+    chart_data = [
+        {
+            "date": ts.date().isoformat(),
+            "close": _round(frame["close"].loc[ts]),
+            "candle_colour": colour.loc[ts],
+        }
+        for ts in frame.tail(CHART_LOOKBACK_DAYS).index
+    ]
+
+    return {
+        "price": _round(float(frame["close"].iloc[-1])),
+        "candle_confirmation": candle_confirmation,
+        "trend_signals_available": False,
+        "trend_tide_available": False,
+        "trend_signals_state": "Unavailable",
+        "trend_tide_state": "Unavailable",
+        "buy_setup_active": False,
+        "sell_setup_active": False,
+        "setup_state": "Unavailable - proprietary components not reproducible",
+        "risk_reward_ratio": TREND_SIGNALS_RISK_REWARD,
+        "implementation_note": (
+            "The source article gives no formula or parameters for Trend "
+            "Signals with TP & SL or the Trend Tide Oscillator, and neither "
+            "exists in this codebase. They are not approximated. Only the "
+            "price-confirmation candle and the 1 : 1.5 risk/reward framework "
+            "are reported; setup flags stay False until the exact indicator "
+            "definitions are supplied."
+        ),
+        "chart_data": chart_data,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Strategy 24: Pivot Levels (classic floor-trader pivots)
+#
+# Levels are computed from the PREVIOUS completed daily candle (H, L, C):
+#   PP = (H + L + C) / 3          R1 = 2PP - L        S1 = 2PP - H
+#   R2 = PP + (H - L)             S2 = PP - (H - L)
+#   R3 = H + 2(PP - L)            S3 = L - 2(H - PP)
+# Zones follow the source's three-way reading: price above R1 = upper
+# zone (profit-booking / short-bias context), between S1 and R1 = middle
+# zone (range / chop), below S1 = lower zone (accumulation / long-bias
+# context). These are descriptive context labels only; no buy/sell rule
+# is derived. The source does not give an exact level formula, so the
+# classic floor-trader set is used (documented assumption).
+# ---------------------------------------------------------------------------
+
+
+def _pivot_level_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    high, low, close = frame["high"], frame["low"], frame["close"]
+    pp = (high + low + close) / 3
+    rng = high - low
+    return pd.DataFrame(
+        {
+            "pivot": pp,
+            "r1": 2 * pp - low,
+            "r2": pp + rng,
+            "r3": high + 2 * (pp - low),
+            "s1": 2 * pp - high,
+            "s2": pp - rng,
+            "s3": low - 2 * (high - pp),
+        },
+        index=frame.index,
+    )
+
+
+def compute_pivot_levels(prices: list[DailyPrice]) -> dict | None:
+    frame = _ohlc_clean(prices)
+    if len(frame) < MIN_ROWS_PIVOT_LEVELS:
+        return None
+
+    # Levels for bar t come from bar t-1 (no look-ahead).
+    levels = _pivot_level_frame(frame).shift(1)
+    df = levels.join(frame["close"]).dropna()
+    if df.empty:
+        return None
+
+    last = df.iloc[-1]
+    price = float(last["close"])
+    ordered = {k: float(last[k]) for k in ("s3", "s2", "s1", "pivot", "r1", "r2", "r3")}
+
+    if price > ordered["r1"]:
+        zone, context = "Upper Zone", "Profit-booking / short-bias area"
+    elif price < ordered["s1"]:
+        zone, context = "Lower Zone", "Accumulation / long-bias area"
+    else:
+        zone, context = "Middle Zone", "Range / chop area - avoid overtrading"
+
+    above = [(k, v) for k, v in ordered.items() if v > price]
+    below = [(k, v) for k, v in ordered.items() if v <= price]
+    nearest_res = min(above, key=lambda kv: kv[1]) if above else None
+    nearest_sup = max(below, key=lambda kv: kv[1]) if below else None
+
+    def _dist(level: tuple[str, float] | None) -> float | None:
+        return _round(abs(level[1] - price) / price * 100) if level and price else None
+
+    return {
+        "price": _round(price),
+        "pivot": _round(ordered["pivot"]),
+        "r1": _round(ordered["r1"]),
+        "r2": _round(ordered["r2"]),
+        "r3": _round(ordered["r3"]),
+        "s1": _round(ordered["s1"]),
+        "s2": _round(ordered["s2"]),
+        "s3": _round(ordered["s3"]),
+        "price_above_pivot": price > ordered["pivot"],
+        "zone": zone,
+        "zone_context": context,
+        "nearest_resistance_level": nearest_res[0].upper() if nearest_res else None,
+        "nearest_resistance": _round(nearest_res[1]) if nearest_res else None,
+        "distance_to_resistance_percent": _dist(nearest_res),
+        "nearest_support_level": nearest_sup[0].upper() if nearest_sup else None,
+        "nearest_support": _round(nearest_sup[1]) if nearest_sup else None,
+        "distance_to_support_percent": _dist(nearest_sup),
+        "basis": "Previous daily candle (H, L, C) - classic floor-trader pivots",
+        "chart_data": _chart_rows(df, ["close", "pivot", "r1", "r2", "r3", "s1", "s2", "s3"]),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Strategy 25: CPR - Central Pivot Range
+#
+#   Pivot = (H + L + C) / 3      BC = (H + L) / 2      TC = 2 x Pivot - BC
+#   top_cpr = max(TC, BC)        bottom_cpr = min(TC, BC)
+#   width % = (top_cpr - bottom_cpr) / Pivot x 100
+# computed from the PREVIOUS daily candle and applied to the current one.
+#
+# Narrow / wide: the source gives no numeric threshold, so the width is
+# ranked against the trailing CPR_WIDTH_LOOKBACK widths of the same symbol
+# using a MID-RANK percentile (share of widths below + half the share equal
+# to it): <= 25th percentile = Narrow, >= 75th = Wide, otherwise Normal.
+# Mid-rank keeps a typical width in a uniform history "Normal" (rank 0.5)
+# while still flagging a genuine outlier - plain quantile cut-offs collapse
+# when many widths are identical. Documented ThrustWise convention.
+# Bias: close above top_cpr = bullish day bias, below bottom_cpr = bearish,
+# inside = neutral. CPR edges are exposed as support / resistance. No
+# buy/sell rule is derived.
+# ---------------------------------------------------------------------------
+
+
+def compute_cpr(prices: list[DailyPrice]) -> dict | None:
+    frame = _ohlc_clean(prices)
+    if len(frame) < MIN_ROWS_CPR:
+        return None
+
+    high, low, close = frame["high"], frame["low"], frame["close"]
+    pivot = (high + low + close) / 3
+    bc = (high + low) / 2
+    tc = 2 * pivot - bc
+    top = pd.concat([tc, bc], axis=1).max(axis=1)
+    bottom = pd.concat([tc, bc], axis=1).min(axis=1)
+    width = top - bottom
+    width_pct = width / pivot.replace(0, np.nan) * 100
+
+    cpr = pd.DataFrame(
+        {
+            "pivot": pivot,
+            "top_cpr": top,
+            "bottom_cpr": bottom,
+            "cpr_width": width,
+            "cpr_width_percent": width_pct,
+        },
+        index=frame.index,
+    )
+    applied = cpr.shift(1)  # previous candle's CPR applies to this candle
+    df = applied.join(close).dropna()
+    if len(df) < 2:
+        return None
+
+    last = df.iloc[-1]
+    price = float(last["close"])
+    top_v, bottom_v = float(last["top_cpr"]), float(last["bottom_cpr"])
+    width_v = float(last["cpr_width_percent"])
+
+    window = df["cpr_width_percent"].tail(CPR_WIDTH_LOOKBACK)
+    below = float((window < width_v - CPR_WIDTH_EQUALITY_TOLERANCE).sum())
+    equal = float(((window - width_v).abs() <= CPR_WIDTH_EQUALITY_TOLERANCE).sum())
+    width_rank = (below + 0.5 * equal) / len(window)
+    if width_rank <= CPR_NARROW_PERCENTILE:
+        width_class, interpretation = "Narrow", "Potentially larger move"
+    elif width_rank >= CPR_WIDE_PERCENTILE:
+        width_class, interpretation = "Wide", "Potentially range-bound market"
+    else:
+        width_class, interpretation = "Normal", "Neutral CPR width"
+
+    if price > top_v:
+        position, bias = "Above CPR", "Bullish Day Bias"
+        support, resistance = top_v, None
+    elif price < bottom_v:
+        position, bias = "Below CPR", "Bearish Day Bias"
+        support, resistance = None, bottom_v
+    else:
+        position, bias = "Inside CPR", "Neutral"
+        support, resistance = bottom_v, top_v
+
+    return {
+        "price": _round(price),
+        "pivot": _round(float(last["pivot"])),
+        "top_cpr": _round(top_v),
+        "bottom_cpr": _round(bottom_v),
+        "cpr_width": _round(float(last["cpr_width"]), 4),
+        "cpr_width_percent": _round(width_v, 4),
+        "cpr_width_percentile_rank": _round(width_rank * 100),
+        "cpr_width_class": width_class,
+        "cpr_width_interpretation": interpretation,
+        "price_position": position,
+        "market_bias": bias,
+        "cpr_support": _round(support),
+        "cpr_resistance": _round(resistance),
+        "width_lookback_days": CPR_WIDTH_LOOKBACK,
+        "basis": "Previous daily candle (H, L, C)",
+        "chart_data": _chart_rows(df, ["close", "pivot", "top_cpr", "bottom_cpr"]),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Strategy 26: TA Candles / Trend Health
+#
+# LIMITATION (important): the source describes TA Candles / "MasterPiece"
+# qualitatively (trend + volatility + momentum + strength consistency) but
+# gives no formula, and it is a proprietary TradingView script. It is NOT
+# reproduced and this output must never be read as that indicator
+# (`is_exact_tradingview_indicator` is False).
+#
+# What IS provided is ThrustWise's own transparent trend-health read built
+# from standard, documented measures covering the same four dimensions:
+#   trend       : EMA21 vs EMA50 (min. 0.25% separation) and close vs EMA21
+#   momentum    : 10-day rate of change
+#   volatility  : ATR(14) as % of close vs its own 50-day median
+#   consistency : share of green / red candles in the last 10 sessions
+# All thresholds are constants at the top of this section so they are easy
+# to audit or change.
+# ---------------------------------------------------------------------------
+
+
+def compute_ta_candles_trend_health(prices: list[DailyPrice]) -> dict | None:
+    frame = _ohlc_clean(prices)
+    if len(frame) < MIN_ROWS_TA_CANDLES:
+        return None
+
+    close = frame["close"]
+    ema_fast = _ema(close, TA_EMA_FAST)
+    ema_slow = _ema(close, TA_EMA_SLOW)
+    roc = close.pct_change(TA_ROC_PERIOD) * 100
+    atr_pct = _atr(frame, TA_ATR_PERIOD) / close.replace(0, np.nan) * 100
+    atr_baseline = atr_pct.rolling(TA_VOLATILITY_BASELINE_WINDOW, min_periods=TA_ATR_PERIOD).median()
+    colour = _candle_colour(frame)
+    green_ratio = (colour == "Green").astype(float).rolling(TA_STRENGTH_WINDOW).mean()
+    red_ratio = (colour == "Red").astype(float).rolling(TA_STRENGTH_WINDOW).mean()
+
+    df = pd.DataFrame(
+        {
+            "close": close,
+            "ema21": ema_fast,
+            "ema50": ema_slow,
+            "roc": roc,
+            "atr_percent": atr_pct,
+            "atr_baseline": atr_baseline,
+            "green_ratio": green_ratio,
+            "red_ratio": red_ratio,
+        }
+    ).dropna()
+    if df.empty:
+        return None
+
+    last = df.iloc[-1]
+    price = float(last["close"])
+    e21, e50 = float(last["ema21"]), float(last["ema50"])
+    roc_v = float(last["roc"])
+    g_ratio, r_ratio = float(last["green_ratio"]), float(last["red_ratio"])
+
+    # Require a minimum EMA separation: in a sideways market the sign of
+    # EMA21 - EMA50 flips on noise and must not be read as a trend.
+    separated = abs(e21 - e50) / e50 * 100 >= TA_TREND_MIN_SEPARATION_PERCENT if e50 else False
+    if separated and e21 > e50 and price > e21:
+        trend = "Bullish"
+    elif separated and e21 < e50 and price < e21:
+        trend = "Bearish"
+    else:
+        trend = "Mixed"
+
+    momentum_state = "Positive" if roc_v > 0 else ("Negative" if roc_v < 0 else "Flat")
+
+    base = float(last["atr_baseline"])
+    atr_v = float(last["atr_percent"])
+    if base > 0 and atr_v >= base * TA_VOLATILITY_EXPANDING_RATIO:
+        volatility_state = "Expanding"
+    elif base > 0 and atr_v <= base * TA_VOLATILITY_CONTRACTING_RATIO:
+        volatility_state = "Contracting"
+    else:
+        volatility_state = "Normal"
+
+    if trend == "Bullish" and momentum_state == "Positive" and g_ratio >= TA_ALIGNED_CANDLE_RATIO:
+        alignment, health = "Aligned Bullish", "Healthy Trend (Bullish)"
+    elif trend == "Bearish" and momentum_state == "Negative" and r_ratio >= TA_ALIGNED_CANDLE_RATIO:
+        alignment, health = "Aligned Bearish", "Healthy Trend (Bearish)"
+    elif trend == "Bullish" and (momentum_state != "Positive" or g_ratio < TA_WEAKENING_CANDLE_RATIO):
+        alignment, health = "Mixed", "Weakening Bullish Trend"
+    elif trend == "Bearish" and (momentum_state != "Negative" or r_ratio < TA_WEAKENING_CANDLE_RATIO):
+        alignment, health = "Mixed", "Weakening Bearish Trend"
+    else:
+        alignment, health = "Mixed", "Choppy - Caution"
+
+    streak_colour = str(colour.iloc[-1])
+    streak = 0
+    for c in reversed(colour.tolist()):
+        if c == streak_colour and c != "Neutral":
+            streak += 1
+        else:
+            break
+
+    return {
+        "price": _round(price),
+        "ema21": _round(e21),
+        "ema50": _round(e50),
+        "trend": trend,
+        "momentum_roc_percent": _round(roc_v),
+        "momentum_state": momentum_state,
+        "atr_percent": _round(atr_v),
+        "volatility_state": volatility_state,
+        "green_candle_ratio": _round(g_ratio, 2),
+        "red_candle_ratio": _round(r_ratio, 2),
+        "current_candle_streak": streak,
+        "current_candle_streak_colour": streak_colour,
+        "strength_alignment": alignment,
+        "trend_health_state": health,
+        "strength_window_candles": TA_STRENGTH_WINDOW,
+        "is_exact_tradingview_indicator": False,
+        "methodology_note": (
+            "TA Candles / MasterPiece is a proprietary TradingView indicator "
+            "whose formula is not given in the source and is NOT reproduced. "
+            "This is ThrustWise's own trend-health read from standard "
+            "measures (EMA21/EMA50 trend, 10-day ROC momentum, ATR(14)% "
+            "volatility, 10-candle green/red consistency)."
+        ),
+        "chart_data": _chart_rows(df, ["close", "ema21", "ema50", "roc", "atr_percent", "green_ratio"]),
     }

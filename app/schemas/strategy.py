@@ -707,6 +707,270 @@ class PortfolioOptimizationResult(CamelModel):
 
 
 # ---------------------------------------------------------------------------
+# Strategies 20-26: additional Technical Strategies. All are single-symbol,
+# computed from the symbol's own daily OHLC history, and analytical only
+# (state / condition flags - no action field). See the matching section in
+# services.strategies for formulas, assumptions and exactness notes.
+# ---------------------------------------------------------------------------
+
+
+class TdSetupChartPoint(CamelModel):
+    date: str
+    close: float | None = None
+    bearish_setup_count: int | None = None
+    bullish_setup_count: int | None = None
+
+
+class TdSetupStrategy(CamelModel):
+    """TD Setup / TD 9 (Tom DeMark Sequential, Part I only).
+
+    Bearish setup: Close[t] > Close[t-4] for consecutive candles; bullish
+    setup: Close[t] < Close[t-4]. A completed count of 9 is a POTENTIAL
+    exhaustion area - not a reversal guarantee and not a buy/sell
+    instruction. The Countdown phase is not implemented. Any interruption
+    resets the count to 0. See services.strategies Strategy 20.
+    """
+
+    price: float
+    setup_type: str  # "Bearish" | "Bullish" | "None"
+    setup_count: int  # 0-9
+    setup_completed: bool
+    exhaustion_state: str  # "Potential Upside Exhaustion" | "Potential Downside Exhaustion" |
+    # "Setup In Progress" | "No Active Setup"
+    consecutive_qualifying_candles: int
+    bars_since_completion: int | None = None
+    comparison_lag_candles: int
+    setup_length: int
+    last_completed_setup_type: str | None = None
+    last_completed_setup_date: str | None = None
+    chart_data: list[TdSetupChartPoint]
+
+
+class SupertrendConfirmationChartPoint(CamelModel):
+    date: str
+    close: float | None = None
+    supertrend: float | None = None
+    confirmation_state: str | None = None  # "Buy Confirmed" | "Sell Confirmed" | "No Confirmation"
+
+
+class SupertrendConfirmationStrategy(CamelModel):
+    """Supertrend Confirmation.
+
+    Buy condition: the two candles before the signal candle are green,
+    close is above the Supertrend and the Supertrend is bullish. Sell
+    condition is the mirror image. A bare Supertrend direction change is
+    never reported as a condition. Descriptive condition flags only - not
+    a recommendation. Supertrend parameters (ATR 10 x 3.0) are an
+    assumption because the source states none. See services.strategies
+    Strategy 21.
+    """
+
+    price: float
+    supertrend: float
+    supertrend_trend: str  # "Bullish" | "Bearish"
+    price_above_supertrend: bool
+    supertrend_flipped_today: bool
+    previous_two_candles: list[str]  # oldest first; "Green" | "Red" | "Neutral"
+    buy_condition_active: bool
+    sell_condition_active: bool
+    confirmation_state: str  # "Buy Confirmed" | "Sell Confirmed" | "No Confirmation"
+    last_buy_condition_date: str | None = None
+    last_sell_condition_date: str | None = None
+    confirmation_candles: int
+    atr_period: int
+    multiplier: float
+    parameters_note: str
+    chart_data: list[SupertrendConfirmationChartPoint]
+
+
+class UfxVervoortChartPoint(CamelModel):
+    date: str
+    close: float | None = None
+    ufx_stand_in_band: float | None = None
+    setup_state: str | None = None  # "Buy Setup" | "Sell Setup" | "No Setup"
+
+
+class UfxVervoortHeikenAshiStrategy(CamelModel):
+    """UFX + Vervoort Heiken Ashi.
+
+    NOT an exact reproduction: UFX Pro and Vervoort Heiken Ashi (Long
+    Term) are proprietary TradingView scripts. The article's rule
+    structure is evaluated with labelled public-formula stand-ins
+    (ATR(6) x 2 Supertrend-style band; standard Heiken Ashi colour) -
+    see `ufx_pro_exact`, `vervoort_heiken_ashi_exact`,
+    `unmapped_source_settings` and `implementation_note`. Risk/reward is
+    1 : 1.5. Descriptive only. See services.strategies Strategy 22.
+    """
+
+    price: float
+    setup_state: str  # "Buy Setup" | "Sell Setup" | "No Setup"
+    buy_setup_active: bool
+    sell_setup_active: bool
+    ufx_stand_in_trend: str  # "Bullish" | "Bearish"
+    ufx_stand_in_flipped_today: bool
+    ufx_stand_in_band: float
+    heiken_ashi_histogram_stand_in: str  # "Green" | "Red" | "Neutral"
+    candle_confirmation: str  # "Bullish" | "Bearish" | "Neutral"
+    last_setup_type: str | None = None  # "Buy" | "Sell"
+    last_setup_date: str | None = None
+    bars_since_last_setup: int | None = None
+    last_setup_entry: float | None = None
+    last_setup_stop: float | None = None
+    last_setup_target: float | None = None
+    risk_reward_ratio: float
+    ufx_atr_period: int
+    ufx_factor: float
+    ufx_pro_exact: bool
+    vervoort_heiken_ashi_exact: bool
+    unmapped_source_settings: list[str]
+    implementation_note: str
+    chart_data: list[UfxVervoortChartPoint]
+
+
+class TrendSignalsTrendTideChartPoint(CamelModel):
+    date: str
+    close: float | None = None
+    candle_colour: str | None = None  # "Green" | "Red" | "Neutral"
+
+
+class TrendSignalsTrendTideStrategy(CamelModel):
+    """Trend Signals + Trend Tide Oscillator.
+
+    The source gives no formula or parameters for either indicator, so
+    neither is reproduced (`trend_signals_available` /
+    `trend_tide_available` are False and the setup flags cannot become
+    True). Only the price-confirmation candle and the 1 : 1.5 risk/reward
+    framework are reported. See services.strategies Strategy 23.
+    """
+
+    price: float
+    candle_confirmation: str  # "Bullish" | "Bearish" | "Neutral"
+    trend_signals_available: bool
+    trend_tide_available: bool
+    trend_signals_state: str
+    trend_tide_state: str
+    buy_setup_active: bool
+    sell_setup_active: bool
+    setup_state: str
+    risk_reward_ratio: float
+    implementation_note: str
+    chart_data: list[TrendSignalsTrendTideChartPoint]
+
+
+class PivotLevelsChartPoint(CamelModel):
+    date: str
+    close: float | None = None
+    pivot: float | None = None
+    r1: float | None = None
+    r2: float | None = None
+    r3: float | None = None
+    s1: float | None = None
+    s2: float | None = None
+    s3: float | None = None
+
+
+class PivotLevelsStrategy(CamelModel):
+    """Pivot Levels (classic floor-trader pivots from the previous daily
+    candle) with the source's upper / middle / lower zone reading. Zone
+    context labels are descriptive only - no buy/sell rule is derived.
+    See services.strategies Strategy 24.
+    """
+
+    price: float
+    pivot: float
+    r1: float
+    r2: float
+    r3: float
+    s1: float
+    s2: float
+    s3: float
+    price_above_pivot: bool
+    zone: str  # "Upper Zone" | "Middle Zone" | "Lower Zone"
+    zone_context: str
+    nearest_resistance_level: str | None = None
+    nearest_resistance: float | None = None
+    distance_to_resistance_percent: float | None = None
+    nearest_support_level: str | None = None
+    nearest_support: float | None = None
+    distance_to_support_percent: float | None = None
+    basis: str
+    chart_data: list[PivotLevelsChartPoint]
+
+
+class CprChartPoint(CamelModel):
+    date: str
+    close: float | None = None
+    pivot: float | None = None
+    top_cpr: float | None = None
+    bottom_cpr: float | None = None
+
+
+class CprStrategy(CamelModel):
+    """CPR - Central Pivot Range from the previous daily candle:
+    Pivot = (H+L+C)/3, BC = (H+L)/2, TC = 2*Pivot - BC. Narrow / wide is
+    ranked against the symbol's own trailing CPR widths (the source gives
+    no numeric threshold). `market_bias` describes price vs the CPR - not
+    a buy/sell rule. See services.strategies Strategy 25.
+    """
+
+    price: float
+    pivot: float
+    top_cpr: float
+    bottom_cpr: float
+    cpr_width: float
+    cpr_width_percent: float
+    cpr_width_percentile_rank: float  # 0-100, mid-rank vs trailing widths
+    cpr_width_class: str  # "Narrow" | "Normal" | "Wide"
+    cpr_width_interpretation: str
+    price_position: str  # "Above CPR" | "Below CPR" | "Inside CPR"
+    market_bias: str  # "Bullish Day Bias" | "Bearish Day Bias" | "Neutral"
+    cpr_support: float | None = None
+    cpr_resistance: float | None = None
+    width_lookback_days: int
+    basis: str
+    chart_data: list[CprChartPoint]
+
+
+class TaCandlesTrendHealthChartPoint(CamelModel):
+    date: str
+    close: float | None = None
+    ema21: float | None = None
+    ema50: float | None = None
+    roc: float | None = None
+    atr_percent: float | None = None
+    green_ratio: float | None = None
+
+
+class TaCandlesTrendHealthStrategy(CamelModel):
+    """TA Candles / Trend Health.
+
+    NOT the proprietary TradingView TA Candles / MasterPiece indicator
+    (`is_exact_tradingview_indicator` is False): ThrustWise's own
+    transparent trend / momentum / volatility / candle-consistency read
+    built from standard measures. See services.strategies Strategy 26.
+    """
+
+    price: float
+    ema21: float
+    ema50: float
+    trend: str  # "Bullish" | "Bearish" | "Mixed"
+    momentum_roc_percent: float
+    momentum_state: str  # "Positive" | "Negative" | "Flat"
+    atr_percent: float
+    volatility_state: str  # "Expanding" | "Contracting" | "Normal"
+    green_candle_ratio: float
+    red_candle_ratio: float
+    current_candle_streak: int
+    current_candle_streak_colour: str
+    strength_alignment: str  # "Aligned Bullish" | "Aligned Bearish" | "Mixed"
+    trend_health_state: str
+    strength_window_candles: int
+    is_exact_tradingview_indicator: bool
+    methodology_note: str
+    chart_data: list[TaCandlesTrendHealthChartPoint]
+
+
+# ---------------------------------------------------------------------------
 # Strategy categories (see section 10/11 of the reorg spec).
 #
 # These are an ADDITIVE, category-organized view of the exact same data
@@ -727,6 +991,13 @@ class TechnicalStrategies(CamelModel):
     sma_trend: SmaTrendStrategy | None = None
     triple_ma_pullback: TripleMaPullbackStrategy | None = None
     mswing: MswingStrategy | None = None
+    td_setup: TdSetupStrategy | None = None
+    supertrend_confirmation: SupertrendConfirmationStrategy | None = None
+    ufx_vervoort_heiken_ashi: UfxVervoortHeikenAshiStrategy | None = None
+    trend_signals_trend_tide: TrendSignalsTrendTideStrategy | None = None
+    pivot_levels: PivotLevelsStrategy | None = None
+    cpr: CprStrategy | None = None
+    ta_candles_trend_health: TaCandlesTrendHealthStrategy | None = None
 
 
 class QuantitativeStrategies(CamelModel):
@@ -806,6 +1077,17 @@ class StrategyAnalytics(CamelModel):
     # Strategy 19 (single-ETF, all symbols): First Passage Time
     # Distribution Analysis.
     first_passage_time: FirstPassageTimeStrategy | None = None
+    # Strategies 20-26 (single-ETF, all symbols): additional Technical
+    # Strategies - TD Setup / TD 9, Supertrend Confirmation, UFX + Vervoort
+    # Heiken Ashi, Trend Signals + Trend Tide, Pivot Levels, CPR, and
+    # TA Candles / Trend Health.
+    td_setup: TdSetupStrategy | None = None
+    supertrend_confirmation: SupertrendConfirmationStrategy | None = None
+    ufx_vervoort_heiken_ashi: UfxVervoortHeikenAshiStrategy | None = None
+    trend_signals_trend_tide: TrendSignalsTrendTideStrategy | None = None
+    pivot_levels: PivotLevelsStrategy | None = None
+    cpr: CprStrategy | None = None
+    ta_candles_trend_health: TaCandlesTrendHealthStrategy | None = None
 
     # Category-organized view of the SAME strategies above (additive —
     # see the "Strategy categories" note preceding TechnicalStrategies).

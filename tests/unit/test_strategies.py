@@ -1905,3 +1905,795 @@ class TestPortfolioOptimization:
         assert "disclaimer" in result and len(result["disclaimer"]) > 0
         assert "long_only_note" in result and len(result["long_only_note"]) > 0
         assert "not investment advice" in result["disclaimer"].lower()
+
+
+# ===========================================================================
+# Strategies 20-26: additional Technical Strategies
+# ===========================================================================
+
+
+def _candle_price(
+    symbol: str, date: datetime.date, o: float, h: float, l: float, c: float
+) -> MagicMock:
+    p = MagicMock()
+    p.symbol = symbol
+    p.date = date
+    p.open, p.high, p.low, p.close = o, h, l, c
+    p.adjusted_close = c
+    p.volume = 1_000_000
+    return p
+
+
+def _candle_series(
+    rows: list[tuple[float, float, float, float]],
+    start: datetime.date = datetime.date(2023, 1, 2),
+    symbol: str = "VOO",
+) -> list[MagicMock]:
+    """rows = [(open, high, low, close), ...] on consecutive weekdays."""
+    out = []
+    current = start
+    for o, h, l, c in rows:
+        while current.weekday() >= 5:
+            current += datetime.timedelta(days=1)
+        out.append(_candle_price(symbol, current, o, h, l, c))
+        current += datetime.timedelta(days=1)
+    return out
+
+
+def _closes_to_candles(
+    closes: list[float], green: bool | list[bool] = True
+) -> list[tuple[float, float, float, float]]:
+    """Candles whose CLOSE path is `closes`; each candle is green or red by
+    placing the open below/above the close (so the close path - which TD
+    Setup, ATR and EMAs depend on - is exactly what the test specifies)."""
+    flags = green if isinstance(green, list) else [green] * len(closes)
+    rows = []
+    for c, is_green in zip(closes, flags):
+        o = c - 0.4 if is_green else c + 0.4
+        rows.append((o, max(o, c) + 0.2, min(o, c) - 0.2, c))
+    return rows
+
+
+def _trend_closes(n: int, start: float = 100.0, step: float = 1.0) -> list[float]:
+    return [start + step * i for i in range(n)]
+
+
+_NEW_TECHNICAL_KEYS = (
+    "td_setup",
+    "supertrend_confirmation",
+    "ufx_vervoort_heiken_ashi",
+    "trend_signals_trend_tide",
+    "pivot_levels",
+    "cpr",
+    "ta_candles_trend_health",
+)
+
+_NEW_COMPUTE_FUNCS = {
+    "td_setup": strategies.compute_td_setup,
+    "supertrend_confirmation": strategies.compute_supertrend_confirmation,
+    "ufx_vervoort_heiken_ashi": strategies.compute_ufx_vervoort_heiken_ashi,
+    "trend_signals_trend_tide": strategies.compute_trend_signals_trend_tide,
+    "pivot_levels": strategies.compute_pivot_levels,
+    "cpr": strategies.compute_cpr,
+    "ta_candles_trend_health": strategies.compute_ta_candles_trend_health,
+}
+
+
+class TestNewTechnicalInsufficientAndDegenerateData:
+    @pytest.mark.parametrize("key", _NEW_TECHNICAL_KEYS)
+    def test_empty_prices_return_none(self, key):
+        assert _NEW_COMPUTE_FUNCS[key]([]) is None
+
+    @pytest.mark.parametrize("key", _NEW_TECHNICAL_KEYS)
+    def test_too_few_rows_return_none(self, key):
+        prices = _candle_series(_closes_to_candles(_trend_closes(3)))
+        assert _NEW_COMPUTE_FUNCS[key](prices) is None
+
+    @pytest.mark.parametrize("key", _NEW_TECHNICAL_KEYS)
+    def test_flat_prices_do_not_crash(self, key):
+        prices = _candle_series([(100.0, 100.0, 100.0, 100.0)] * 150)
+        result = _NEW_COMPUTE_FUNCS[key](prices)
+        assert result is not None
+        assert result["chart_data"]  # chart payload still produced
+
+    @pytest.mark.parametrize("key", _NEW_TECHNICAL_KEYS)
+    def test_nan_values_do_not_crash(self, key):
+        rows = _closes_to_candles(_trend_closes(150))
+        rows[40] = (float("nan"),) * 4
+        rows[90] = (float("nan"), 130.0, 120.0, 125.0)  # only open missing
+        prices = _candle_series(rows)
+        result = _NEW_COMPUTE_FUNCS[key](prices)  # must not raise
+        assert result is None or isinstance(result, dict)
+
+
+class TestTdSetup:
+    def test_bearish_setup_completes_at_nine(self):
+        # 13 strictly rising closes -> first comparable bar is index 4, so
+        # indices 4..12 = nine consecutive Close[t] > Close[t-4].
+        prices = _candle_series(_closes_to_candles(_trend_closes(13)))
+        r = strategies.compute_td_setup(prices)
+        assert r["setup_type"] == "Bearish"
+        assert r["setup_count"] == 9
+        assert r["setup_completed"] is True
+        assert r["exhaustion_state"] == "Potential Upside Exhaustion"
+        assert r["comparison_lag_candles"] == 4
+
+    def test_bullish_setup_completes_at_nine(self):
+        prices = _candle_series(_closes_to_candles(_trend_closes(13, 200.0, -1.0)))
+        r = strategies.compute_td_setup(prices)
+        assert r["setup_type"] == "Bullish"
+        assert r["setup_count"] == 9
+        assert r["setup_completed"] is True
+        assert r["exhaustion_state"] == "Potential Downside Exhaustion"
+
+    def test_eight_is_in_progress_not_completed(self):
+        # 12 flat closes (no comparison hits) then 8 rising closes -> count 8.
+        closes = [100.0] * 12 + _trend_closes(8, 101.0)
+        prices = _candle_series(_closes_to_candles(closes))
+        r = strategies.compute_td_setup(prices)
+        assert r["setup_count"] == 8
+        assert r["setup_completed"] is False
+        assert r["exhaustion_state"] == "Setup In Progress"
+        assert r["last_completed_setup_type"] is None
+
+    def test_interruption_by_equal_close_resets_count(self):
+        closes = _trend_closes(12)  # run of 8, last close 111, close[t-4]=107
+        closes.append(closes[-4])  # equal to Close[t-4] -> neither setup
+        r = strategies.compute_td_setup(_candle_series(_closes_to_candles(closes)))
+        assert r["setup_type"] == "None"
+        assert r["setup_count"] == 0
+        assert r["setup_completed"] is False
+        assert r["exhaustion_state"] == "No Active Setup"
+
+    def test_interruption_by_opposite_close_starts_other_setup_at_one(self):
+        closes = _trend_closes(12)
+        closes.append(closes[-4] - 5.0)  # below Close[t-4]
+        r = strategies.compute_td_setup(_candle_series(_closes_to_candles(closes)))
+        assert r["setup_type"] == "Bullish"
+        assert r["setup_count"] == 1
+        assert r["setup_completed"] is False
+
+    def test_nine_is_not_a_buy_or_sell_instruction(self):
+        prices = _candle_series(_closes_to_candles(_trend_closes(13)))
+        r = strategies.compute_td_setup(prices)
+        for forbidden in ("signal", "action", "buy", "sell", "recommendation"):
+            assert not [k for k in r if forbidden in k.lower()]
+
+    def test_tenth_qualifying_candle_keeps_count_capped_at_nine(self):
+        r = strategies.compute_td_setup(
+            _candle_series(_closes_to_candles(_trend_closes(14)))
+        )
+        assert r["setup_count"] == 9
+        assert r["consecutive_qualifying_candles"] == 10
+        assert r["bars_since_completion"] == 1
+
+    def test_last_completed_setup_is_remembered_after_interruption(self):
+        closes = _trend_closes(13)
+        closes.append(closes[-4] - 5.0)
+        r = strategies.compute_td_setup(_candle_series(_closes_to_candles(closes)))
+        assert r["setup_completed"] is False
+        assert r["last_completed_setup_type"] == "Bearish"
+        assert r["last_completed_setup_date"] is not None
+
+    def test_flat_prices_have_no_setup(self):
+        r = strategies.compute_td_setup(
+            _candle_series([(100.0, 100.0, 100.0, 100.0)] * 30)
+        )
+        assert r["setup_type"] == "None" and r["setup_count"] == 0
+
+    def test_missing_close_interrupts_count(self):
+        closes = _trend_closes(20)
+        closes[14] = float("nan")
+        r = strategies.compute_td_setup(_candle_series(_closes_to_candles(closes)))
+        # A missing close breaks the comparison TWICE: on its own bar (14) and
+        # again 4 bars later (18), where it is the Close[t-4] reference.
+        # Bars 15-17 qualify (3), bar 18 cannot be evaluated, bar 19 -> 1.
+        assert r["setup_count"] == 1 and not r["setup_completed"]
+        # ...but the 10-bar run that completed BEFORE the gap is remembered.
+        assert r["last_completed_setup_type"] == "Bearish"
+
+    def test_missing_latest_close_returns_none(self):
+        closes = _trend_closes(20)
+        closes[-1] = float("nan")
+        assert strategies.compute_td_setup(
+            _candle_series(_closes_to_candles(closes))
+        ) is None
+
+
+class TestSupertrendConfirmation:
+    def _uptrend(self, n=60):
+        return _closes_to_candles(_trend_closes(n))
+
+    def test_buy_condition_with_two_green_candles_above_bullish_supertrend(self):
+        r = strategies.compute_supertrend_confirmation(
+            _candle_series(self._uptrend())
+        )
+        assert r["supertrend_trend"] == "Bullish"
+        assert r["price_above_supertrend"] is True
+        assert r["previous_two_candles"] == ["Green", "Green"]
+        assert r["buy_condition_active"] is True
+        assert r["sell_condition_active"] is False
+        assert r["confirmation_state"] == "Buy Confirmed"
+
+    @pytest.mark.parametrize("red_offset", [-2, -3])  # either of the 2 prior candles
+    def test_one_red_prior_candle_blocks_buy_even_though_trend_is_bullish(
+        self, red_offset
+    ):
+        # red_offset indexes the candle list; -1 is the signal candle itself.
+        rows = self._uptrend()
+        o, h, l, c = rows[red_offset]
+        rows[red_offset] = (c + 0.4, h, l, c)  # open above close -> red
+        r = strategies.compute_supertrend_confirmation(_candle_series(rows))
+        # Supertrend is still bullish and price is still above it...
+        assert r["supertrend_trend"] == "Bullish"
+        assert r["price_above_supertrend"] is True
+        # ...but the two-candle confirmation fails, so no condition fires.
+        assert r["buy_condition_active"] is False
+        assert r["confirmation_state"] == "No Confirmation"
+
+    def test_signal_candle_colour_itself_is_not_part_of_the_rule(self):
+        rows = self._uptrend()
+        o, h, l, c = rows[-1]
+        rows[-1] = (c + 0.4, h, l, c)  # signal candle red; prior two green
+        r = strategies.compute_supertrend_confirmation(_candle_series(rows))
+        assert r["buy_condition_active"] is True
+
+    def test_doji_prior_candle_does_not_confirm(self):
+        rows = self._uptrend()
+        o, h, l, c = rows[-2]
+        rows[-2] = (c, h, l, c)  # open == close
+        r = strategies.compute_supertrend_confirmation(_candle_series(rows))
+        assert r["previous_two_candles"][1] == "Neutral"
+        assert r["buy_condition_active"] is False
+
+    def test_missing_open_does_not_confirm(self):
+        rows = self._uptrend()
+        o, h, l, c = rows[-2]
+        rows[-2] = (float("nan"), h, l, c)
+        r = strategies.compute_supertrend_confirmation(_candle_series(rows))
+        assert r["buy_condition_active"] is False
+
+    def test_sell_condition_with_two_red_candles_below_bearish_supertrend(self):
+        rows = _closes_to_candles(_trend_closes(60, 200.0, -1.0), green=False)
+        r = strategies.compute_supertrend_confirmation(_candle_series(rows))
+        assert r["supertrend_trend"] == "Bearish"
+        assert r["price_above_supertrend"] is False
+        assert r["previous_two_candles"] == ["Red", "Red"]
+        assert r["sell_condition_active"] is True
+        assert r["buy_condition_active"] is False
+        assert r["confirmation_state"] == "Sell Confirmed"
+
+    def test_one_green_prior_candle_blocks_sell(self):
+        rows = _closes_to_candles(_trend_closes(60, 200.0, -1.0), green=False)
+        o, h, l, c = rows[-2]
+        rows[-2] = (c - 0.4, h, l, c)  # open below close -> green
+        r = strategies.compute_supertrend_confirmation(_candle_series(rows))
+        assert r["sell_condition_active"] is False
+
+    def test_direction_change_alone_is_not_a_condition(self):
+        # Long uptrend then a violent drop: Supertrend flips bearish, but the
+        # candles right before the flip bar are not red -> no sell condition
+        # on the flip bar, even though `supertrend_flipped_today` is True.
+        closes = _trend_closes(60) + [150.0]
+        rows = _closes_to_candles(closes)
+        o, h, l, c = rows[-1]
+        rows[-1] = (c + 40.0, c + 41.0, c - 1.0, c)  # big red flip candle
+        r = strategies.compute_supertrend_confirmation(_candle_series(rows))
+        assert r["supertrend_trend"] == "Bearish"
+        assert r["supertrend_flipped_today"] is True
+        assert r["sell_condition_active"] is False
+        assert r["confirmation_state"] == "No Confirmation"
+
+    def test_supertrend_helper_flips_direction_on_reversal(self):
+        rows = _closes_to_candles(_trend_closes(40) + _trend_closes(30, 139.0, -3.0))
+        frame = strategies.to_ohlc_frame(_candle_series(rows))
+        st = strategies._supertrend(frame, 10, 3.0)
+        assert st["direction"].dropna().iloc[10] == 1
+        assert st["direction"].iloc[-1] == -1
+        assert st["supertrend"].iloc[:9].isna().all()  # ATR warm-up
+
+    def test_flat_prices_never_confirm(self):
+        r = strategies.compute_supertrend_confirmation(
+            _candle_series([(100.0, 100.0, 100.0, 100.0)] * 60)
+        )
+        assert r["buy_condition_active"] is False
+        assert r["sell_condition_active"] is False
+
+    def test_reuses_existing_atr_helper(self):
+        # Guard against a second ATR implementation creeping in.
+        import inspect
+
+        assert "_atr(" in inspect.getsource(strategies._supertrend)
+
+    def test_chart_data_shape(self):
+        r = strategies.compute_supertrend_confirmation(
+            _candle_series(self._uptrend(250))
+        )
+        assert len(r["chart_data"]) == strategies.CHART_LOOKBACK_DAYS
+        assert set(r["chart_data"][-1]) == {
+            "date",
+            "close",
+            "supertrend",
+            "confirmation_state",
+        }
+
+
+class TestUfxVervoortHeikenAshi:
+    def _v_shape(self):
+        down = _closes_to_candles(_trend_closes(60, 200.0, -1.0), green=False)
+        up = _closes_to_candles(_trend_closes(40, 142.0, 2.0), green=True)
+        return _candle_series(down + up)
+
+    def test_discloses_that_proprietary_indicators_are_not_reproduced(self):
+        r = strategies.compute_ufx_vervoort_heiken_ashi(self._v_shape())
+        assert r["ufx_pro_exact"] is False
+        assert r["vervoort_heiken_ashi_exact"] is False
+        assert "not reproduced" in r["implementation_note"].lower()
+        assert any("Timer Period = 11" in s for s in r["unmapped_source_settings"])
+        assert any("EMA Period = 44" in s for s in r["unmapped_source_settings"])
+        assert r["ufx_atr_period"] == 6 and r["ufx_factor"] == 2.0
+
+    def test_buy_setup_found_on_reversal_with_one_to_one_point_five_risk_reward(self):
+        r = strategies.compute_ufx_vervoort_heiken_ashi(self._v_shape())
+        assert r["last_setup_type"] == "Buy"
+        assert r["risk_reward_ratio"] == 1.5
+        entry, stop, target = (
+            r["last_setup_entry"],
+            r["last_setup_stop"],
+            r["last_setup_target"],
+        )
+        assert stop < entry < target
+        assert (target - entry) == pytest.approx(1.5 * (entry - stop), abs=0.02)
+
+    def test_sell_setup_found_on_downward_reversal(self):
+        up = _closes_to_candles(_trend_closes(60, 100.0, 1.0), green=True)
+        down = _closes_to_candles(_trend_closes(40, 157.0, -2.0), green=False)
+        r = strategies.compute_ufx_vervoort_heiken_ashi(_candle_series(up + down))
+        assert r["last_setup_type"] == "Sell"
+        assert r["last_setup_target"] < r["last_setup_entry"] < r["last_setup_stop"]
+
+    def test_requires_bullish_candle_confirmation(self):
+        # Same reversal but every up-bar is RED (open above close): the stand-in
+        # may flip, but the candle-confirmation leg can never be satisfied.
+        down = _closes_to_candles(_trend_closes(60, 200.0, -1.0), green=False)
+        up = _closes_to_candles(_trend_closes(40, 142.0, 2.0), green=False)
+        r = strategies.compute_ufx_vervoort_heiken_ashi(_candle_series(down + up))
+        assert r["last_setup_type"] != "Buy"
+
+    def test_no_setup_in_steady_trend(self):
+        rows = _closes_to_candles(_trend_closes(120))
+        r = strategies.compute_ufx_vervoort_heiken_ashi(_candle_series(rows))
+        assert r["buy_setup_active"] is False and r["sell_setup_active"] is False
+        assert r["setup_state"] == "No Setup"
+
+    def test_heikin_ashi_standard_formula(self):
+        frame = strategies.to_ohlc_frame(
+            _candle_series([(10, 14, 8, 12), (12, 16, 11, 15), (15, 18, 14, 17)])
+        )
+        ha = strategies._heikin_ashi(frame)
+        assert ha["ha_close"].iloc[0] == pytest.approx((10 + 14 + 8 + 12) / 4)
+        assert ha["ha_open"].iloc[0] == pytest.approx((10 + 12) / 2)
+        assert ha["ha_open"].iloc[1] == pytest.approx(
+            (ha["ha_open"].iloc[0] + ha["ha_close"].iloc[0]) / 2
+        )
+
+
+class TestTrendSignalsTrendTide:
+    def test_proprietary_components_reported_unavailable_and_never_fire(self):
+        rows = _closes_to_candles(_trend_closes(60))
+        r = strategies.compute_trend_signals_trend_tide(_candle_series(rows))
+        assert r["trend_signals_available"] is False
+        assert r["trend_tide_available"] is False
+        assert r["buy_setup_active"] is False and r["sell_setup_active"] is False
+        assert "not approximated" in r["implementation_note"].lower()
+        assert r["risk_reward_ratio"] == 1.5
+
+    def test_reports_only_the_derivable_candle_confirmation(self):
+        up = strategies.compute_trend_signals_trend_tide(
+            _candle_series(_closes_to_candles(_trend_closes(40), green=True))
+        )
+        down = strategies.compute_trend_signals_trend_tide(
+            _candle_series(_closes_to_candles(_trend_closes(40), green=False))
+        )
+        assert up["candle_confirmation"] == "Bullish"
+        assert down["candle_confirmation"] == "Bearish"
+
+
+class TestPivotLevels:
+    def _series_with_prev(self, prev_hlc, last_close, n=12):
+        base = [(100.0, 101.0, 99.0, 100.0)] * (n - 2)
+        h, l, c = prev_hlc
+        last = (last_close, last_close + 1.0, last_close - 1.0, last_close)
+        return _candle_series(base + [(c, h, l, c), last])
+
+    def test_classic_pivot_formulas_hand_calculated(self):
+        # prev H=110, L=90, C=100 -> PP=100, range=20
+        r = strategies.compute_pivot_levels(self._series_with_prev((110, 90, 100), 100))
+        assert r["pivot"] == 100.0
+        assert r["r1"] == 110.0 and r["s1"] == 90.0  # 2PP-L, 2PP-H
+        assert r["r2"] == 120.0 and r["s2"] == 80.0  # PP +/- range
+        assert r["r3"] == 130.0  # H + 2(PP-L)
+        assert r["s3"] == 70.0  # L - 2(H-PP)
+
+    def test_zone_classification(self):
+        upper = strategies.compute_pivot_levels(self._series_with_prev((110, 90, 100), 115))
+        middle = strategies.compute_pivot_levels(self._series_with_prev((110, 90, 100), 100))
+        lower = strategies.compute_pivot_levels(self._series_with_prev((110, 90, 100), 85))
+        assert upper["zone"] == "Upper Zone"
+        assert "short-bias" in upper["zone_context"]
+        assert middle["zone"] == "Middle Zone"
+        assert "avoid overtrading" in middle["zone_context"]
+        assert lower["zone"] == "Lower Zone"
+        assert "long-bias" in lower["zone_context"]
+
+    def test_nearest_support_and_resistance(self):
+        r = strategies.compute_pivot_levels(self._series_with_prev((110, 90, 100), 105))
+        assert r["nearest_resistance_level"] == "R1" and r["nearest_resistance"] == 110.0
+        assert r["nearest_support_level"] == "PIVOT" and r["nearest_support"] == 100.0
+        assert r["distance_to_resistance_percent"] == pytest.approx(4.76, abs=0.01)
+
+    def test_levels_use_previous_candle_only_no_lookahead(self):
+        a = self._series_with_prev((110, 90, 100), 100)
+        b = self._series_with_prev((110, 90, 100), 100)
+        b[-1].high, b[-1].low = 500.0, 1.0  # wild range on the CURRENT bar
+        ra, rb = strategies.compute_pivot_levels(a), strategies.compute_pivot_levels(b)
+        for k in ("pivot", "r1", "r2", "r3", "s1", "s2", "s3"):
+            assert ra[k] == rb[k]
+
+    def test_flat_prices_collapse_levels_without_error(self):
+        r = strategies.compute_pivot_levels(
+            _candle_series([(50.0, 50.0, 50.0, 50.0)] * 10)
+        )
+        assert r["pivot"] == r["r1"] == r["s1"] == 50.0
+        assert r["zone"] == "Middle Zone"
+
+    def test_exposes_zones_not_trade_rules(self):
+        r = strategies.compute_pivot_levels(self._series_with_prev((110, 90, 100), 115))
+        assert not [k for k in r if k.lower() in ("signal", "action", "buy", "sell")]
+
+    def test_minimum_rows(self):
+        rows = [(100.0, 101.0, 99.0, 100.0)] * strategies.MIN_ROWS_PIVOT_LEVELS
+        assert strategies.compute_pivot_levels(_candle_series(rows)) is not None
+        assert strategies.compute_pivot_levels(_candle_series(rows[:-1])) is None
+
+
+class TestCpr:
+    # width = |2C - H - L| / 3, so close at the range midpoint -> zero width,
+    # close at an extreme -> widest.
+    NARROW_BAR = (100.0, 110.0, 90.0, 100.0)  # close at mid
+    WIDE_BAR = (100.0, 110.0, 90.0, 110.0)  # close at high
+
+    def _build(self, history_bar, prev_bar, last_close, n=70, alt_bar=None):
+        rows = [history_bar, alt_bar or self.WIDE_BAR] * ((n - 2) // 2)
+        rows = rows[: n - 2] + [prev_bar, (100.0, 120.0, 80.0, last_close)]
+        return _candle_series(rows)
+
+    def test_cpr_formulas_hand_calculated(self):
+        # prev H=110, L=90, C=104 -> Pivot=101.3333, BC=100, TC=102.6667
+        prev = (100.0, 110.0, 90.0, 104.0)
+        r = strategies.compute_cpr(self._build(self.NARROW_BAR, prev, 101.0))
+        assert r["pivot"] == pytest.approx(101.33, abs=0.01)
+        assert r["top_cpr"] == pytest.approx(102.67, abs=0.01)
+        assert r["bottom_cpr"] == pytest.approx(100.0, abs=0.01)
+        assert r["cpr_width"] == pytest.approx(2.6667, abs=0.001)
+        assert r["cpr_width_percent"] == pytest.approx(2.6316, abs=0.001)
+
+    def test_top_is_max_and_bottom_is_min_when_tc_below_bc(self):
+        # prev close below mid: C=94 -> Pivot=98, BC=100, TC=96 (TC < BC)
+        prev = (100.0, 110.0, 90.0, 94.0)
+        r = strategies.compute_cpr(self._build(self.NARROW_BAR, prev, 99.0))
+        assert r["top_cpr"] == pytest.approx(100.0, abs=0.01)
+        assert r["bottom_cpr"] == pytest.approx(96.0, abs=0.01)
+
+    def test_narrow_width_classification(self):
+        prev = (100.0, 110.0, 90.0, 100.0)  # zero width, below history's 25th pct
+        r = strategies.compute_cpr(self._build(self.WIDE_BAR, prev, 100.0))
+        assert r["cpr_width_class"] == "Narrow"
+        assert r["cpr_width_percentile_rank"] < 25
+        assert "larger move" in r["cpr_width_interpretation"]
+
+    def test_typical_width_in_uniform_history_is_not_misclassified(self):
+        # Current width equals every other width (all max): a typical day,
+        # not an outlier -> Normal, never Narrow/Wide.
+        prev = (100.0, 110.0, 90.0, 110.0)
+        r = strategies.compute_cpr(self._build(self.WIDE_BAR, prev, 100.0))
+        assert r["cpr_width_class"] == "Normal"
+
+    def test_wide_width_classification(self):
+        prev = (100.0, 110.0, 90.0, 110.0)  # widest possible for this range
+        # history is uniformly zero-width, so this day is the lone outlier
+        r = strategies.compute_cpr(
+            self._build(self.NARROW_BAR, prev, 100.0, alt_bar=self.NARROW_BAR)
+        )
+        assert r["cpr_width_class"] == "Wide"
+        assert r["cpr_width_percentile_rank"] > 75
+        assert "range-bound" in r["cpr_width_interpretation"]
+
+    def test_price_above_cpr_is_bullish_bias_with_top_as_support(self):
+        prev = (100.0, 110.0, 90.0, 104.0)
+        r = strategies.compute_cpr(self._build(self.NARROW_BAR, prev, 108.0))
+        assert r["price_position"] == "Above CPR"
+        assert r["market_bias"] == "Bullish Day Bias"
+        assert r["cpr_support"] == r["top_cpr"] and r["cpr_resistance"] is None
+
+    def test_price_below_cpr_is_bearish_bias_with_bottom_as_resistance(self):
+        prev = (100.0, 110.0, 90.0, 104.0)
+        r = strategies.compute_cpr(self._build(self.NARROW_BAR, prev, 95.0))
+        assert r["price_position"] == "Below CPR"
+        assert r["market_bias"] == "Bearish Day Bias"
+        assert r["cpr_resistance"] == r["bottom_cpr"] and r["cpr_support"] is None
+
+    def test_price_inside_cpr_is_neutral(self):
+        prev = (100.0, 110.0, 90.0, 104.0)
+        r = strategies.compute_cpr(self._build(self.NARROW_BAR, prev, 101.0))
+        assert r["price_position"] == "Inside CPR"
+        assert r["market_bias"] == "Neutral"
+        assert r["cpr_support"] == r["bottom_cpr"]
+        assert r["cpr_resistance"] == r["top_cpr"]
+
+    def test_flat_history_has_no_width_dispersion_so_is_normal(self):
+        r = strategies.compute_cpr(
+            _candle_series([(100.0, 100.0, 100.0, 100.0)] * 80)
+        )
+        assert r["cpr_width_class"] == "Normal"
+        assert r["cpr_width_percentile_rank"] == 50.0
+        assert r["market_bias"] == "Neutral"
+
+    def test_cpr_uses_previous_candle_not_current(self):
+        prev = (100.0, 110.0, 90.0, 104.0)
+        a = self._build(self.NARROW_BAR, prev, 101.0)
+        b = self._build(self.NARROW_BAR, prev, 101.0)
+        b[-1].high, b[-1].low = 999.0, 1.0
+        assert strategies.compute_cpr(a)["top_cpr"] == strategies.compute_cpr(b)["top_cpr"]
+
+    def test_minimum_rows_boundary(self):
+        rows = [(100.0, 101.0, 99.0, 100.0)] * strategies.MIN_ROWS_CPR
+        assert strategies.compute_cpr(_candle_series(rows)) is not None
+        assert strategies.compute_cpr(_candle_series(rows[:-1])) is None
+
+
+class TestTaCandlesTrendHealth:
+    def test_discloses_it_is_not_the_tradingview_indicator(self):
+        rows = _closes_to_candles(_trend_closes(120))
+        r = strategies.compute_ta_candles_trend_health(_candle_series(rows))
+        assert r["is_exact_tradingview_indicator"] is False
+        assert "NOT reproduced" in r["methodology_note"]
+
+    def test_continuous_green_uptrend_is_healthy_and_aligned(self):
+        rows = _closes_to_candles(_trend_closes(120), green=True)
+        r = strategies.compute_ta_candles_trend_health(_candle_series(rows))
+        assert r["trend"] == "Bullish"
+        assert r["momentum_state"] == "Positive"
+        assert r["green_candle_ratio"] == 1.0
+        assert r["strength_alignment"] == "Aligned Bullish"
+        assert r["trend_health_state"] == "Healthy Trend (Bullish)"
+        assert r["current_candle_streak"] >= 10
+        assert r["current_candle_streak_colour"] == "Green"
+
+    def test_continuous_red_downtrend_is_healthy_bearish(self):
+        rows = _closes_to_candles(_trend_closes(120, 300.0, -1.0), green=False)
+        r = strategies.compute_ta_candles_trend_health(_candle_series(rows))
+        assert r["trend"] == "Bearish"
+        assert r["trend_health_state"] == "Healthy Trend (Bearish)"
+
+    def test_sudden_weakness_in_uptrend_is_flagged_weakening(self):
+        closes = _trend_closes(100, 100.0, 1.0)
+        closes += [closes[-1] - 0.1 * (i + 1) for i in range(8)]  # shallow drift down
+        flags = [True] * 100 + [False] * 8  # red candles
+        rows = _closes_to_candles(closes, green=flags)
+        r = strategies.compute_ta_candles_trend_health(_candle_series(rows))
+        assert r["trend"] == "Bullish"
+        assert r["green_candle_ratio"] < 0.5
+        assert r["trend_health_state"] == "Weakening Bullish Trend"
+
+    def test_choppy_market_is_flagged_caution(self):
+        closes = [100.0 + (2.0 if i % 2 else -2.0) for i in range(120)]
+        flags = [i % 2 == 1 for i in range(120)]
+        rows = _closes_to_candles(closes, green=flags)
+        r = strategies.compute_ta_candles_trend_health(_candle_series(rows))
+        assert r["trend"] == "Mixed"  # EMAs not separated in a sideways market
+        assert r["trend_health_state"] == "Choppy - Caution"
+        assert r["strength_alignment"] == "Mixed"
+
+    def test_volatility_state_expanding_on_range_blowout(self):
+        rows = _closes_to_candles(_trend_closes(110, 100.0, 0.05))
+        for i in range(-5, 0):  # last 5 bars: huge ranges
+            o, h, l, c = rows[i]
+            rows[i] = (o, c + 15.0, c - 15.0, c)
+        r = strategies.compute_ta_candles_trend_health(_candle_series(rows))
+        assert r["volatility_state"] == "Expanding"
+
+    def test_reuses_existing_ema_and_atr_helpers(self):
+        import inspect
+
+        src = inspect.getsource(strategies.compute_ta_candles_trend_health)
+        assert "_ema(" in src and "_atr(" in src
+
+
+class TestNewTechnicalStrategiesRegistration:
+    """The seven additions must live in the EXISTING Technical Strategies
+    category - not in another category and not in a new one."""
+
+    def test_all_seven_are_in_technical_strategies(self):
+        from app.schemas import TechnicalStrategies
+
+        for key in _NEW_TECHNICAL_KEYS:
+            assert key in TechnicalStrategies.model_fields, key
+
+    def test_none_are_in_other_categories(self):
+        from app.schemas import (
+            CalendarStrategies,
+            PortfolioStrategies,
+            QuantitativeStrategies,
+            RegimeStrategies,
+        )
+
+        for model in (
+            QuantitativeStrategies,
+            RegimeStrategies,
+            CalendarStrategies,
+            PortfolioStrategies,
+        ):
+            for key in _NEW_TECHNICAL_KEYS:
+                assert key not in model.model_fields, (model.__name__, key)
+
+    def test_no_new_category_was_created(self):
+        from app.schemas import StrategyAnalytics
+
+        category_fields = {
+            name for name in StrategyAnalytics.model_fields if name.endswith("_strategies")
+        }
+        assert category_fields == {
+            "technical_strategies",
+            "quantitative_strategies",
+            "regime_strategies",
+            "calendar_strategies",
+            "portfolio_strategies",
+        }
+
+    def test_flat_fields_exist_for_backward_compatible_consumers(self):
+        from app.schemas import StrategyAnalytics
+
+        for key in _NEW_TECHNICAL_KEYS:
+            assert key in StrategyAnalytics.model_fields, key
+
+    def test_existing_technical_keys_are_unchanged(self):
+        from app.schemas import TechnicalStrategies
+
+        for key in (
+            "ema50_rsi",
+            "ema821",
+            "macd",
+            "bollinger_bands",
+            "better_breakout",
+            "sma_trend",
+            "triple_ma_pullback",
+            "mswing",
+        ):
+            assert key in TechnicalStrategies.model_fields
+
+    def test_computed_output_validates_against_response_schemas(self):
+        from app.schemas import StrategyAnalytics
+
+        rng = random.Random(7)
+        closes, c = [], 100.0
+        for _ in range(260):
+            c = max(5.0, c + rng.uniform(-1.5, 1.7))
+            closes.append(c)
+        flags = [rng.random() > 0.45 for _ in closes]
+        prices = _candle_series(_closes_to_candles(closes, green=flags))
+
+        payload = {k: f(prices) for k, f in _NEW_COMPUTE_FUNCS.items()}
+        assert all(v is not None for v in payload.values())
+        model = StrategyAnalytics.model_validate(
+            {**payload, "technical_strategies": dict(payload)}
+        )
+        dumped = model.model_dump(by_alias=True)
+        assert dumped["tdSetup"]["setupCount"] is not None
+        assert dumped["cpr"]["topCpr"] is not None
+        for camel in (
+            "tdSetup",
+            "supertrendConfirmation",
+            "ufxVervoortHeikenAshi",
+            "trendSignalsTrendTide",
+            "pivotLevels",
+            "cpr",
+            "taCandlesTrendHealth",
+        ):
+            assert dumped["technicalStrategies"][camel] is not None
+
+
+class TestStrategyEndpointIncludesNewTechnicalStrategies:
+    """End-to-end through the REAL /etfs/{symbol}/strategies route (only the
+    DB / Redis / cross-ETF loaders are stubbed)."""
+
+    @staticmethod
+    def _client(n_rows):
+        from unittest.mock import AsyncMock, patch
+
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        from app.database import get_db
+        from app.routers import strategy as strategy_router
+
+        rng = random.Random(11)
+        closes, c = [], 100.0
+        for _ in range(n_rows):
+            c = max(5.0, c + rng.uniform(-1.5, 1.7))
+            closes.append(c)
+        flags = [rng.random() > 0.45 for _ in closes]
+        prices = _candle_series(_closes_to_candles(closes, green=flags))
+
+        app = FastAPI()
+        app.include_router(strategy_router.router)
+        app.dependency_overrides[get_db] = lambda: None
+
+        patches = [
+            patch.object(strategy_router, "load_prices", AsyncMock(return_value=prices)),
+            patch.object(strategy_router.cache, "get_json", AsyncMock(return_value=None)),
+            patch.object(strategy_router.cache, "set_json", AsyncMock(return_value=None)),
+            patch.object(
+                strategy_router.cache, "get_or_compute", AsyncMock(return_value=None)
+            ),
+            patch.object(
+                strategy_router.regime, "extract_symbol_view", lambda *_a, **_k: None
+            ),
+            patch.object(
+                strategy_router.strategies,
+                "extract_factor_momentum_view",
+                lambda *_a, **_k: None,
+            ),
+        ]
+        return TestClient(app), patches
+
+    def _get(self, n_rows):
+        client, patches = self._client(n_rows)
+        for p in patches:
+            p.start()
+        try:
+            return client.get("/etfs/VOO/strategies")
+        finally:
+            for p in patches:
+                p.stop()
+
+    def test_all_seven_appear_under_technical_strategies_only(self):
+        res = self._get(300)
+        assert res.status_code == 200
+        data = res.json()["data"]
+        technical = data["technicalStrategies"]
+        for camel in (
+            "tdSetup",
+            "supertrendConfirmation",
+            "ufxVervoortHeikenAshi",
+            "trendSignalsTrendTide",
+            "pivotLevels",
+            "cpr",
+            "taCandlesTrendHealth",
+        ):
+            assert technical[camel] is not None, camel
+            assert data[camel] == technical[camel]  # flat field mirrors group
+            for other in (
+                "quantitativeStrategies",
+                "regimeStrategies",
+                "calendarStrategies",
+                "portfolioStrategies",
+            ):
+                assert camel not in (data.get(other) or {}), (other, camel)
+        assert "indicatorStrategies" not in data
+
+    def test_existing_flat_and_grouped_fields_still_present(self):
+        data = self._get(300).json()["data"]
+        assert data["macd"] is not None
+        assert data["technicalStrategies"]["macd"] is not None
+        assert data["quantitativeStrategies"]["evarRisk"] is not None
+
+    def test_insufficient_history_reports_new_strategies_in_message(self):
+        res = self._get(30)
+        assert res.status_code == 200
+        body = res.json()
+        assert body["data"]["tdSetup"] is not None  # 30 rows is enough for TD 9
+        assert body["data"]["cpr"] is None  # needs 61
+        assert "CPR (Central Pivot Range)" in body["message"]
+        assert "TA Candles / Trend Health" in body["message"]
+        assert "TD Setup / TD 9" not in body["message"]
