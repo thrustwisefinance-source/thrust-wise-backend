@@ -71,6 +71,15 @@ class StockFundamentalsSnapshot(Base):
     )
     percent_institutions: Mapped[float | None] = mapped_column(Float, nullable=True)
 
+    # --- Valuation inputs (Graham valuation / Greenblatt Magic Formula) ---
+    # JSON object (see app.scanners.data.extract_valuation_inputs for the
+    # exact shape): EBIT, balance-sheet components, market cap / debt /
+    # cash / enterprise value, trailing EPS and the forward growth
+    # estimate - each with its reporting period and provider provenance.
+    # Kept as one serialized field (same precedent as
+    # annual_eps_history_json) so provenance travels with each value.
+    valuation_inputs_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     # --- Freshness bookkeeping (see module docstring) ---
     fundamental_period: Mapped[str | None] = mapped_column(
         String(20), nullable=True

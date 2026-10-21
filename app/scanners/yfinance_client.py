@@ -146,6 +146,20 @@ def _fetch_annual_income_stmt_sync(symbol: str) -> pd.DataFrame | None:
     return df
 
 
+def _fetch_balance_sheet_sync(symbol: str) -> pd.DataFrame | None:
+    df = yf.Ticker(symbol).balance_sheet
+    if df is None or df.empty:
+        return None
+    return df
+
+
+def _fetch_growth_estimates_sync(symbol: str) -> pd.DataFrame | None:
+    df = yf.Ticker(symbol).growth_estimates
+    if df is None or df.empty:
+        return None
+    return df
+
+
 def _fetch_institutional_holders_sync(symbol: str) -> pd.DataFrame | None:
     df = yf.Ticker(symbol).institutional_holders
     if df is None or df.empty:
@@ -205,6 +219,26 @@ async def fetch_annual_income_stmt(symbol: str) -> pd.DataFrame | None:
     """
     return await _run_with_retry(
         _fetch_annual_income_stmt_sync, symbol, log_ctx=f"income_stmt:{symbol}"
+    )
+
+
+async def fetch_balance_sheet(symbol: str) -> pd.DataFrame | None:
+    """Annual balance sheet (line items x fiscal-year-end columns). Used
+    only by the Greenblatt Magic Formula inputs (net working capital, net
+    PP&E). None on any failure - never raises.
+    """
+    return await _run_with_retry(
+        _fetch_balance_sheet_sync, symbol, log_ctx=f"balance_sheet:{symbol}"
+    )
+
+
+async def fetch_growth_estimates(symbol: str) -> pd.DataFrame | None:
+    """Yahoo's analyst growth estimates (rows = periods such as "+5y",
+    column "stockTrend" = this stock's estimate as a decimal fraction).
+    Used only by the Graham valuation's forward growth input.
+    """
+    return await _run_with_retry(
+        _fetch_growth_estimates_sync, symbol, log_ctx=f"growth_estimates:{symbol}"
     )
 
 

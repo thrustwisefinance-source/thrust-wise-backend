@@ -51,6 +51,7 @@ import asyncio
 import datetime
 import json
 import logging
+import math
 from dataclasses import dataclass
 
 import pandas as pd
@@ -211,6 +212,191 @@ def _annual_eps_dict_from_income_stmt(df: pd.DataFrame | None) -> dict:
     return result
 
 
+# ---------------------------------------------------------------------------
+# Valuation inputs (Graham valuation / Greenblatt Magic Formula) - ADDITIVE.
+# Extracted from the SAME yfinance fetch as the CANSLIM fundamentals above
+# (plus the annual balance sheet and growth estimates) and stored, with
+# per-value period/provenance, in StockFundamentalsSnapshot.
+# valuation_inputs_json. Nothing here changes the CANSLIM extraction.
+# ---------------------------------------------------------------------------
+
+VALUATION_INPUTS_SCHEMA_VERSION = 1
+YFINANCE_SOURCE = "Yahoo Finance via yfinance"
+# Yahoo's earningsTrend period for the long-term (next ~5 years, per annum)
+# analyst growth estimate; column "stockTrend" is this stock's own estimate
+# as a decimal fraction (0.12 = 12%).
+GROWTH_ESTIMATE_PERIOD = "+5y"
+GROWTH_ESTIMATE_COLUMN = "stockTrend"
+
+
+def _num_or_none(value) -> float | None:
+    """float(value) if it is a real finite number, else None (NaN/inf/None/bool -> None)."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _statement_columns_latest_first(df: pd.DataFrame) -> list:
+    return sorted(df.columns, key=lambda c: str(c), reverse=True)
+
+
+def _column_period(column) -> str:
+    return column.date().isoformat() if hasattr(column, "date") else str(column)[:10]
+
+
+def _statement_row_value(df: pd.DataFrame, column, labels: tuple[str, ...]) -> tuple[str | None, float | None]:
+    """(label used, value) for the first of `labels` present with a real value in `column`."""
+    for label in labels:
+        if label in df.index:
+            value = _num_or_none(df.at[label, column])
+            if value is not None:
+                return label, value
+    return None, None
+
+
+def extract_ebit(income_df: pd.DataFrame | None) -> dict | None:
+    """Latest annual EBIT (fallback: Operating Income, labelled as such) and
+    its fiscal-period end date, from yfinance's annual income statement."""
+    if income_df is None or income_df.empty:
+        return None
+    for column in _statement_columns_latest_first(income_df):
+        label, value = _statement_row_value(income_df, column, ("EBIT", "Operating Income"))
+        if value is not None:
+            return {"value": value, "period": _column_period(column), "label": label}
+    return None
+
+
+def extract_balance_sheet_components(balance_df: pd.DataFrame | None) -> dict | None:
+    """Magic Formula balance-sheet components from the latest annual column
+    that has any of them. Every component comes from that ONE column
+    (a single period); a component not reported there stays None - it is
+    never back-filled from a different period or defaulted to 0."""
+    if balance_df is None or balance_df.empty:
+        return None
+    spec = {
+        "current_assets": ("Current Assets",),
+        "cash": ("Cash Cash Equivalents And Short Term Investments", "Cash And Cash Equivalents"),
+        "current_liabilities": ("Current Liabilities",),
+        "current_debt": ("Current Debt And Capital Lease Obligation", "Current Debt"),
+        "net_ppe": ("Net PPE",),
+    }
+    for column in _statement_columns_latest_first(balance_df):
+        values, labels = {}, {}
+        for key, candidates in spec.items():
+            labels[key], values[key] = _statement_row_value(balance_df, column, candidates)
+        if any(v is not None for v in values.values()):
+            return {"period": _column_period(column), **values, "labels": labels}
+    return None
+
+
+def extract_forward_growth(growth_df: pd.DataFrame | None) -> dict | None:
+    """Analyst long-term growth estimate in PERCENT units, with its horizon."""
+    if growth_df is None or GROWTH_ESTIMATE_PERIOD not in growth_df.index:
+        return None
+    if GROWTH_ESTIMATE_COLUMN not in growth_df.columns:
+        return None
+    fraction = _num_or_none(growth_df.at[GROWTH_ESTIMATE_PERIOD, GROWTH_ESTIMATE_COLUMN])
+    if fraction is None:
+        return None
+    return {
+        "percent": fraction * 100.0,
+        "horizon": "next 5 years (per annum)",
+        "source": f"{YFINANCE_SOURCE} - analyst consensus growth estimate (earningsTrend {GROWTH_ESTIMATE_PERIOD})",
+    }
+
+
+def historical_eps_cagr_percent(annual_eps_history: list[dict]) -> dict | None:
+    """Historical annual-EPS CAGR (percent) - ONLY a labelled proxy for
+    growth when no forward estimate exists. Needs >= 3 fiscal years with a
+    positive first and last EPS; otherwise None (never fabricated)."""
+    points = [p for p in (annual_eps_history or []) if _num_or_none(p.get("eps")) is not None]
+    if len(points) < 3:
+        return None
+    first, last = points[0], points[-1]
+    years = int(last["year"]) - int(first["year"])
+    if years <= 0 or first["eps"] <= 0 or last["eps"] <= 0:
+        return None
+    cagr = ((last["eps"] / first["eps"]) ** (1.0 / years) - 1.0) * 100.0
+    return {"percent": cagr, "years": years, "from_year": first["year"], "to_year": last["year"]}
+
+
+def extract_valuation_inputs(
+    info: dict | None,
+    income_df: pd.DataFrame | None,
+    balance_df: pd.DataFrame | None,
+    growth_df: pd.DataFrame | None,
+    extracted_at: datetime.datetime | None = None,
+) -> dict:
+    """Assemble the valuation-inputs payload (see module section comment).
+    Every field may be None: partial provider data is stored as-is and the
+    strategy functions turn missing inputs into an explicit UNAVAILABLE."""
+    info = info or {}
+    now = extracted_at or datetime.datetime.now(datetime.timezone.utc)
+    return {
+        "schema_version": VALUATION_INPUTS_SCHEMA_VERSION,
+        "source": YFINANCE_SOURCE,
+        "extracted_at": now.isoformat(),
+        "price_currency": info.get("currency"),
+        "financial_currency": info.get("financialCurrency"),
+        "market_cap": _num_or_none(info.get("marketCap")),
+        "enterprise_value": _num_or_none(info.get("enterpriseValue")),
+        "total_debt": _num_or_none(info.get("totalDebt")),
+        "total_cash": _num_or_none(info.get("totalCash")),
+        "trailing_eps": _num_or_none(info.get("trailingEps")),
+        "ebit": extract_ebit(income_df),
+        "balance_sheet": extract_balance_sheet_components(balance_df),
+        "forward_growth": extract_forward_growth(growth_df),
+    }
+
+
+def valuation_inputs_from_snapshot(snapshot: StockFundamentalsSnapshot | None) -> dict | None:
+    if snapshot is None or not snapshot.valuation_inputs_json:
+        return None
+    try:
+        loaded = json.loads(snapshot.valuation_inputs_json)
+    except (TypeError, ValueError):
+        return None
+    return loaded if isinstance(loaded, dict) else None
+
+
+def build_magic_formula_candidate(
+    symbol: str,
+    company_name: str | None,
+    sector: str | None,
+    industry: str | None,
+    inputs: dict | None,
+) -> dict:
+    """Flatten stored valuation inputs into the raw-input dict
+    app.services.strategies.compute_magic_formula_metrics expects."""
+    base = {"symbol": symbol, "company_name": company_name, "sector": sector, "industry": industry}
+    if not inputs:
+        return {**base, "no_data": True}
+    ebit = inputs.get("ebit") or {}
+    bs = inputs.get("balance_sheet") or {}
+    return {
+        **base,
+        "ebit": ebit.get("value"),
+        "ebit_period": ebit.get("period"),
+        "ebit_label": ebit.get("label"),
+        "reported_enterprise_value": inputs.get("enterprise_value"),
+        "market_cap": inputs.get("market_cap"),
+        "total_debt": inputs.get("total_debt"),
+        "total_cash": inputs.get("total_cash"),
+        "current_assets": bs.get("current_assets"),
+        "cash": bs.get("cash"),
+        "current_liabilities": bs.get("current_liabilities"),
+        "current_debt": bs.get("current_debt"),
+        "net_ppe": bs.get("net_ppe"),
+        "balance_sheet_period": bs.get("period"),
+        "financial_currency": inputs.get("financial_currency"),
+        "price_currency": inputs.get("price_currency"),
+    }
+
+
 async def fetch_and_extract_fundamentals_for_symbol(symbol: str) -> dict | None:
     """One symbol's full fundamentals fetch + extraction via yfinance.
 
@@ -223,11 +409,20 @@ async def fetch_and_extract_fundamentals_for_symbol(symbol: str) -> dict | None:
     encodes it, same as before), or None if yfinance returned nothing
     usable at all for this symbol.
     """
-    info, earnings_dates_df, annual_income_df, holders_df = await asyncio.gather(
+    (
+        info,
+        earnings_dates_df,
+        annual_income_df,
+        holders_df,
+        balance_sheet_df,
+        growth_estimates_df,
+    ) = await asyncio.gather(
         yfinance_client.fetch_info(symbol),
         yfinance_client.fetch_earnings_dates(symbol),
         yfinance_client.fetch_annual_income_stmt(symbol),
         yfinance_client.fetch_institutional_holders(symbol),
+        yfinance_client.fetch_balance_sheet(symbol),
+        yfinance_client.fetch_growth_estimates(symbol),
     )
 
     if info is None and earnings_dates_df is None and annual_income_df is None:
@@ -279,6 +474,11 @@ async def fetch_and_extract_fundamentals_for_symbol(symbol: str) -> dict | None:
         "percent_institutions": percent_institutions,
         "fundamental_period": eps_current_period,
         "fundamentals_as_of": fundamentals_as_of,
+        # Graham / Magic Formula inputs (dict here; JSON-encoded by the
+        # caller like annual_eps_history). Additive - CANSLIM ignores it.
+        "valuation_inputs": extract_valuation_inputs(
+            info, annual_income_df, balance_sheet_df, growth_estimates_df
+        ),
     }
 
 
@@ -330,6 +530,7 @@ async def refresh_fundamentals_snapshots(
 
             annual_history = fields.pop("annual_eps_history")
             fields["annual_eps_history_json"] = json.dumps(annual_history)
+            fields["valuation_inputs_json"] = json.dumps(fields.pop("valuation_inputs"))
 
             try:
                 async with AsyncSessionLocal() as session:

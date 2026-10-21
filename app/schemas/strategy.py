@@ -5,6 +5,8 @@ Analytical / visualization data only — no signal, action, or
 recommendation fields anywhere in this module.
 """
 
+from pydantic import Field
+
 from app.schemas.common import CamelModel
 
 
@@ -971,6 +973,125 @@ class TaCandlesTrendHealthStrategy(CamelModel):
 
 
 # ---------------------------------------------------------------------------
+# Strategies 27-28: fundamental-valuation QUANTITATIVE strategies. Unlike the
+# strategies above these are not functions of the requested ETF's price
+# history: Graham valuation is per-stock, the Magic Formula is a ranking over
+# a stock universe. Both always return an object whose `status` is
+# "available" or "unavailable" (never silently null). Analytical only - no
+# buy/sell field. See services.strategies Strategies 27-28.
+# ---------------------------------------------------------------------------
+
+
+class GrahamSensitivityScenario(CamelModel):
+    scenario: str
+    growth_percent: float | None = None
+    estimated_value: float | None = None
+    upside_downside_percent: float | None = None
+
+
+class GrahamValuationStrategy(CamelModel):
+    """Graham growth-valuation estimate: EPS x (8.5 + 2g) x (4.4 / Y).
+
+    `g` and `Y` are percent-unit numbers (8 = 8%). Growth is capped at
+    `max_growth_percent` (raw value kept in `growth_percent_raw`).
+    `growth_basis` says whether growth is a forward analyst estimate or a
+    labelled historical-CAGR proxy. Not an intrinsic-value guarantee and not
+    a price prediction. Per-stock: for an ETF symbol (or a stock without
+    usable inputs) `status` is "unavailable" with `unavailable_reasons`.
+    """
+
+    status: str  # "available" | "unavailable"
+    unavailable_reasons: list[str] = Field(default_factory=list)
+    symbol: str | None = None
+    estimated_value: float | None = None
+    eps: float | None = None
+    eps_period: str | None = None
+    eps_basis: str | None = None
+    growth_percent_raw: float | None = None
+    growth_percent_applied: float | None = None
+    growth_basis: str | None = None  # "forward_analyst_consensus" | "historical_eps_cagr_proxy"
+    growth_source: str | None = None
+    growth_horizon: str | None = None
+    max_growth_percent: float | None = None
+    aaa_yield_percent: float | None = None
+    aaa_yield_source: str | None = None
+    aaa_yield_as_of: str | None = None
+    baseline_yield_percent: float | None = None
+    formula: str | None = None
+    market_price: float | None = None
+    market_price_as_of: str | None = None
+    difference_abs: float | None = None
+    upside_downside_percent: float | None = None
+    difference_definition: str | None = None
+    margin_of_safety_percent: float | None = None
+    margin_of_safety_price: float | None = None
+    price_within_margin_of_safety: bool | None = None
+    sensitivity: list[GrahamSensitivityScenario] = Field(default_factory=list)
+    data_quality_warnings: list[str] = Field(default_factory=list)
+    disclaimer: str | None = None
+
+
+class MagicFormulaRow(CamelModel):
+    """One stock's Magic Formula factors and ranks. Percent fields are
+    percent units (12.5 = 12.5%). Ranks are null unless `ranked` is true;
+    `exclusion_reason` says why a stock was not ranked."""
+
+    symbol: str | None = None
+    company_name: str | None = None
+    sector: str | None = None
+    industry: str | None = None
+    ebit: float | None = None
+    ebit_period: str | None = None
+    ebit_basis: str | None = None
+    enterprise_value: float | None = None
+    enterprise_value_source: str | None = None
+    earnings_yield_percent: float | None = None
+    earnings_yield_status: str | None = None
+    earnings_yield_unavailable_reason: str | None = None
+    net_working_capital: float | None = None
+    net_fixed_assets: float | None = None
+    invested_capital: float | None = None
+    balance_sheet_period: str | None = None
+    return_on_capital_percent: float | None = None
+    return_on_capital_status: str | None = None
+    return_on_capital_unavailable_reason: str | None = None
+    earnings_yield_rank: int | None = None
+    return_on_capital_rank: int | None = None
+    combined_rank: int | None = None
+    overall_position: int | None = None
+    ranked: bool = False
+    exclusion_reason: str | None = None
+    data_quality_warnings: list[str] = Field(default_factory=list)
+
+
+class GreenblattMagicFormulaStrategy(CamelModel):
+    """Greenblatt Magic Formula ranking over a stock universe (cross-
+    sectional, like Factor Momentum it is computed once and cached, and
+    shown on every symbol's response). `top_ranked` holds the best
+    `top_n` rows by combined rank (lower is better); `requested_symbol_result`
+    is the requested stock's own row when the request was for a stock in the
+    universe. A relative ranking only - not an absolute quality guarantee.
+    """
+
+    status: str  # "available" | "unavailable"
+    unavailable_reasons: list[str] = Field(default_factory=list)
+    universe: str | None = None
+    universe_label: str | None = None
+    universe_size: int | None = None
+    eligible_universe_definition: str | None = None
+    ranked_count: int | None = None
+    excluded_count: int | None = None
+    excluded_by_reason: dict[str, int] = Field(default_factory=dict)
+    top_n: int | None = None
+    top_ranked: list[MagicFormulaRow] = Field(default_factory=list)
+    requested_symbol_result: MagicFormulaRow | None = None
+    methodology: list[str] = Field(default_factory=list)
+    data_updated_at: str | None = None
+    data_quality_warnings: list[str] = Field(default_factory=list)
+    disclaimer: str | None = None
+
+
+# ---------------------------------------------------------------------------
 # Strategy categories (see section 10/11 of the reorg spec).
 #
 # These are an ADDITIVE, category-organized view of the exact same data
@@ -1007,6 +1128,8 @@ class QuantitativeStrategies(CamelModel):
     soc_avalanche: SocAvalancheStrategy | None = None
     wavelet_trend_filter: WaveletTrendStrategy | None = None
     first_passage_time: FirstPassageTimeStrategy | None = None
+    graham_valuation: GrahamValuationStrategy | None = None
+    greenblatt_magic_formula: GreenblattMagicFormulaStrategy | None = None
 
 
 class RegimeStrategies(CamelModel):
@@ -1088,6 +1211,11 @@ class StrategyAnalytics(CamelModel):
     pivot_levels: PivotLevelsStrategy | None = None
     cpr: CprStrategy | None = None
     ta_candles_trend_health: TaCandlesTrendHealthStrategy | None = None
+    # Strategies 27-28 (Quantitative, fundamental valuation): Graham
+    # growth-valuation (per-stock) and Greenblatt Magic Formula (stock-
+    # universe ranking). Always an object with a `status`, never silently null.
+    graham_valuation: GrahamValuationStrategy | None = None
+    greenblatt_magic_formula: GreenblattMagicFormulaStrategy | None = None
 
     # Category-organized view of the SAME strategies above (additive —
     # see the "Strategy categories" note preceding TechnicalStrategies).

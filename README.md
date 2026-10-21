@@ -42,6 +42,15 @@ backend set:
 | `EODHD_API_TOKEN` | Company EODHD account token |
 | `CORS_ORIGINS` | Must include `https://thrustwise-finance-ui.vercel.app` |
 | `ENVIRONMENT` | `production` (disables SQL echo logging) |
+| `GRAHAM_AAA_YIELD_PERCENT` | Optional. AAA corporate bond yield in percent units (`5.1` = 5.1%) for the `graham_valuation` strategy. No data source exists in this backend, so when unset the strategy reports `unavailable` (no default is assumed). |
+| `GRAHAM_AAA_YIELD_AS_OF` / `GRAHAM_AAA_YIELD_SOURCE` | Optional. Observation date (e.g. `2026-10-20`) and source label for that yield, echoed in the response. |
+| `GRAHAM_MARGIN_OF_SAFETY_PERCENT` | Optional, default `30`. Margin of safety applied to the Graham estimate. |
+
+`graham_valuation` and `greenblatt_magic_formula` (Quantitative) are returned by the existing
+`GET /api/etfs/{symbol}/strategies` route (fields `grahamValuation`, `greenblattMagicFormula`, and
+inside `quantitativeStrategies`). Graham needs a **stock** symbol from an ingested universe (e.g. `AAPL`);
+Magic Formula ranks that universe and is attached to every response. Both need the scanner refresh
+(`POST /api/admin/scanners/refresh`) to have run after migration `0004` (`alembic upgrade head`).
 
 ## Running locally
 

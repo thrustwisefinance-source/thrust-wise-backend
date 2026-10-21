@@ -50,6 +50,21 @@ class Settings(BaseSettings):
     # re-downloading years of daily bars on every scanner refresh.
     scanner_price_history_years: int = 2
 
+    # --- Graham growth-valuation formula (strategy `graham_valuation`) ---
+    # The AAA corporate bond yield (percent units: 5.1 means 5.1%) has NO
+    # data source in this backend (and no new provider is added for it), so
+    # it is operator-supplied. When unset, graham_valuation reports
+    # status "unavailable" - no default yield is ever assumed. Set
+    # GRAHAM_AAA_YIELD_PERCENT together with GRAHAM_AAA_YIELD_AS_OF
+    # (observation date, e.g. 2026-10-20) and, ideally,
+    # GRAHAM_AAA_YIELD_SOURCE (e.g. "Moody's Seasoned Aaa, FRED series AAA").
+    graham_aaa_yield_percent: float | None = None
+    graham_aaa_yield_as_of: str = ""
+    graham_aaa_yield_source: str = "Operator-configured (GRAHAM_AAA_YIELD_PERCENT)"
+    # Margin of safety (percent below the estimated value) used for the
+    # margin-of-safety price and price_within_margin_of_safety flag.
+    graham_margin_of_safety_percent: float = 30.0
+
     @property
     def scanner_universes_to_ingest_list(self) -> list[str]:
         return [u.strip() for u in self.scanner_universes_to_ingest.split(",") if u.strip()]

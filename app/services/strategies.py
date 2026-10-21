@@ -3926,3 +3926,500 @@ def compute_ta_candles_trend_health(prices: list[DailyPrice]) -> dict | None:
         ),
         "chart_data": _chart_rows(df, ["close", "ema21", "ema50", "roc", "atr_percent", "green_ratio"]),
     }
+
+# ---------------------------------------------------------------------------
+# Strategies 27-28: fundamental-valuation QUANTITATIVE strategies
+#
+# 27. Benjamin Graham growth-valuation formula  (`graham_valuation`)
+# 28. Joel Greenblatt's Magic Formula           (`greenblatt_magic_formula`)
+#
+# Unlike Strategies 1-26 these are NOT functions of an ETF's price history:
+# they take already-extracted fundamental inputs (see
+# app.scanners.data.extract_valuation_inputs and the
+# `valuation_inputs_json` column of StockFundamentalsSnapshot) as plain
+# arguments, so these functions stay pure (no DB/HTTP) and fully testable.
+# Neither function ever fabricates a missing input: a missing / non-finite /
+# invalid input yields `status == "unavailable"` plus explicit reasons.
+# Descriptive / analytical only - not a buy/sell recommendation.
+# ---------------------------------------------------------------------------
+
+UNAVAILABLE = "unavailable"
+AVAILABLE = "available"
+
+
+def _is_num(value) -> bool:
+    """True for a real, finite int/float (bools, NaN, +/-inf and None are not)."""
+    if isinstance(value, bool) or value is None:
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError):
+        return False
+
+
+# --- Strategy 27: Graham growth-valuation formula ---------------------------
+#
+#   Estimated Value = EPS x (8.5 + 2g) x (4.4 / Y)
+#
+#   EPS  earnings per share (selected basis/period is reported)
+#   g    expected annual EPS growth, in PERCENT UNITS (8% -> 8, not 0.08)
+#   Y    comparable AAA corporate bond yield, in PERCENT UNITS (5.1% -> 5.1)
+#   8.5, 4.4  fixed constants of this (interest-rate-adjusted) formula.
+#
+# This is NOT the Graham Number (sqrt(22.5 x EPS x BVPS)), a different
+# valuation. Upside/Downside % = (Estimated Value - Market Price) / Market
+# Price x 100 (positive => estimate above market price).
+GRAHAM_BASE_PE = 8.5
+GRAHAM_GROWTH_MULTIPLIER = 2.0
+GRAHAM_BASELINE_YIELD_PERCENT = 4.4
+# Growth fed to the formula is capped (the formula is very sensitive to g and
+# analyst long-term estimates for growth names can be extreme). The RAW growth
+# is always reported alongside the applied value and a warning is added.
+GRAHAM_MAX_GROWTH_PERCENT = 15.0
+# Default margin of safety (percent below the estimate); configurable via
+# Settings.graham_margin_of_safety_percent.
+GRAHAM_DEFAULT_MARGIN_OF_SAFETY_PERCENT = 30.0
+# Conservative growth scenarios: fraction of the applied growth. 0.0 is the
+# "no growth" scenario. A scenario never RAISES growth above the applied
+# value (for negative g it stays at g).
+GRAHAM_SENSITIVITY_SCENARIOS = (
+    ("No growth (g = 0)", 0.0),
+    ("Half of applied growth", 0.5),
+    ("75% of applied growth", 0.75),
+)
+GRAHAM_GROWTH_BASIS_FORWARD = "forward_analyst_consensus"
+GRAHAM_GROWTH_BASIS_HISTORICAL = "historical_eps_cagr_proxy"
+GRAHAM_DISCLAIMER = (
+    "Approximate, assumption-driven estimate from a published formula. It is "
+    "not a guaranteed intrinsic value, not a prediction of the stock's future "
+    "price, and not investment advice. Results are highly sensitive to the "
+    "growth and bond-yield inputs."
+)
+
+
+def _graham_value(eps: float, growth_percent: float, aaa_yield_percent: float) -> float | None:
+    multiplier = GRAHAM_BASE_PE + GRAHAM_GROWTH_MULTIPLIER * growth_percent
+    if multiplier <= 0 or aaa_yield_percent <= 0:
+        return None
+    return eps * multiplier * (GRAHAM_BASELINE_YIELD_PERCENT / aaa_yield_percent)
+
+
+def _upside_percent(value: float | None, price: float | None) -> float | None:
+    if value is None or not _is_num(price) or price <= 0:
+        return None
+    return (value - price) / price * 100.0
+
+
+def compute_graham_valuation(
+    *,
+    eps,
+    eps_period: str | None = None,
+    eps_basis: str | None = None,
+    growth_percent=None,
+    growth_basis: str | None = None,
+    growth_source: str | None = None,
+    growth_horizon: str | None = None,
+    aaa_yield_percent=None,
+    aaa_yield_source: str | None = None,
+    aaa_yield_as_of: str | None = None,
+    price=None,
+    price_as_of: str | None = None,
+    margin_of_safety_percent=GRAHAM_DEFAULT_MARGIN_OF_SAFETY_PERCENT,
+    max_growth_percent: float = GRAHAM_MAX_GROWTH_PERCENT,
+    extra_warnings: list[str] | None = None,
+) -> dict:
+    """Graham growth-valuation estimate for ONE stock (always returns a dict).
+
+    `growth_percent` and `aaa_yield_percent` are percent-unit numbers (8 =
+    8%). Never raises on bad input: missing / non-finite / non-positive-EPS /
+    non-positive-yield inputs produce `status == "unavailable"` with
+    `unavailable_reasons` and no estimate. A missing price does NOT make the
+    estimate unavailable - only the price-comparison fields are null.
+    """
+    warnings = list(extra_warnings or [])
+    reasons: list[str] = []
+
+    if not _is_num(eps):
+        reasons.append("EPS is missing or not a finite number.")
+    elif float(eps) <= 0:
+        reasons.append(
+            "EPS is zero or negative; the growth-valuation formula is not meaningful."
+        )
+    if not _is_num(growth_percent):
+        reasons.append("Expected earnings growth is missing or not a finite number.")
+    if not _is_num(aaa_yield_percent):
+        reasons.append("AAA corporate bond yield is missing or not a finite number.")
+    elif float(aaa_yield_percent) <= 0:
+        reasons.append("AAA corporate bond yield must be greater than zero.")
+
+    applied_growth: float | None = None
+    if _is_num(growth_percent):
+        raw = float(growth_percent)
+        applied_growth = min(raw, float(max_growth_percent))
+        if applied_growth < raw:
+            warnings.append(
+                f"Expected growth {raw:.2f}% exceeds the {max_growth_percent:g}% cap; "
+                f"{applied_growth:g}% was used."
+            )
+        if growth_basis == GRAHAM_GROWTH_BASIS_HISTORICAL:
+            warnings.append(
+                "Growth is a HISTORICAL EPS CAGR proxy, not a forward analyst estimate."
+            )
+        if (
+            not reasons
+            and GRAHAM_BASE_PE + GRAHAM_GROWTH_MULTIPLIER * applied_growth <= 0
+        ):
+            reasons.append(
+                "Growth is so negative that (8.5 + 2g) is not positive; no estimate."
+            )
+
+    mos_ok = _is_num(margin_of_safety_percent) and 0 <= float(margin_of_safety_percent) < 100
+    if not mos_ok:
+        warnings.append("Margin of safety percent is invalid; margin-of-safety fields omitted.")
+
+    price_ok = _is_num(price) and float(price) > 0
+    if not price_ok:
+        warnings.append("Current market price is unavailable; no price comparison is shown.")
+
+    out = {
+        "status": UNAVAILABLE if reasons else AVAILABLE,
+        "unavailable_reasons": reasons,
+        "estimated_value": None,
+        "eps": float(eps) if _is_num(eps) else None,
+        "eps_period": eps_period,
+        "eps_basis": eps_basis,
+        "growth_percent_raw": float(growth_percent) if _is_num(growth_percent) else None,
+        "growth_percent_applied": _round(applied_growth, 4) if applied_growth is not None else None,
+        "growth_basis": growth_basis,
+        "growth_source": growth_source,
+        "growth_horizon": growth_horizon,
+        "max_growth_percent": float(max_growth_percent),
+        "aaa_yield_percent": float(aaa_yield_percent) if _is_num(aaa_yield_percent) else None,
+        "aaa_yield_source": aaa_yield_source,
+        "aaa_yield_as_of": aaa_yield_as_of,
+        "baseline_yield_percent": GRAHAM_BASELINE_YIELD_PERCENT,
+        "formula": "EPS x (8.5 + 2g) x (4.4 / Y)",
+        "market_price": float(price) if price_ok else None,
+        "market_price_as_of": price_as_of if price_ok else None,
+        "difference_abs": None,
+        "upside_downside_percent": None,
+        "difference_definition": (
+            "Upside/Downside % = (Estimated Value - Market Price) / Market Price x 100"
+        ),
+        "margin_of_safety_percent": float(margin_of_safety_percent) if mos_ok else None,
+        "margin_of_safety_price": None,
+        "price_within_margin_of_safety": None,
+        "sensitivity": [],
+        "data_quality_warnings": warnings,
+        "disclaimer": GRAHAM_DISCLAIMER,
+    }
+    if reasons:
+        return out
+
+    value = _graham_value(float(eps), applied_growth, float(aaa_yield_percent))
+    if value is None:  # defensive; guarded by the checks above
+        out["status"] = UNAVAILABLE
+        out["unavailable_reasons"] = ["Formula inputs produced no valid estimate."]
+        return out
+
+    out["estimated_value"] = _round(value)
+    if price_ok:
+        out["difference_abs"] = _round(value - float(price))
+        out["upside_downside_percent"] = _round(_upside_percent(value, float(price)))
+    if mos_ok:
+        mos_price = value * (1 - float(margin_of_safety_percent) / 100.0)
+        out["margin_of_safety_price"] = _round(mos_price)
+        if price_ok:
+            out["price_within_margin_of_safety"] = bool(float(price) <= mos_price)
+
+    for label, factor in GRAHAM_SENSITIVITY_SCENARIOS:
+        g = min(applied_growth, applied_growth * factor)
+        scenario_value = _graham_value(float(eps), g, float(aaa_yield_percent))
+        out["sensitivity"].append(
+            {
+                "scenario": label,
+                "growth_percent": _round(g, 4),
+                "estimated_value": _round(scenario_value),
+                "upside_downside_percent": _round(
+                    _upside_percent(scenario_value, float(price) if price_ok else None)
+                ),
+            }
+        )
+    return out
+
+
+# --- Strategy 28: Greenblatt Magic Formula ----------------------------------
+#
+#   Earnings Yield    = EBIT / Enterprise Value
+#   Return on Capital = EBIT / (Net Working Capital + Net Fixed Assets)
+#
+# Definitions used (from yfinance statements, see app.scanners.data):
+#   EBIT   latest annual "EBIT" (fallback "Operating Income", labelled).
+#   EV     provider-reported enterpriseValue; else marketCap + totalDebt -
+#          totalCash (never mixed silently - the source is reported per row).
+#   NWC    (Current Assets - Cash & ST investments)
+#          - (Current Liabilities - Current Debt)     [operating working capital]
+#   NFA    Net PP&E (net fixed assets).
+# Ranking: the two factors are ranked independently (highest first, standard
+# competition ranking so equal values share a rank), the ranks are summed,
+# and the list is ordered by combined rank ascending (lower is better), ties
+# broken by earnings-yield rank, then return-on-capital rank, then symbol.
+# Observations that are invalid (missing inputs, EV <= 0, invested capital
+# <= 0) are NEVER ranked (no artificially favourable rank) and are listed in
+# `excluded_by_reason`. Negative EBIT with a valid denominator is a valid
+# (unfavourable) observation and is ranked normally.
+MAGIC_FORMULA_EXCLUDED_SECTORS = frozenset({"financials", "financial services", "utilities"})
+MAGIC_FORMULA_STALE_DAYS = 548  # ~18 months: statements older than this get a warning
+MAGIC_FORMULA_RESPONSE_TOP_N = 25
+MAGIC_FORMULA_DISCLAIMER = (
+    "A relative ranking within the stated universe at one point in time. It is "
+    "not an absolute measure of investment quality, not a guarantee of future "
+    "returns, and not investment advice."
+)
+MAGIC_FORMULA_METHODOLOGY = [
+    "Earnings Yield = EBIT / Enterprise Value.",
+    "Return on Capital = EBIT / (Net Working Capital + Net Fixed Assets).",
+    (
+        "Net Working Capital = (Current Assets - Cash & short-term investments) - "
+        "(Current Liabilities - Current Debt); Net Fixed Assets = Net PP&E."
+    ),
+    (
+        "Each factor is ranked highest-first (equal values share a rank); the two "
+        "ranks are summed and results are sorted by combined rank ascending."
+    ),
+    (
+        "Financials and utilities are excluded (Greenblatt's convention). Stocks "
+        "with missing/invalid inputs are excluded from the ranking, never ranked."
+    ),
+    (
+        "EBIT and balance-sheet figures are the latest ANNUAL statements (not "
+        "trailing-twelve-month); data comes from Yahoo Finance via yfinance."
+    ),
+]
+
+
+def _period_age_days(period: str | None, today: datetime.date) -> int | None:
+    if not period:
+        return None
+    try:
+        return (today - datetime.date.fromisoformat(str(period)[:10])).days
+    except ValueError:
+        return None
+
+
+def compute_magic_formula_metrics(inp: dict, today: datetime.date | None = None) -> dict:
+    """Earnings yield / return on capital for ONE stock from raw inputs.
+
+    `inp` keys (all optional except symbol; missing => that factor is
+    unavailable): symbol, company_name, sector, industry, ebit, ebit_period,
+    ebit_label, reported_enterprise_value, market_cap, total_debt, total_cash,
+    current_assets, cash, current_liabilities, current_debt, net_ppe,
+    balance_sheet_period, financial_currency, price_currency.
+    Returns a row with factor values (percent units), per-factor status,
+    warnings, and null ranks (filled in by rank_magic_formula).
+    """
+    today = today or datetime.datetime.now(datetime.timezone.utc).date()
+    warnings: list[str] = []
+    g = inp.get
+
+    ebit = float(g("ebit")) if _is_num(g("ebit")) else None
+    if ebit is None:
+        warnings.append("EBIT is missing.")
+
+    # --- enterprise value (best available supported calculation) ---
+    ev: float | None = None
+    ev_source: str | None = None
+    if _is_num(g("reported_enterprise_value")):
+        ev = float(g("reported_enterprise_value"))
+        ev_source = "Yahoo Finance enterpriseValue (provider-reported)"
+    elif all(_is_num(g(k)) for k in ("market_cap", "total_debt", "total_cash")):
+        ev = float(g("market_cap")) + float(g("total_debt")) - float(g("total_cash"))
+        ev_source = "Computed: marketCap + totalDebt - totalCash (Yahoo Finance info)"
+    else:
+        warnings.append("Enterprise value is missing and cannot be derived from market cap, debt and cash.")
+
+    earnings_yield: float | None = None
+    ey_status, ey_reason = UNAVAILABLE, None
+    if ebit is None:
+        ey_reason = "EBIT missing"
+    elif ev is None:
+        ey_reason = "Enterprise value missing"
+    elif ev <= 0:
+        ey_reason = "Enterprise value is zero or negative"
+        warnings.append("Enterprise value is zero or negative; earnings yield is not meaningful.")
+    else:
+        earnings_yield = ebit / ev * 100.0
+        ey_status = AVAILABLE
+
+    # --- invested capital ---
+    nwc: float | None = None
+    required = ("current_assets", "cash", "current_liabilities", "current_debt")
+    missing_nwc = [k for k in required if not _is_num(g(k))]
+    if missing_nwc:
+        warnings.append("Net working capital unavailable; missing: " + ", ".join(missing_nwc) + ".")
+    else:
+        nwc = (float(g("current_assets")) - float(g("cash"))) - (
+            float(g("current_liabilities")) - float(g("current_debt"))
+        )
+    nfa = float(g("net_ppe")) if _is_num(g("net_ppe")) else None
+    if nfa is None:
+        warnings.append("Net fixed assets (Net PP&E) are missing.")
+    elif nfa < 0:
+        warnings.append("Net PP&E is negative; treated as invalid.")
+        nfa = None
+    invested = (nwc + nfa) if (nwc is not None and nfa is not None) else None
+
+    roc: float | None = None
+    roc_status, roc_reason = UNAVAILABLE, None
+    if ebit is None:
+        roc_reason = "EBIT missing"
+    elif invested is None:
+        roc_reason = "Net working capital or net fixed assets missing"
+    elif invested <= 0:
+        roc_reason = "Invested capital (NWC + NFA) is zero or negative"
+        warnings.append("Invested capital is zero or negative; return on capital is not meaningful.")
+    else:
+        roc = ebit / invested * 100.0
+        roc_status = AVAILABLE
+
+    fin_ccy, px_ccy = g("financial_currency"), g("price_currency")
+    currency_mismatch = bool(fin_ccy and px_ccy and fin_ccy != px_ccy)
+    if currency_mismatch:
+        warnings.append(
+            f"Financial statements are in {fin_ccy} but the share price is in {px_ccy}; "
+            "ratios would mix currencies."
+        )
+
+    for label, period in (("EBIT", g("ebit_period")), ("Balance sheet", g("balance_sheet_period"))):
+        age = _period_age_days(period, today)
+        if age is not None and age > MAGIC_FORMULA_STALE_DAYS:
+            warnings.append(f"{label} period {period} is {age} days old (stale).")
+
+    return {
+        "symbol": g("symbol"),
+        "company_name": g("company_name"),
+        "sector": g("sector"),
+        "industry": g("industry"),
+        "ebit": ebit,
+        "ebit_period": g("ebit_period"),
+        "ebit_basis": g("ebit_label"),
+        "enterprise_value": ev,
+        "enterprise_value_source": ev_source,
+        "earnings_yield_percent": _round(earnings_yield, 6),
+        "earnings_yield_status": ey_status,
+        "earnings_yield_unavailable_reason": ey_reason,
+        "net_working_capital": nwc,
+        "net_fixed_assets": nfa,
+        "invested_capital": invested,
+        "balance_sheet_period": g("balance_sheet_period"),
+        "return_on_capital_percent": _round(roc, 6),
+        "return_on_capital_status": roc_status,
+        "return_on_capital_unavailable_reason": roc_reason,
+        "currency_mismatch": currency_mismatch,
+        "earnings_yield_rank": None,
+        "return_on_capital_rank": None,
+        "combined_rank": None,
+        "overall_position": None,
+        "ranked": False,
+        "exclusion_reason": None,
+        "data_quality_warnings": warnings,
+    }
+
+
+def _competition_ranks(values: dict[str, float]) -> dict[str, int]:
+    """Highest value => rank 1; equal values share the same (lowest) rank."""
+    keyed = {s: round(v, 10) for s, v in values.items()}
+    return {s: 1 + sum(1 for o in keyed.values() if o > v) for s, v in keyed.items()}
+
+
+def rank_magic_formula(rows: list[dict]) -> list[dict]:
+    """Fill ranks on `rows` (in place) for rows that are rankable
+    (`exclusion_reason is None` and both factors available) and return the
+    ranked rows in final order: combined rank ascending, then earnings-yield
+    rank, return-on-capital rank, symbol (fully deterministic).
+    """
+    rankable = [
+        r
+        for r in rows
+        if r["exclusion_reason"] is None
+        and r["earnings_yield_status"] == AVAILABLE
+        and r["return_on_capital_status"] == AVAILABLE
+    ]
+    ey = _competition_ranks({r["symbol"]: r["earnings_yield_percent"] for r in rankable})
+    roc = _competition_ranks({r["symbol"]: r["return_on_capital_percent"] for r in rankable})
+    for r in rankable:
+        r["earnings_yield_rank"] = ey[r["symbol"]]
+        r["return_on_capital_rank"] = roc[r["symbol"]]
+        r["combined_rank"] = ey[r["symbol"]] + roc[r["symbol"]]
+        r["ranked"] = True
+    ordered = sorted(
+        rankable,
+        key=lambda r: (
+            r["combined_rank"],
+            r["earnings_yield_rank"],
+            r["return_on_capital_rank"],
+            r["symbol"],
+        ),
+    )
+    for position, r in enumerate(ordered, start=1):
+        r["overall_position"] = position
+    return ordered
+
+
+def screen_magic_formula(
+    candidates: list[dict], universe: str, today: datetime.date | None = None
+) -> dict:
+    """Run the Magic Formula over `candidates` (one raw-input dict per
+    universe member; a candidate with `"no_data": True` had no fundamentals
+    row). One bad candidate never aborts the screen: it is recorded in
+    `excluded_by_reason` and the rest are ranked.
+    """
+    rows: list[dict] = []
+    for cand in candidates:
+        try:
+            if cand.get("no_data"):
+                row = compute_magic_formula_metrics({"symbol": cand.get("symbol")}, today)
+                row.update(company_name=cand.get("company_name"), sector=cand.get("sector"),
+                           industry=cand.get("industry"))
+                row["exclusion_reason"] = "no_fundamentals_data"
+            else:
+                row = compute_magic_formula_metrics(cand, today)
+                sector = (cand.get("sector") or "").strip().lower()
+                if sector in MAGIC_FORMULA_EXCLUDED_SECTORS:
+                    row["exclusion_reason"] = "excluded_sector"
+                elif row["currency_mismatch"]:
+                    row["exclusion_reason"] = "currency_mismatch"
+                elif (
+                    row["earnings_yield_status"] != AVAILABLE
+                    or row["return_on_capital_status"] != AVAILABLE
+                ):
+                    row["exclusion_reason"] = "insufficient_or_invalid_financial_data"
+        except Exception as exc:  # noqa: BLE001 - one bad stock must not crash the ranking
+            row = {
+                "symbol": cand.get("symbol"), "company_name": cand.get("company_name"),
+                "sector": cand.get("sector"), "industry": cand.get("industry"),
+                "ranked": False, "exclusion_reason": "calculation_error",
+                "earnings_yield_status": UNAVAILABLE, "return_on_capital_status": UNAVAILABLE,
+                "data_quality_warnings": [f"Calculation failed: {exc}"],
+            }
+        rows.append(row)
+
+    ranked = rank_magic_formula(rows)
+    excluded_by_reason: dict[str, int] = {}
+    for r in rows:
+        if r["exclusion_reason"]:
+            excluded_by_reason[r["exclusion_reason"]] = excluded_by_reason.get(r["exclusion_reason"], 0) + 1
+
+    unranked = sorted(
+        (r for r in rows if not r["ranked"]), key=lambda r: str(r.get("symbol"))
+    )
+    return {
+        "status": AVAILABLE if ranked else UNAVAILABLE,
+        "universe": universe,
+        "universe_size": len(rows),
+        "ranked_count": len(ranked),
+        "excluded_count": len(unranked),
+        "excluded_by_reason": dict(sorted(excluded_by_reason.items())),
+        "ranked": ranked,
+        "unranked": unranked,
+    }

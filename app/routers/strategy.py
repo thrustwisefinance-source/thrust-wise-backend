@@ -7,14 +7,20 @@ trading bot and does NOT return buy/sell/hold signals, recommendations,
 or anything ML-derived.
 """
 
+import datetime
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.constants import ETF_REGISTRY, PORTFOLIO_COMPARISON_REGISTRY, STRATEGY_ONLY_REGISTRY
 from app.database import get_db
+from app.models import StockUniverseMember
 from app.routers.deps import load_prices, require_prices, resolve_meta
+from app.scanners import data as scanner_data
+from app.scanners import universe as scanner_universe
 from app.schemas import ApiResponse, PortfolioOptimizationRequest, PortfolioOptimizationResult, StrategyAnalytics
 from app.services import cache, portfolio_comparison, regime, strategies
 
@@ -125,6 +131,246 @@ async def _load_market_regime(db: AsyncSession) -> dict | None:
     return regime.compute_market_regime(prices_by_symbol)
 
 
+# ---------------------------------------------------------------------------
+# Quantitative valuation strategies 27-28: Graham valuation + Greenblatt
+# Magic Formula (services.strategies). Both ride on the existing
+# /etfs/{symbol}/strategies response (`quantitative_strategies` group):
+#   - Greenblatt is a stock-UNIVERSE ranking, so - like Factor Momentum - it
+#     is computed once, cached separately and attached to every response.
+#   - Graham is per-stock: for a stock symbol (a current member of an
+#     ingested stock universe) the same route returns the valuation
+#     strategies for that stock; for an ETF it reports "unavailable".
+# The cache key lives under the scanner cache prefix so a scanner refresh
+# (which re-ingests fundamentals) busts it automatically.
+# ---------------------------------------------------------------------------
+
+VALUATION_DEFAULT_UNIVERSE = "sp500"
+GREENBLATT_CACHE_KEY_PREFIX = "tw:v1:scanner:greenblatt:"
+GRAHAM_NOT_APPLICABLE_ETF = (
+    "Graham valuation applies to individual stocks, not ETFs. Request a stock "
+    "symbol from an ingested universe (e.g. AAPL) on this same route."
+)
+
+
+class _ValuationNotReady(Exception):
+    """Raised inside the cached compute so an 'unavailable' result is never cached."""
+
+
+async def _find_stock_member(db: AsyncSession, symbol: str) -> StockUniverseMember | None:
+    return await db.scalar(
+        select(StockUniverseMember)
+        .where(
+            StockUniverseMember.symbol == symbol.strip().upper(),
+            StockUniverseMember.is_current.is_(True),
+        )
+        .order_by(StockUniverseMember.universe.asc())
+        .limit(1)
+    )
+
+
+def _unavailable_magic_formula(universe_key: str, reasons: list[str]) -> dict:
+    return {
+        "status": strategies.UNAVAILABLE,
+        "unavailable_reasons": reasons,
+        "universe": universe_key,
+        "methodology": strategies.MAGIC_FORMULA_METHODOLOGY,
+        "disclaimer": strategies.MAGIC_FORMULA_DISCLAIMER,
+    }
+
+
+async def _run_greenblatt(db: AsyncSession, universe_key: str) -> dict:
+    """Universe-wide Magic Formula screen (the expensive compute wrapped by
+    cache.get_or_compute). One DB query for the members, one for all
+    fundamentals snapshots - no per-stock queries or provider calls."""
+    members = await scanner_universe.get_stock_universe(db, universe_key)
+    if not members:
+        raise _ValuationNotReady(
+            f"Universe '{universe_key}' has not been ingested yet "
+            "(POST /api/admin/scanners/refresh)."
+        )
+    snapshots = await scanner_data.load_fundamentals_snapshots(db, [m.symbol for m in members])
+    candidates = []
+    for m in members:
+        snapshot = snapshots.get(m.symbol)
+        candidates.append(
+            scanner_data.build_magic_formula_candidate(
+                m.symbol,
+                (snapshot.company_name if snapshot else None) or m.name,
+                (snapshot.sector if snapshot else None) or m.sector,
+                (snapshot.industry if snapshot else None) or m.industry,
+                scanner_data.valuation_inputs_from_snapshot(snapshot),
+            )
+        )
+    screen = strategies.screen_magic_formula(candidates, universe_key)
+    if not screen["ranked_count"] and screen["excluded_by_reason"].get("no_fundamentals_data") == len(members):
+        raise _ValuationNotReady(
+            "Valuation inputs (EBIT, balance sheet, enterprise value) have not been "
+            "ingested yet; run a scanner fundamentals refresh."
+        )
+    screen["data_updated_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    return screen
+
+
+async def _load_magic_formula_view(
+    db: AsyncSession, universe_key: str, requested_symbol: str | None
+) -> dict:
+    """Greenblatt response object: top-N rows + the requested stock's own
+    row. Never raises - provider/DB trouble becomes an explicit
+    'unavailable' object (logged), so it can't break the rest of the response."""
+    try:
+        screen = await cache.get_or_compute(
+            f"{GREENBLATT_CACHE_KEY_PREFIX}{universe_key}",
+            lambda: _run_greenblatt(db, universe_key),
+        )
+    except _ValuationNotReady as exc:
+        return _unavailable_magic_formula(universe_key, [str(exc)])
+    except Exception:  # must not break the strategies response
+        logger.exception("Greenblatt Magic Formula computation failed")
+        return _unavailable_magic_formula(
+            universe_key, ["Magic Formula computation failed; see server logs."]
+        )
+
+    if not isinstance(screen, dict) or "ranked" not in screen:
+        return _unavailable_magic_formula(
+            universe_key, ["Magic Formula result is unavailable."]
+        )
+
+    source = scanner_universe.get_universe_source(universe_key)
+    ranked = screen["ranked"]
+    mine = None
+    if requested_symbol:
+        mine = next(
+            (r for r in ranked + screen["unranked"] if r.get("symbol") == requested_symbol), None
+        )
+    warnings = []
+    no_data = screen["excluded_by_reason"].get("no_fundamentals_data", 0)
+    if no_data:
+        warnings.append(
+            f"{no_data} universe member(s) have no ingested valuation inputs yet and are not ranked."
+        )
+    return {
+        "status": screen["status"],
+        "unavailable_reasons": [] if screen["status"] == strategies.AVAILABLE else [
+            "No stock in the universe has complete, valid inputs for both factors."
+        ],
+        "universe": universe_key,
+        "universe_label": source.label if source else universe_key,
+        "universe_size": screen["universe_size"],
+        "eligible_universe_definition": (
+            f"Current members of the '{universe_key}' stock universe, excluding financials and "
+            "utilities and any stock with missing/invalid EBIT, enterprise value or invested capital."
+        ),
+        "ranked_count": screen["ranked_count"],
+        "excluded_count": screen["excluded_count"],
+        "excluded_by_reason": screen["excluded_by_reason"],
+        "top_n": strategies.MAGIC_FORMULA_RESPONSE_TOP_N,
+        "top_ranked": ranked[: strategies.MAGIC_FORMULA_RESPONSE_TOP_N],
+        "requested_symbol_result": mine,
+        "methodology": strategies.MAGIC_FORMULA_METHODOLOGY,
+        "data_updated_at": screen.get("data_updated_at"),
+        "data_quality_warnings": warnings,
+        "disclaimer": strategies.MAGIC_FORMULA_DISCLAIMER,
+    }
+
+
+def _graham_unavailable(symbol: str, reasons: list[str]) -> dict:
+    out = strategies.compute_graham_valuation(eps=None, growth_percent=None, aaa_yield_percent=None)
+    out["unavailable_reasons"] = reasons
+    out["data_quality_warnings"] = []
+    out["symbol"] = symbol
+    return out
+
+
+async def _compute_graham_for_stock(db: AsyncSession, symbol: str) -> dict:
+    """Graham valuation for one stock from its stored fundamentals snapshot,
+    its latest ingested close, and the operator-configured AAA yield."""
+    try:
+        snapshot = (await scanner_data.load_fundamentals_snapshots(db, [symbol])).get(symbol)
+        inputs = scanner_data.valuation_inputs_from_snapshot(snapshot) or {}
+        latest = await load_prices(db, symbol, limit=1)
+    except Exception:
+        logger.exception("Graham valuation input load failed for %s", symbol)
+        return _graham_unavailable(symbol, ["Valuation inputs could not be loaded; see server logs."])
+
+    warnings: list[str] = []
+    if snapshot is None:
+        warnings.append("No fundamentals snapshot on file for this symbol.")
+
+    # EPS: trailing-twelve-month EPS if present, else latest annual diluted EPS.
+    eps = inputs.get("trailing_eps")
+    eps_period = eps_basis = None
+    if eps is not None:
+        stamp = (inputs.get("extracted_at") or "")[:10] or "unknown date"
+        eps_period = f"TTM (as reported by Yahoo Finance on {stamp})"
+        eps_basis = "Trailing-twelve-month EPS (Yahoo Finance trailingEps)"
+    else:
+        annual = scanner_data.annual_eps_history_from_snapshot(snapshot)
+        if annual:
+            eps = annual[-1].get("eps")
+            eps_period = f"FY{annual[-1].get('year')}"
+            eps_basis = "Latest annual diluted EPS (annual income statement)"
+
+    # Growth: forward analyst estimate if present, else a LABELLED historical proxy.
+    growth = inputs.get("forward_growth") or {}
+    growth_percent = growth.get("percent")
+    growth_basis = strategies.GRAHAM_GROWTH_BASIS_FORWARD
+    growth_source, growth_horizon = growth.get("source"), growth.get("horizon")
+    if growth_percent is None:
+        proxy = scanner_data.historical_eps_cagr_percent(
+            scanner_data.annual_eps_history_from_snapshot(snapshot)
+        )
+        if proxy is not None:
+            growth_percent = proxy["percent"]
+            growth_basis = strategies.GRAHAM_GROWTH_BASIS_HISTORICAL
+            growth_source = "ThrustWise calculation: historical annual diluted-EPS CAGR (not a forecast)"
+            growth_horizon = f"historical FY{proxy['from_year']}-FY{proxy['to_year']}"
+        else:
+            growth_basis = None
+
+    price = latest[-1].close if latest else None
+    price_as_of = f"{latest[-1].date.isoformat()} (end-of-day close)" if latest else None
+
+    out = strategies.compute_graham_valuation(
+        eps=eps,
+        eps_period=eps_period,
+        eps_basis=eps_basis,
+        growth_percent=growth_percent,
+        growth_basis=growth_basis,
+        growth_source=growth_source,
+        growth_horizon=growth_horizon,
+        aaa_yield_percent=settings.graham_aaa_yield_percent,
+        aaa_yield_source=settings.graham_aaa_yield_source if settings.graham_aaa_yield_percent is not None else None,
+        aaa_yield_as_of=settings.graham_aaa_yield_as_of or None,
+        price=price,
+        price_as_of=price_as_of,
+        margin_of_safety_percent=settings.graham_margin_of_safety_percent,
+        extra_warnings=warnings,
+    )
+    if settings.graham_aaa_yield_percent is not None and not settings.graham_aaa_yield_as_of:
+        out["data_quality_warnings"].append("AAA yield observation date is not configured.")
+    if settings.graham_aaa_yield_percent is None:
+        out["unavailable_reasons"] = [
+            r.replace("AAA corporate bond yield is missing or not a finite number.",
+                      "AAA corporate bond yield is not configured (set GRAHAM_AAA_YIELD_PERCENT).")
+            for r in out["unavailable_reasons"]
+        ]
+    out["symbol"] = symbol
+    return out
+
+
+def _with_valuation_strategies(result: dict, graham: dict, magic_formula: dict) -> dict:
+    """Copy of `result` with the two valuation strategies added as flat
+    fields and inside the Quantitative group (existing keys untouched)."""
+    merged = dict(result)
+    merged["graham_valuation"] = graham
+    merged["greenblatt_magic_formula"] = magic_formula
+    quantitative = dict(merged.get("quantitative_strategies") or {})
+    quantitative["graham_valuation"] = graham
+    quantitative["greenblatt_magic_formula"] = magic_formula
+    merged["quantitative_strategies"] = quantitative
+    return merged
+
+
 @router.get("/{symbol}/strategies", response_model=ApiResponse[StrategyAnalytics])
 async def get_strategy_analytics(symbol: str, db: AsyncSession = Depends(get_db)):
     """Indicator readouts for all technical strategies:
@@ -216,8 +462,35 @@ async def get_strategy_analytics(symbol: str, db: AsyncSession = Depends(get_db)
     responses (which don't contain the seven new technical strategies)
     are not served for the new fields; the response shape stays backward
     compatible either way since all fields are optional.
+
+    Also carries two fundamental-valuation Quantitative strategies
+    (services.strategies Strategies 27-28), added WITHOUT a new endpoint
+    or cache-key change (they are attached after the cached ETF payload):
+    `graham_valuation` (per-stock; "unavailable" for ETFs) and
+    `greenblatt_magic_formula` (stock-universe ranking, cached separately,
+    attached to every response). A symbol that is not an ETF but is a
+    current member of an ingested stock universe is no longer a 404: it
+    returns only these two strategies for that stock (ETF price-based
+    strategies are not computed for stocks).
     """
-    meta = resolve_meta(symbol)
+    try:
+        meta = resolve_meta(symbol)
+    except HTTPException as exc:
+        if exc.status_code != 404:
+            raise
+        stock = await _find_stock_member(db, symbol)
+        if stock is None:
+            raise
+        graham = await _compute_graham_for_stock(db, stock.symbol)
+        magic = await _load_magic_formula_view(db, stock.universe, stock.symbol)
+        return ApiResponse(
+            data=_with_valuation_strategies({}, graham, magic),
+            message=(
+                f"{stock.symbol} is a stock ({stock.universe}): only the Quantitative "
+                "valuation strategies (Graham Valuation, Greenblatt Magic Formula) apply; "
+                "ETF price-based strategies are not computed for stocks."
+            ),
+        )
 
     cache_key = f"tw:v10:strategies:{meta.symbol}"
     cached = await cache.get_json(cache_key)
@@ -337,6 +610,13 @@ async def get_strategy_analytics(symbol: str, db: AsyncSession = Depends(get_db)
         }
 
         await cache.set_json(cache_key, result)
+
+    # Strategies 27-28 (attached after the cached ETF payload; see docstring).
+    result = _with_valuation_strategies(
+        result,
+        _graham_unavailable(meta.symbol, [GRAHAM_NOT_APPLICABLE_ETF]),
+        await _load_magic_formula_view(db, VALUATION_DEFAULT_UNIVERSE, None),
+    )
 
     # Insufficient history is not an error — surface it as an informational
     # message (same pattern as the "skipped" symbols message in etfs.py),
