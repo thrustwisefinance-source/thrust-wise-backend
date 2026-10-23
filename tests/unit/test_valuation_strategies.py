@@ -12,7 +12,9 @@ GET /api/etfs/{symbol}/strategies route:
 No live network / database / Redis access anywhere in this file.
 """
 
+
 import asyncio
+
 import datetime
 import json
 import math
