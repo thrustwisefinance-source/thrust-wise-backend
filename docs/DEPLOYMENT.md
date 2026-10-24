@@ -71,3 +71,24 @@ baked at build time).
 Deploy = new image. Rollback = redeploy the previous Railway deployment.
 Keep migrations backward-compatible for one release so an old image can run
 against a newer schema.
+
+## Migrating a database that drifted from Alembic (0002 → head)
+
+Symptom: `UndefinedColumnError: stock_fundamentals_snapshots.valuation_inputs_json`.
+Cause: `AUTO_CREATE_TABLES=true` made `create_all` build the scanner tables
+while `alembic_version` stayed at `0002`; `create_all` never adds columns to
+existing tables, and nothing ran `alembic upgrade head`.
+
+0003/0004 are idempotent, so on such a database simply run (Railway shell /
+one-off command, same `DATABASE_URL` as the service):
+
+    alembic current          # expect 0002
+    alembic upgrade head     # 0002 -> 0003 (no-op for existing tables) -> 0004 (adds column)
+    alembic current          # expect 0004 (head)
+
+Verify: `SELECT column_name FROM information_schema.columns WHERE
+table_name='stock_fundamentals_snapshots' AND column_name='valuation_inputs_json';`
+
+Existing snapshot rows keep `valuation_inputs_json = NULL` until the next
+scanner ingestion refreshes them; Graham/Magic Formula report those symbols as
+unavailable rather than guessing. Set `AUTO_CREATE_TABLES=false` in production.

@@ -14,7 +14,6 @@ Create Date: 2026-10-21
 from typing import Sequence, Union
 
 from alembic import op
-import sqlalchemy as sa
 
 revision: str = "0004"
 down_revision: Union[str, None] = "0003"
@@ -23,9 +22,12 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    op.add_column(
-        "stock_fundamentals_snapshots",
-        sa.Column("valuation_inputs_json", sa.Text(), nullable=True),
+    # IF NOT EXISTS (PostgreSQL): safe if the column was already added
+    # out-of-band. Nullable, no default => metadata-only change, existing rows
+    # are not rewritten and simply read back NULL.
+    op.execute(
+        "ALTER TABLE stock_fundamentals_snapshots "
+        "ADD COLUMN IF NOT EXISTS valuation_inputs_json TEXT"
     )
 
 

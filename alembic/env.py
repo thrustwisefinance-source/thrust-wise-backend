@@ -44,6 +44,12 @@ def run_migrations_online() -> None:
         # instead of blocking it forever
         connection.exec_driver_sql("SET statement_timeout = '30s'")
         connection.exec_driver_sql("SET lock_timeout = '15s'")
+        # SQLAlchemy 2.0 autobegins a transaction on the statements above.
+        # Alembic treats a pre-existing transaction as "external" and never
+        # commits it, so without this commit `alembic upgrade head` logs every
+        # migration yet rolls all of them back when the connection closes.
+        # (SET is session-level, so the timeouts survive the commit.)
+        connection.commit()
         context.configure(connection=connection, target_metadata=target_metadata)
         with context.begin_transaction():
             context.run_migrations()

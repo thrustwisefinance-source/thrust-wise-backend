@@ -9,13 +9,16 @@ dockerfilePath = "Dockerfile"
 # /health/ready surfaces any real DB problem once the app is up.
 # NOTE: explicit `sh -c` + semicolons — Railway's start-command handling has
 # proven unreliable with compound && chains and ${VAR:-default} expansion.
-# uvicorn starts unconditionally; migrations are bounded and best-effort
-# (schema is Alembic-managed and already current; /health/ready reports any
-# real DB problem). Port 8000 matches the PORT service variable.
+# uvicorn starts unconditionally; `alembic upgrade head` runs first, bounded by
+# `timeout 120` and best-effort (a failure prints MIGRATION_FAILED_OR_TIMED_OUT
+# and the API still boots so unrelated endpoints keep serving; /health/ready
+# reports any real DB problem). Without this step new columns never reach the
+# database — Base.metadata.create_all only creates MISSING tables, it never
+# alters existing ones. Port 8000 matches the PORT service variable.
 #
 # --host :: (not 0.0.0.0): Railway's internal proxy/healthcheck traffic
 # runs over IPv6. Binding 0.0.0.0 is IPv4-only and unreachable from that
 # hop. Binding :: is dual-stack on Linux and covers both.
 
-startCommand = "sh -c 'uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} --log-level debug'"
+startCommand = "sh -c 'timeout 120 alembic upgrade head || echo MIGRATION_FAILED_OR_TIMED_OUT_see_logs_above; exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} --log-level debug'"
 restartPolicyType = "ON_FAILURE"

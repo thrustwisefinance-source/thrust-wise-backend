@@ -18,6 +18,27 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
+    existing = set(sa.inspect(op.get_bind()).get_table_names())
+
+    # Idempotent on purpose: with AUTO_CREATE_TABLES=true (the default) the app
+    # boot ran Base.metadata.create_all, which already created these two tables
+    # on databases still stamped at 0002. Plain create_table would abort with
+    # DuplicateTable there. Existing tables/rows are left untouched; columns
+    # missing from a create_all-built table are added by 0004.
+    if "stock_universe_members" not in existing:
+        _create_stock_universe_members()
+    op.create_index(
+        "ix_stock_universe_members_universe_current",
+        "stock_universe_members",
+        ["universe", "is_current"],
+        if_not_exists=True,
+    )
+
+    if "stock_fundamentals_snapshots" not in existing:
+        _create_stock_fundamentals_snapshots()
+
+
+def _create_stock_universe_members() -> None:
     op.create_table(
         "stock_universe_members",
         sa.Column("id", sa.Integer(), primary_key=True, autoincrement=True),
@@ -44,12 +65,9 @@ def upgrade() -> None:
             "universe", "symbol", name="uq_stock_universe_members_universe_symbol"
         ),
     )
-    op.create_index(
-        "ix_stock_universe_members_universe_current",
-        "stock_universe_members",
-        ["universe", "is_current"],
-    )
 
+
+def _create_stock_fundamentals_snapshots() -> None:
     op.create_table(
         "stock_fundamentals_snapshots",
         sa.Column("id", sa.Integer(), primary_key=True, autoincrement=True),
