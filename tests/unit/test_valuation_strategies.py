@@ -663,7 +663,9 @@ class TestValuationExtraction:
 # Route integration: existing GET /api/etfs/{symbol}/strategies, no new endpoint
 # ---------------------------------------------------------------------------
 
-# Every (method, path) the API exposed BEFORE this change (19 operations).
+# Every (method, path) the API exposes: the 19 operations that existed before
+# the valuation strategies, plus the 4 deliberate, backward-compatible additions
+# for the article-based strategies (see the "article-based" block below).
 ORIGINAL_ROUTES = {
     ("GET", "/api/compare"),
     ("GET", "/api/dashboard"),
@@ -684,6 +686,11 @@ ORIGINAL_ROUTES = {
     ("POST", "/api/admin/refresh"),
     ("POST", "/api/admin/scanners/refresh"),
     ("POST", "/api/portfolio/optimization"),
+    # article-based strategies 29-32 (parameterised variants / multi-asset / ops)
+    ("GET", "/api/etfs/{symbol}/strategies/seasonal_heat_map"),
+    ("GET", "/api/etfs/{symbol}/strategies/ema_bollinger_atr"),
+    ("POST", "/api/portfolio/diversification_heat_map"),
+    ("POST", "/api/admin/backfill"),
 }
 
 
@@ -907,7 +914,9 @@ class TestRouteIntegration:
         }
 
         async def get_json(key):
-            assert key == "tw:v10:strategies:QQQ"  # unchanged ETF cache key
+            # ETF cache key bumped v10 -> v11 when the article-based strategies
+            # were added, so cached v10 payloads (without them) are not served.
+            assert key == "tw:v11:strategies:QQQ"
             return cached_etf
 
         monkeypatch.setattr(seeded.cache, "get_json", get_json)
@@ -998,6 +1007,8 @@ class TestRegression:
             "pivot_levels",
             "cpr",
             "ta_candles_trend_health",
+            # article-based Strategy 31 (appended; see test_article_strategies.py)
+            "ema_bollinger_atr",
         ]
         assert list(QuantitativeStrategies.model_fields)[:6] == [
             "evar_risk",
@@ -1011,13 +1022,19 @@ class TestRegression:
         assert list(QuantitativeStrategies.model_fields)[6:] == [
             "graham_valuation",
             "greenblatt_magic_formula",
+            # article-based Strategy 32 (appended)
+            "crash_warning",
         ]
         assert list(RegimeStrategies.model_fields) == [
             "risk_on_risk_off",
             "hmm_regime_switching",
             "factor_momentum",
         ]
-        assert list(CalendarStrategies.model_fields) == ["tlt_monthly_cycle"]
+        # article-based Strategy 29 appended to the existing Calendar category
+        assert list(CalendarStrategies.model_fields) == [
+            "tlt_monthly_cycle",
+            "seasonal_heat_map",
+        ]
         assert list(PortfolioStrategies.model_fields) == [
             "tqqq_tmf_ief_rebalancing",
             "vt_vs_vti_vxus",

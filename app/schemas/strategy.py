@@ -5,6 +5,9 @@ Analytical / visualization data only — no signal, action, or
 recommendation fields anywhere in this module.
 """
 
+import datetime
+from typing import Any, Literal
+
 from pydantic import Field
 
 from app.schemas.common import CamelModel
@@ -1092,6 +1095,443 @@ class GreenblattMagicFormulaStrategy(CamelModel):
 
 
 # ---------------------------------------------------------------------------
+# Strategies 29-32: article-based additions (see the matching section in
+# services.strategies for methodology, assumptions and limitations):
+#   29 Seasonal Investment Performance Heat Map   (calendar group)
+#   30 Investment Diversification Heat Map        (portfolio; POST route)
+#   31 EMA + Bollinger Bands + ATR backtest       (technical group)
+#   32 Technical Crash-Warning Risk Indicator     (quantitative group)
+# All additive. Analytical / historical-simulation data only - no order,
+# signal or recommendation fields.
+# ---------------------------------------------------------------------------
+
+
+class HeatMapColorScale(CamelModel):
+    metric: str
+    neutral: float
+    max_abs_return_percent: float | None = None
+    note: str
+
+
+class SeasonalMonthCell(CamelModel):
+    year: int
+    month: int
+    label: str
+    return_percent: float | None = None
+    partial_return_percent: float | None = None
+    sign: str | None = None
+    # ok | partial_month | no_base | prior_month_missing | missing | out_of_range
+    status: str
+    base_date: str | None = None
+    end_date: str | None = None
+
+
+class SeasonalQuarterCell(CamelModel):
+    year: int
+    quarter: int
+    label: str
+    return_percent: float | None = None  # only when status == "complete"
+    partial_return_percent: float | None = None  # linked leading months (quarter-to-date)
+    sign: str | None = None
+    status: str  # complete | partial | missing | out_of_range
+    months_included: int = 0
+
+
+class SeasonalCalendarYear(CamelModel):
+    return_percent: float | None = None
+    sign: str | None = None
+    status: str  # complete | partial | missing
+
+
+class SeasonalYearRow(CamelModel):
+    year: int
+    months: list[SeasonalMonthCell]
+    quarters: list[SeasonalQuarterCell]
+    calendar_year: SeasonalCalendarYear
+
+
+class PeriodSummary(CamelModel):
+    month: int | None = None
+    quarter: int | None = None
+    label: str
+    count: int
+    average_return_percent: float | None = None
+    median_return_percent: float | None = None
+    positive_count: int = 0
+    positive_rate_percent: float | None = None
+    best_return_percent: float | None = None
+    worst_return_percent: float | None = None
+
+
+class SeasonalHeatMapStrategy(CamelModel):
+    symbol: str | None = None
+    price_basis: str
+    adjustment_policy: str
+    requested_start: str | None = None
+    requested_end: str | None = None
+    data_first_date: str
+    data_last_date: str
+    as_of: str
+    month_labels: list[str]
+    quarter_labels: list[str]
+    rows: list[SeasonalYearRow]
+    monthly_summary: list[PeriodSummary]
+    quarterly_summary: list[PeriodSummary]
+    color_scale: HeatMapColorScale
+    methodology: list[str] = Field(default_factory=list)
+    data_quality_warnings: list[str] = Field(default_factory=list)
+    disclaimer: str
+
+
+class DiversificationCell(CamelModel):
+    year: int
+    return_percent: float | None = None
+    partial_return_percent: float | None = None
+    sign: str | None = None
+    # complete | partial | no_base | prior_year_missing | not_listed | missing
+    # (portfolio cells also: incomplete | no_weights)
+    status: str
+    rank: int | None = None
+    rank_among: int | None = None
+    window_start: str | None = None
+    window_end: str | None = None
+    reason: str | None = None
+
+
+class YearReturn(CamelModel):
+    year: int
+    return_percent: float | None = None
+
+
+class DiversificationAsset(CamelModel):
+    symbol: str
+    weight_percent: float | None = None
+    first_date: str | None = None
+    last_date: str | None = None
+    cells: list[DiversificationCell]
+    complete_years: int
+    average_annual_return_percent: float | None = None
+    best_year: YearReturn | None = None
+    worst_year: YearReturn | None = None
+
+
+class DiversificationPortfolio(CamelModel):
+    weights_percent: dict[str, float | None]
+    rebalancing_policy: str
+    policy_description: str
+    cells: list[DiversificationCell]
+
+
+class DiversificationRankEntry(CamelModel):
+    rank: int
+    symbol: str
+    is_portfolio: bool
+    return_percent: float | None = None
+
+
+class DiversificationYearRanking(CamelModel):
+    year: int
+    complete_asset_count: int
+    ranking: list[DiversificationRankEntry]
+
+
+class DiversificationHeatMapStrategy(CamelModel):
+    symbols: list[str]
+    price_basis: str
+    adjustment_policy: str
+    requested_start: str | None = None
+    requested_end: str | None = None
+    years: list[int]
+    as_of: str
+    assets: list[DiversificationAsset]
+    portfolio: DiversificationPortfolio | None = None
+    yearly_rankings: list[DiversificationYearRanking]
+    color_scale: HeatMapColorScale
+    methodology: list[str] = Field(default_factory=list)
+    data_quality_warnings: list[str] = Field(default_factory=list)
+    disclaimer: str
+
+
+class DiversificationHeatMapRequest(CamelModel):
+    """POST body for /api/portfolio/diversification_heat_map.
+
+    `weights_percent` (optional) maps ticker -> percent weight: long-only,
+    finite, summing to 100 (+/-0.01); omitted tickers get 0%. Without it
+    the heat map is returned without a portfolio row. `start`/`end` have
+    calendar-year granularity."""
+
+    symbols: list[str]
+    weights_percent: dict[str, float] | None = None
+    start: datetime.date | None = None
+    end: datetime.date | None = None
+    price_basis: Literal["adjusted", "close"] = "adjusted"
+
+
+class EbaSegmentMetrics(CamelModel):
+    segment: str  # train | out_of_sample
+    start: str
+    end: str
+    bars: int
+    total_return_percent: float | None = None
+    cagr_percent: float | None = None
+    max_drawdown_percent: float | None = None
+    trade_count: int
+    long_trades: int
+    short_trades: int
+    win_rate_percent: float | None = None
+    profit_factor: float | None = None
+    profit_factor_note: str | None = None
+    average_trade_percent: float | None = None
+    exposure_percent: float | None = None
+    ambiguous_bars: int = 0
+    benchmark_buy_hold_return_percent: float | None = None
+    excess_return_vs_benchmark_percent: float | None = None
+
+
+class EbaTrade(CamelModel):
+    side: str  # long | short  (historical simulated trade)
+    segment: str
+    signal_date: str
+    entry_date: str
+    entry_price: float | None = None
+    exit_date: str
+    exit_price: float | None = None
+    exit_reason: str
+    stop_loss: float | None = None
+    take_profit: float | None = None
+    atr_at_signal: float | None = None
+    price_return_percent: float | None = None
+    equity_return_percent: float | None = None
+    bars_held: int
+
+
+class EbaEquityPoint(CamelModel):
+    date: str
+    segment: str
+    equity: float | None = None
+    benchmark: float | None = None
+
+
+class EbaChartPoint(CamelModel):
+    date: str
+    close: float | None = None
+    ema: float | None = None
+    bb_upper: float | None = None
+    bb_lower: float | None = None
+    rsi: float | None = None
+    atr: float | None = None
+
+
+class EbaLatest(CamelModel):
+    date: str
+    close: float | None = None
+    ema: float | None = None
+    bb_upper: float | None = None
+    bb_lower: float | None = None
+    rsi: float | None = None
+    atr: float | None = None
+    trend: str  # Uptrend | Downtrend | Neutral
+    long_setup_active: bool
+    short_setup_active: bool
+    reference_stop_distance: float | None = None
+    reference_take_profit_distance: float | None = None
+    note: str
+
+
+class EbaParameterCandidate(CamelModel):
+    stop_loss_atr_mult: float
+    take_profit_ratio: float
+    train_total_return_percent: float | None = None
+    train_trade_count: int
+    train_max_drawdown_percent: float | None = None
+
+
+class EbaSelectedParameters(CamelModel):
+    stop_loss_atr_mult: float
+    take_profit_ratio: float
+
+
+class EbaParameterSelection(CamelModel):
+    enabled: bool
+    objective: str
+    candidates: list[EbaParameterCandidate] = Field(default_factory=list)
+    selected: EbaSelectedParameters | None = None
+    note: str
+
+
+class EbaParameters(CamelModel):
+    """Effective parameters of the run (article defaults unless overridden)."""
+
+    ema_period: int
+    bb_period: int
+    bb_std: float
+    rsi_period: int
+    atr_period: int
+    trend_lookback: int
+    stop_loss_atr_mult: float
+    take_profit_ratio: float
+    rsi_long_exit: float
+    rsi_short_exit: float
+    commission_percent: float
+    slippage_percent: float
+    position_fraction: float
+    train_fraction: float
+    allow_short: bool
+
+
+class EmaBollingerAtrStrategy(CamelModel):
+    """EMA(30) trend + Bollinger(15, 1.5) entry conditions + ATR(7) risk
+    levels, with a historical train / out-of-sample backtest. Analytics
+    only: no orders, no broker connection, no profitability claim."""
+
+    timeframe: str  # 1d | 1h
+    data_source: str
+    bars_used: int
+    first_bar: str
+    last_bar: str
+    parameters: EbaParameters
+    latest: EbaLatest
+    train_fraction: float
+    train: EbaSegmentMetrics
+    out_of_sample: EbaSegmentMetrics
+    parameter_selection: EbaParameterSelection
+    trade_count_total: int
+    trades: list[EbaTrade]
+    equity_curve: list[EbaEquityPoint]
+    chart_data: list[EbaChartPoint]
+    assumptions: list[str] = Field(default_factory=list)
+    data_quality_warnings: list[str] = Field(default_factory=list)
+    disclaimer: str
+
+
+class CrashCondition(CamelModel):
+    id: str
+    label: str
+    rule: str
+    scored: bool
+    triggered: bool
+    triggered_since: str | None = None
+    observed_at: str
+    note: str | None = None
+
+
+class CrashIndicators(CamelModel):
+    close: float | None = None
+    sma_short: float | None = None
+    sma_long: float | None = None
+    rsi: float | None = None
+    macd: float | None = None
+    signal: float | None = None
+    histogram: float | None = None
+    drawdown_from_252d_high_percent: float | None = None
+
+
+class CrashDivergence(CamelModel):
+    first_swing_date: str
+    first_swing_close: float | None = None
+    first_swing_rsi: float | None = None
+    second_swing_date: str
+    second_swing_close: float | None = None
+    second_swing_rsi: float | None = None
+    confirmed_on: str
+
+
+class CrashClassification(CamelModel):
+    bars: int
+    crash_labelled_bars: int
+    base_rate_percent: float | None = None
+    warning_bars: int
+    true_positives: int
+    false_positives: int
+    false_negatives: int
+    true_negatives: int
+    precision_percent: float | None = None
+    recall_percent: float | None = None
+    false_positive_rate_percent: float | None = None
+    episodes: int
+    episodes_detected: int
+    episodes_missed: int
+    median_lead_bars: float | None = None
+    precision_lift_vs_base_rate: float | None = None
+
+
+class CrashEvaluationBlock(CamelModel):
+    start: str
+    end: str
+    indicator: CrashClassification
+    baseline_sma200: CrashClassification
+    always_warn_precision_percent: float | None = None
+
+
+class CrashValidationDefinition(CamelModel):
+    crash_event: str
+    prediction_horizon_bars: int
+    warning_rule: str
+    baseline_rule: str
+    split: str
+    note: str
+
+
+class CrashParameters(CamelModel):
+    sma_short: int
+    sma_long: int
+    rsi_period: int
+    macd: list[int]
+    macd_recent_cross_bars: int
+    histogram_decline_bars: int
+    swing_half_window: int
+    divergence_lookback_bars: int
+    warning_min_triggered: int
+
+
+class CrashValidation(CamelModel):
+    status: str  # available | unavailable
+    reason: str | None = None
+    definition: CrashValidationDefinition
+    in_sample: CrashEvaluationBlock | None = None
+    out_of_sample: CrashEvaluationBlock | None = None
+    warnings: list[str] = Field(default_factory=list)
+
+
+class CrashChartPoint(CamelModel):
+    date: str
+    close: float | None = None
+    sma_short: float | None = None
+    sma_long: float | None = None
+    rsi: float | None = None
+    macd: float | None = None
+    signal: float | None = None
+    histogram: float | None = None
+    triggered_count: int | None = None
+    triggered: list[str] = Field(default_factory=list)
+
+
+class CrashWarningStrategy(CamelModel):
+    """EXPERIMENTAL transparent technical-risk monitor (daily). A count of
+    explicit indicator conditions - NOT a crash forecast, no probability."""
+
+    timeframe: str
+    data_basis: str
+    as_of: str
+    bars_used: int
+    indicators: CrashIndicators
+    conditions: list[CrashCondition]
+    informational: list[CrashCondition]
+    divergence: CrashDivergence | None = None
+    triggered_count: int
+    scored_condition_count: int
+    risk_level: str  # Low | Elevated | High (heuristic cut-offs)
+    warning_active: bool
+    assessment: str
+    validation: CrashValidation
+    parameters: CrashParameters
+    chart_data: list[CrashChartPoint]
+    methodology: list[str] = Field(default_factory=list)
+    data_quality_warnings: list[str] = Field(default_factory=list)
+    disclaimer: str
+
+
+# ---------------------------------------------------------------------------
 # Strategy categories (see section 10/11 of the reorg spec).
 #
 # These are an ADDITIVE, category-organized view of the exact same data
@@ -1119,6 +1559,7 @@ class TechnicalStrategies(CamelModel):
     pivot_levels: PivotLevelsStrategy | None = None
     cpr: CprStrategy | None = None
     ta_candles_trend_health: TaCandlesTrendHealthStrategy | None = None
+    ema_bollinger_atr: EmaBollingerAtrStrategy | None = None
 
 
 class QuantitativeStrategies(CamelModel):
@@ -1130,6 +1571,7 @@ class QuantitativeStrategies(CamelModel):
     first_passage_time: FirstPassageTimeStrategy | None = None
     graham_valuation: GrahamValuationStrategy | None = None
     greenblatt_magic_formula: GreenblattMagicFormulaStrategy | None = None
+    crash_warning: CrashWarningStrategy | None = None
 
 
 class RegimeStrategies(CamelModel):
@@ -1140,6 +1582,7 @@ class RegimeStrategies(CamelModel):
 
 class CalendarStrategies(CamelModel):
     tlt_monthly_cycle: TltMonthlyCycleStrategy | None = None
+    seasonal_heat_map: SeasonalHeatMapStrategy | None = None
 
 
 class PortfolioStrategies(CamelModel):
@@ -1216,6 +1659,14 @@ class StrategyAnalytics(CamelModel):
     # universe ranking). Always an object with a `status`, never silently null.
     graham_valuation: GrahamValuationStrategy | None = None
     greenblatt_magic_formula: GreenblattMagicFormulaStrategy | None = None
+    # Strategies 29, 31, 32 (single-ETF, all symbols): Seasonal Performance
+    # Heat Map (calendar), EMA + Bollinger + ATR backtest (technical) and the
+    # experimental Technical Crash-Warning indicator (quantitative / risk).
+    # Strategy 30 (Diversification Heat Map) is multi-asset and is served by
+    # POST /api/portfolio/diversification_heat_map instead.
+    seasonal_heat_map: SeasonalHeatMapStrategy | None = None
+    ema_bollinger_atr: EmaBollingerAtrStrategy | None = None
+    crash_warning: CrashWarningStrategy | None = None
 
     # Category-organized view of the SAME strategies above (additive —
     # see the "Strategy categories" note preceding TechnicalStrategies).

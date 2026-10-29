@@ -8,9 +8,14 @@ or anything ML-derived.
 """
 
 import datetime
+import hashlib
+import json
 import logging
+import time
+from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException
+import httpx
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -21,8 +26,17 @@ from app.models import StockUniverseMember
 from app.routers.deps import load_prices, require_prices, resolve_meta
 from app.scanners import data as scanner_data
 from app.scanners import universe as scanner_universe
-from app.schemas import ApiResponse, PortfolioOptimizationRequest, PortfolioOptimizationResult, StrategyAnalytics
-from app.services import cache, portfolio_comparison, regime, strategies
+from app.schemas import (
+    ApiResponse,
+    DiversificationHeatMapRequest,
+    DiversificationHeatMapStrategy,
+    EmaBollingerAtrStrategy,
+    PortfolioOptimizationRequest,
+    PortfolioOptimizationResult,
+    SeasonalHeatMapStrategy,
+    StrategyAnalytics,
+)
+from app.services import cache, eodhd_client, portfolio_comparison, regime, strategies
 
 logger = logging.getLogger(__name__)
 
@@ -463,6 +477,19 @@ async def get_strategy_analytics(symbol: str, db: AsyncSession = Depends(get_db)
     are not served for the new fields; the response shape stays backward
     compatible either way since all fields are optional.
 
+    Also carries three article-based strategies (services.strategies
+    Strategies 29, 31, 32) computed with their default parameters from the
+    symbol's own daily history and surfaced as flat fields and inside
+    their category group: `seasonalHeatMap` (calendarStrategies),
+    `emaBollingerAtr` (technicalStrategies, with a train / out-of-sample
+    backtest) and `crashWarning` (quantitativeStrategies; an EXPERIMENTAL
+    technical-risk monitor, not a crash forecast). Cache key bumped
+    v10 -> v11 so older cached payloads are not served; all new fields are
+    optional. Strategy 30 (Diversification Heat Map) is multi-asset and is
+    served by POST /api/portfolio/diversification_heat_map; the parameterised
+    seasonal / EMA-BB-ATR variants are GET /api/etfs/{symbol}/strategies/
+    seasonal_heat_map and .../ema_bollinger_atr.
+
     Also carries two fundamental-valuation Quantitative strategies
     (services.strategies Strategies 27-28), added WITHOUT a new endpoint
     or cache-key change (they are attached after the cached ETF payload):
@@ -492,7 +519,7 @@ async def get_strategy_analytics(symbol: str, db: AsyncSession = Depends(get_db)
             ),
         )
 
-    cache_key = f"tw:v10:strategies:{meta.symbol}"
+    cache_key = f"tw:v11:strategies:{meta.symbol}"
     cached = await cache.get_json(cache_key)
     if cached is not None:
         result = cached
@@ -528,6 +555,11 @@ async def get_strategy_analytics(symbol: str, db: AsyncSession = Depends(get_db)
             "pivot_levels": strategies.compute_pivot_levels(prices),
             "cpr": strategies.compute_cpr(prices),
             "ta_candles_trend_health": strategies.compute_ta_candles_trend_health(prices),
+            # Strategies 29, 31, 32 (default parameters; the parameterised
+            # variants are the dedicated routes at the bottom of this module).
+            "seasonal_heat_map": strategies.compute_seasonal_heat_map(prices, symbol=meta.symbol),
+            "ema_bollinger_atr": strategies.compute_ema_bollinger_atr(prices),
+            "crash_warning": strategies.compute_crash_warning(prices),
         }
 
         if meta.symbol == PORTFOLIO_COMPARISON_SYMBOL:
@@ -587,6 +619,7 @@ async def get_strategy_analytics(symbol: str, db: AsyncSession = Depends(get_db)
             "pivot_levels": result["pivot_levels"],
             "cpr": result["cpr"],
             "ta_candles_trend_health": result["ta_candles_trend_health"],
+            "ema_bollinger_atr": result["ema_bollinger_atr"],
         }
         result["quantitative_strategies"] = {
             "evar_risk": result["evar_risk"],
@@ -595,6 +628,7 @@ async def get_strategy_analytics(symbol: str, db: AsyncSession = Depends(get_db)
             "soc_avalanche": result["soc_avalanche"],
             "wavelet_trend_filter": result["wavelet_trend_filter"],
             "first_passage_time": result["first_passage_time"],
+            "crash_warning": result["crash_warning"],
         }
         result["regime_strategies"] = {
             "risk_on_risk_off": result["risk_on_risk_off"],
@@ -603,6 +637,7 @@ async def get_strategy_analytics(symbol: str, db: AsyncSession = Depends(get_db)
         }
         result["calendar_strategies"] = {
             "tlt_monthly_cycle": result["tlt_monthly_cycle"],
+            "seasonal_heat_map": result["seasonal_heat_map"],
         }
         result["portfolio_strategies"] = {
             "tqqq_tmf_ief_rebalancing": result["tqqq_tmf_ief_rebalancing"],
@@ -648,6 +683,9 @@ async def get_strategy_analytics(symbol: str, db: AsyncSession = Depends(get_db)
         "pivot_levels": "Pivot Levels",
         "cpr": "CPR (Central Pivot Range)",
         "ta_candles_trend_health": "TA Candles / Trend Health",
+        "seasonal_heat_map": "Seasonal Performance Heat Map",
+        "ema_bollinger_atr": "EMA + Bollinger Bands + ATR",
+        "crash_warning": "Technical Crash-Warning Risk Indicator",
     }
     if meta.symbol == PORTFOLIO_COMPARISON_SYMBOL:
         strategy_labels["vt_vs_vti_vxus"] = "VT vs VTI+VXUS Portfolio Comparison"
@@ -758,5 +796,292 @@ async def post_portfolio_optimization(
             ),
         )
 
+    await cache.set_json(cache_key, result)
+    return ApiResponse(data=result)
+
+
+# ---------------------------------------------------------------------------
+# Strategies 29-32: parameterised variants of the article-based strategies.
+# The default-parameter results of 29, 31 and 32 are already part of
+# GET /etfs/{symbol}/strategies above; these routes exist only because the
+# date range (29), the tickers/weights (30) and the backtest configuration /
+# hourly timeframe (31) cannot be expressed through that route.
+# Results are cached under "tw:v1:article:*", which nightly ingestion busts.
+# ---------------------------------------------------------------------------
+
+ARTICLE_CACHE_PREFIX = "tw:v1:article:"
+DIVERSIFICATION_MIN_SYMBOLS = 2
+DIVERSIFICATION_MAX_SYMBOLS = 12
+# Hourly bars are fetched on demand from EODHD (5 API calls per request) and
+# NOT stored in PostgreSQL, so they are memoised to protect the API quota even
+# when Redis is down.
+HOURLY_BARS_TTL_SECONDS = 6 * 3600
+HOURLY_MEMO_SECONDS = 900
+HOURLY_MAX_LOOKBACK_DAYS = 1825
+_hourly_memo: dict[str, tuple[float, list[dict]]] = {}
+
+
+def _digest(payload: object) -> str:
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()[:20]
+
+
+def _price_source_meta(symbol: str):
+    return (
+        ETF_REGISTRY.get(symbol)
+        or PORTFOLIO_COMPARISON_REGISTRY.get(symbol)
+        or STRATEGY_ONLY_REGISTRY[symbol]
+    )
+
+
+async def _load_hourly_bars(symbol: str, lookback_days: int) -> list[strategies.PriceBar]:
+    """Hourly OHLCV for `symbol` straight from EODHD's intraday endpoint.
+
+    Never substitutes daily data: an entitlement problem or missing coverage is
+    reported as an explicit, actionable error."""
+    memo_key = f"{symbol}:{lookback_days}"
+    cache_key = f"{ARTICLE_CACHE_PREFIX}bars1h:{memo_key}"
+    now = time.monotonic()
+    memo = _hourly_memo.get(memo_key)
+    rows = memo[1] if memo and now - memo[0] < HOURLY_MEMO_SECONDS else None
+
+    if rows is None:
+        async def _fetch() -> list[dict]:
+            to_dt = datetime.datetime.now(datetime.timezone.utc)
+            from_dt = to_dt - datetime.timedelta(days=lookback_days)
+            try:
+                return await eodhd_client.fetch_intraday_history(
+                    _price_source_meta(symbol).eodhd_symbol(), "1h", from_dt=from_dt, to_dt=to_dt
+                )
+            except eodhd_client.EodhdEntitlementError as exc:
+                raise HTTPException(status_code=403, detail=str(exc)) from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code
+                logger.warning("EODHD intraday request for %s failed with HTTP %s", symbol, status)
+                raise HTTPException(
+                    status_code=404 if status == 404 else 502,
+                    detail=(
+                        f"EODHD has no hourly data for {symbol}." if status == 404
+                        else "EODHD intraday request failed; try again later."
+                    ),
+                ) from exc
+            except (httpx.TimeoutException, httpx.ConnectError) as exc:
+                logger.warning("EODHD intraday request for %s failed: %s", symbol, type(exc).__name__)
+                raise HTTPException(status_code=502, detail="EODHD intraday request timed out; try again later.") from exc
+
+        rows = await cache.get_or_compute(cache_key, _fetch, ttl=HOURLY_BARS_TTL_SECONDS)
+        _hourly_memo[memo_key] = (now, rows)
+
+    bars: list[strategies.PriceBar] = []
+    for row in rows or []:
+        try:
+            bars.append(
+                strategies.PriceBar(
+                    date=datetime.datetime.strptime(str(row["datetime"])[:19], "%Y-%m-%d %H:%M:%S"),
+                    open=float(row["open"]), high=float(row["high"]), low=float(row["low"]),
+                    close=float(row["close"]), volume=float(row.get("volume") or 0),
+                )
+            )
+        except (KeyError, TypeError, ValueError):
+            continue  # malformed bar: dropped (counted below), never guessed
+    if not bars:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"EODHD returned no usable hourly bars for {symbol} in the last {lookback_days} days "
+                "(symbol or period not covered). Daily data was NOT substituted."
+            ),
+        )
+    return bars
+
+
+@router.get(
+    "/{symbol}/strategies/seasonal_heat_map",
+    response_model=ApiResponse[SeasonalHeatMapStrategy],
+)
+async def get_seasonal_heat_map(
+    symbol: str,
+    start: datetime.date | None = Query(default=None, description="First month shown (month granularity)."),
+    end: datetime.date | None = Query(default=None, description="Last month shown (month granularity)."),
+    price_basis: Literal["adjusted", "close"] = Query(
+        default="adjusted",
+        description="'adjusted' = EODHD adjusted_close (splits+dividends); 'close' = raw close.",
+    ),
+    db: AsyncSession = Depends(get_db),
+):
+    """Strategy 29 - monthly + geometrically-linked quarterly returns by
+    calendar year for a supported symbol, over an optional date range."""
+    sym = _resolve_portfolio_symbol(symbol)
+    if start and end and start > end:
+        raise HTTPException(status_code=422, detail="start must not be after end.")
+
+    cache_key = f"{ARTICLE_CACHE_PREFIX}seasonal:{sym}:{price_basis}:{start}:{end}"
+    cached = await cache.get_json(cache_key)
+    if cached is not None:
+        return ApiResponse(data=cached)
+
+    prices = await load_prices(db, sym)
+    require_prices(prices, sym)
+    result = strategies.compute_seasonal_heat_map(
+        prices, symbol=sym, start=start, end=end, price_basis=price_basis
+    )
+    if result is None:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Insufficient price history for {sym} in the requested range: at least two calendar "
+                "months of data are needed. Extend history with POST /api/admin/backfill if needed."
+            ),
+        )
+    await cache.set_json(cache_key, result)
+    return ApiResponse(data=result)
+
+
+@router.get(
+    "/{symbol}/strategies/ema_bollinger_atr",
+    response_model=ApiResponse[EmaBollingerAtrStrategy],
+)
+async def get_ema_bollinger_atr(
+    symbol: str,
+    timeframe: Literal["1d", "1h"] = Query(
+        default="1d",
+        description="'1d' uses stored daily bars. '1h' fetches hourly bars from EODHD (needs an intraday plan).",
+    ),
+    lookback_days: int = Query(
+        default=730, ge=30, le=HOURLY_MAX_LOOKBACK_DAYS, description="Hourly timeframe only: history window."
+    ),
+    optimize: bool = Query(
+        default=False, description="Pick stop multiple / take-profit ratio on the TRAINING segment only."
+    ),
+    ema_period: int | None = Query(default=None),
+    bb_period: int | None = Query(default=None),
+    bb_std: float | None = Query(default=None),
+    rsi_period: int | None = Query(default=None),
+    atr_period: int | None = Query(default=None),
+    trend_lookback: int | None = Query(default=None),
+    stop_loss_atr_mult: float | None = Query(default=None),
+    take_profit_ratio: float | None = Query(default=None),
+    rsi_long_exit: float | None = Query(default=None),
+    rsi_short_exit: float | None = Query(default=None),
+    commission_percent: float | None = Query(default=None),
+    slippage_percent: float | None = Query(default=None),
+    position_fraction: float | None = Query(default=None),
+    train_fraction: float | None = Query(default=None),
+    allow_short: bool | None = Query(default=None),
+    db: AsyncSession = Depends(get_db),
+):
+    """Strategy 31 - EMA trend + Bollinger entry conditions + ATR risk levels
+    with a train / out-of-sample historical backtest. Analytics only: no
+    orders are placed. Omitted parameters keep the article defaults."""
+    sym = _resolve_portfolio_symbol(symbol)
+    overrides = {
+        "ema_period": ema_period, "bb_period": bb_period, "bb_std": bb_std, "rsi_period": rsi_period,
+        "atr_period": atr_period, "trend_lookback": trend_lookback, "stop_loss_atr_mult": stop_loss_atr_mult,
+        "take_profit_ratio": take_profit_ratio, "rsi_long_exit": rsi_long_exit,
+        "rsi_short_exit": rsi_short_exit, "commission_percent": commission_percent,
+        "slippage_percent": slippage_percent, "position_fraction": position_fraction,
+        "train_fraction": train_fraction, "allow_short": allow_short,
+    }
+    try:
+        params = strategies.resolve_ema_bollinger_atr_params(overrides)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    cache_key = (
+        f"{ARTICLE_CACHE_PREFIX}eba:{sym}:{timeframe}:{lookback_days if timeframe == '1h' else 0}:"
+        f"{int(optimize)}:{_digest(params)}"
+    )
+    cached = await cache.get_json(cache_key)
+    if cached is not None:
+        return ApiResponse(data=cached)
+
+    if timeframe == "1h":
+        bars = await _load_hourly_bars(sym, lookback_days)
+        source = "EODHD intraday API (interval 1h, raw/unadjusted, UTC); not stored in the database"
+    else:
+        bars = await load_prices(db, sym)
+        require_prices(bars, sym)
+        source = None
+    result = strategies.compute_ema_bollinger_atr(
+        bars, timeframe=timeframe, params=overrides, optimize=optimize, data_source=source
+    )
+    if result is None:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Insufficient {timeframe} history for {sym}: the indicators need a warm-up period plus at "
+                f"least {strategies.EBA_MIN_SEGMENT_BARS} bars in each of the training and out-of-sample segments."
+            ),
+        )
+    await cache.set_json(cache_key, result)
+    return ApiResponse(data=result)
+
+
+@portfolio_router.post(
+    "/diversification_heat_map",
+    response_model=ApiResponse[DiversificationHeatMapStrategy],
+)
+async def post_diversification_heat_map(
+    request: DiversificationHeatMapRequest, db: AsyncSession = Depends(get_db)
+):
+    """Strategy 30 - annual returns of several supported instruments ranked
+    within each calendar year, plus an optional user-weighted portfolio
+    (annual rebalancing - see services.strategies Strategy 30). Descriptive
+    only; it does not establish diversification benefits."""
+    unique_symbols: list[str] = []
+    for raw in request.symbols:
+        sym = (raw or "").strip().upper()
+        if sym and sym not in unique_symbols:
+            unique_symbols.append(sym)
+    if not DIVERSIFICATION_MIN_SYMBOLS <= len(unique_symbols) <= DIVERSIFICATION_MAX_SYMBOLS:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Provide between {DIVERSIFICATION_MIN_SYMBOLS} and "
+                f"{DIVERSIFICATION_MAX_SYMBOLS} distinct symbols."
+            ),
+        )
+    for sym in unique_symbols:
+        _resolve_portfolio_symbol(sym)
+    if request.start and request.end and request.start > request.end:
+        raise HTTPException(status_code=422, detail="start must not be after end.")
+
+    weights = None
+    if request.weights_percent is not None:
+        try:
+            weights = strategies.validate_portfolio_weights(unique_symbols, request.weights_percent)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    cache_key = ARTICLE_CACHE_PREFIX + "diversification:" + _digest(
+        {
+            "s": sorted(unique_symbols), "w": weights, "start": request.start, "end": request.end,
+            "basis": request.price_basis,
+        }
+    )
+    cached = await cache.get_json(cache_key)
+    if cached is not None:
+        return ApiResponse(data=cached)
+
+    prices_by_symbol = {}
+    for sym in unique_symbols:
+        prices = await load_prices(db, sym)
+        require_prices(prices, sym)
+        prices_by_symbol[sym] = prices
+
+    result = strategies.compute_diversification_heat_map(
+        prices_by_symbol, weights_percent=weights, start=request.start, end=request.end,
+        price_basis=request.price_basis,
+    )
+    if result is None:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "No complete calendar-year returns could be formed for the requested symbols and range "
+                "(at least two calendar years of history are needed). Extend history with "
+                "POST /api/admin/backfill if needed."
+            ),
+        )
     await cache.set_json(cache_key, result)
     return ApiResponse(data=result)

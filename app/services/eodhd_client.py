@@ -34,6 +34,13 @@ BACKOFF_MULTIPLIER = 4.0
 JITTER_MAX_S = 1.0
 
 
+def _redact(value: object) -> str:
+    """str(value) with the API token masked (httpx exception text embeds the full URL)."""
+    text = str(value)
+    token = settings.eodhd_api_token
+    return text.replace(token, "***") if token else text
+
+
 async def _get_json_with_retry(url: str, params: dict[str, str], log_ctx: str) -> object:
     """Shared GET-with-retry/backoff core used by every EODHD call below.
 
@@ -76,7 +83,7 @@ async def _get_json_with_retry(url: str, params: dict[str, str], log_ctx: str) -
                 log_ctx,
                 attempt,
                 MAX_RETRIES,
-                last_exception,
+                _redact(last_exception),
                 wait,
             )
             await asyncio.sleep(wait)
@@ -86,7 +93,7 @@ async def _get_json_with_retry(url: str, params: dict[str, str], log_ctx: str) -
         "EODHD request for %s failed after %d attempts: %s",
         log_ctx,
         MAX_RETRIES,
-        last_exception,
+        _redact(last_exception),
     )
     raise last_exception  # type: ignore[misc]
 
@@ -198,3 +205,67 @@ async def fetch_index_fundamentals(index_eodhd_symbol: str) -> dict | None:
     module's docstring). Returns None if unavailable.
     """
     return await fetch_fundamentals(index_eodhd_symbol)
+
+
+class EodhdEntitlementError(Exception):
+    """EODHD rejected the request because the API token / subscription does not
+    cover the endpoint (401/402/403). Carries an actionable, token-free message."""
+
+
+# EODHD intraday: interval -> maximum (to - from) span per request, in days.
+INTRADAY_MAX_SPAN_DAYS = {"1m": 120, "5m": 600, "1h": 7200}
+
+
+async def fetch_intraday_history(
+    eodhd_symbol: str,
+    interval: str = "1h",
+    from_dt: datetime.datetime | None = None,
+    to_dt: datetime.datetime | None = None,
+) -> list[dict]:
+    """
+    Fetch intraday OHLCV bars for a symbol like "SPY.US" from
+    https://eodhd.com/api/intraday/{symbol} (raw, UNADJUSTED bars; `datetime`
+    is UTC). Requires an EODHD plan that includes intraday data
+    (EOD+Intraday / All-in-One); each request costs 5 API calls.
+
+    Returns a list of dicts: {timestamp, datetime, open, high, low, close, volume}.
+
+    Raises:
+      ValueError             - unsupported interval or a range beyond EODHD's limit.
+      EodhdEntitlementError  - 401/402/403: the plan/token does not include intraday.
+    No silent fallback to daily data is ever performed here.
+    """
+    if interval not in INTRADAY_MAX_SPAN_DAYS:
+        raise ValueError(f"Unsupported intraday interval '{interval}'.")
+    params: dict[str, str] = {
+        "api_token": settings.eodhd_api_token,
+        "fmt": "json",
+        "interval": interval,
+    }
+    if from_dt and to_dt:
+        span_days = (to_dt - from_dt).total_seconds() / 86400.0
+        if span_days > INTRADAY_MAX_SPAN_DAYS[interval]:
+            raise ValueError(
+                f"EODHD allows at most {INTRADAY_MAX_SPAN_DAYS[interval]} days per {interval} request."
+            )
+    if from_dt:
+        params["from"] = str(int(from_dt.replace(tzinfo=from_dt.tzinfo or datetime.timezone.utc).timestamp()))
+    if to_dt:
+        params["to"] = str(int(to_dt.replace(tzinfo=to_dt.tzinfo or datetime.timezone.utc).timestamp()))
+
+    url = f"{BASE_URL}/intraday/{eodhd_symbol}"
+    try:
+        data = await _get_json_with_retry(url, params, log_ctx=f"{eodhd_symbol}:{interval}")
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code in (401, 402, 403):
+            raise EodhdEntitlementError(
+                f"EODHD denied access to intraday {interval} data for {eodhd_symbol} "
+                f"(HTTP {exc.response.status_code}). The configured EODHD plan/token must include "
+                "intraday data (EOD+Intraday or All-in-One). Use timeframe=1d, or upgrade the plan."
+            ) from exc
+        raise
+
+    if not isinstance(data, list):
+        logger.warning("Unexpected EODHD intraday payload for %s: %r", eodhd_symbol, type(data))
+        return []
+    return data

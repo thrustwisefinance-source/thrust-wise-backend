@@ -174,3 +174,62 @@ async def trigger_scanner_refresh(
             "message": f"Scanner refresh started for universe '{universe}'",
         },
     )
+
+@router.post("/backfill")
+async def trigger_history_backfill(
+    symbol: str = Query(description="Plain symbol already in a price registry, e.g. 'SPY'."),
+    years: int = Query(default=15, ge=1, le=40, description="How many years of daily history to request."),
+    restate_adjusted: bool = Query(
+        default=False,
+        description=(
+            "Also overwrite adjusted_close on rows already stored (EODHD restates it after later "
+            "dividends/splits; ingestion never does). Only adjusted_close is changed; no rows are deleted."
+        ),
+    ),
+    x_admin_token: str | None = Header(
+        default=None,
+        alias="X-Admin-Token",
+    ),
+):
+    """Controlled one-symbol history backfill (1 EODHD EOD call) used to extend
+    coverage for the Seasonal / Diversification heat maps beyond the default
+    ingestion window, and optionally to restate adjusted_close. Admin-only,
+    same auth and locking convention as POST /admin/refresh. Never runs
+    automatically."""
+    _verify_admin_token(x_admin_token)
+
+    plain = symbol.strip().upper()
+    if plain not in ingestion._all_price_sources():
+        raise HTTPException(status_code=404, detail=f"Unknown symbol: {symbol}")
+
+    if _refresh_lock.locked():
+        return JSONResponse(
+            status_code=409,
+            content={
+                "data": None,
+                "success": False,
+                "message": "Ingestion run already in progress",
+            },
+        )
+
+    async def _run_backfill():
+        async with _refresh_lock:
+            try:
+                async with AsyncSessionLocal() as session:
+                    result = await ingestion.backfill_symbol_history(
+                        session, plain, years, restate_adjusted=restate_adjusted
+                    )
+                logger.info("Admin-triggered backfill completed: %s", result)
+            except Exception:
+                logger.exception("Admin-triggered backfill failed for %s", plain)
+
+    _run_in_background(_run_backfill())
+
+    return JSONResponse(
+        status_code=202,
+        content={
+            "data": {"status": "started", "symbol": plain, "years": years, "restateAdjusted": restate_adjusted},
+            "success": True,
+            "message": f"Backfill started for {plain}",
+        },
+    )
