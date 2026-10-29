@@ -13,8 +13,10 @@ already loaded from the database (see routers.deps.load_prices), no DB or
 HTTP access here, no external calls.
 """
 
+import dataclasses
 import datetime
 import math
+import numbers
 
 import numpy as np
 import pandas as pd
@@ -4422,4 +4424,1560 @@ def screen_magic_formula(
         "excluded_by_reason": dict(sorted(excluded_by_reason.items())),
         "ranked": ranked,
         "unranked": unranked,
+    }
+
+
+# ===========================================================================
+# Strategies 29-32: article-based additions
+#
+#   29. Seasonal Investment Performance Heat Map   (calendar group)
+#   30. Investment Diversification Heat Map        (portfolio group)
+#   31. EMA + Bollinger Bands + ATR (backtest)     (technical group)
+#   32. Technical Crash-Warning Risk Indicator     (quantitative group)
+#
+# Same conventions as everything above: pure functions over price rows that
+# the router has already loaded (no DB / HTTP access here), pandas/numpy
+# only, JSON-ready dicts out, `None` when history is insufficient, and no
+# buy/sell/hold recommendation anywhere. #31 contains a historical
+# backtest simulator; it is an analytics tool, NOT an execution system.
+# ===========================================================================
+
+ARTICLE_PRICE_BASES = ("adjusted", "close")
+MONTH_LABELS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+QUARTER_LABELS = ("Q1", "Q2", "Q3", "Q4")
+# A month/year whose last observation is within this many calendar days of the
+# last weekday of the period is treated as complete (covers exchange holidays
+# such as Good Friday / Thanksgiving closing the true last weekday).
+PERIOD_END_TOLERANCE_DAYS = 4
+# Day-over-day jump in (adjusted_close / close) treated as a probable split.
+CORPORATE_ACTION_RATIO_JUMP = 0.20
+
+
+def _last_weekday(year: int, month: int) -> datetime.date:
+    last = (pd.Timestamp(year=year, month=month, day=1) + pd.offsets.MonthEnd(0)).date()
+    while last.weekday() >= 5:
+        last -= datetime.timedelta(days=1)
+    return last
+
+
+def _month_end_date(year: int, month: int) -> datetime.date:
+    return (pd.Timestamp(year=year, month=month, day=1) + pd.offsets.MonthEnd(0)).date()
+
+
+def _article_price_series(prices, basis: str) -> pd.Series:
+    """Positive, finite prices of the chosen basis indexed by date (ascending,
+    one row per date). Rows lacking a valid value are dropped, never zero-filled."""
+    attr = "adjusted_close" if basis == "adjusted" else "close"
+    rows = {}
+    for p in prices or []:
+        value = getattr(p, attr, None)
+        if _is_num(value) and float(value) > 0 and p.date is not None:
+            rows[pd.Timestamp(p.date)] = float(value)
+    if not rows:
+        return pd.Series(dtype=float)
+    return pd.Series(rows, dtype=float).sort_index()
+
+
+def _corporate_action_warnings(prices, basis: str) -> list[str]:
+    """Data-quality notes about the price basis. EODHD `close` is NOT adjusted
+    for splits; `adjusted_close` is adjusted for splits AND dividends."""
+    warnings: list[str] = []
+    both = {}
+    for p in prices or []:
+        c, a = getattr(p, "close", None), getattr(p, "adjusted_close", None)
+        if _is_num(c) and _is_num(a) and float(c) > 0 and float(a) > 0:
+            both[pd.Timestamp(p.date)] = float(a) / float(c)
+    if len(both) < 3:
+        return warnings
+    ratio = pd.Series(both).sort_index()
+    jumps = ratio.pct_change().abs()
+    for ts, jump in jumps[jumps > CORPORATE_ACTION_RATIO_JUMP].items():
+        if basis == "close":
+            warnings.append(
+                f"Probable stock split around {ts.date().isoformat()}: raw close is not split-adjusted, "
+                "so returns spanning this date are distorted. Use price_basis='adjusted'."
+            )
+        else:
+            warnings.append(
+                f"Adjusted/raw close ratio changes by {jump * 100:.0f}% around {ts.date().isoformat()} "
+                "(probable split or restated history); verify the stored adjusted_close history."
+            )
+    span_days = (ratio.index[-1] - ratio.index[0]).days
+    if basis == "adjusted" and span_days > 730 and float(ratio.max() - ratio.min()) < 1e-9:
+        warnings.append(
+            "adjusted_close equals close for the entire history, so dividends are probably not "
+            "reflected (stored history may pre-date dividend adjustment). Returns are then price-only; "
+            "run POST /api/admin/backfill with restate_adjusted=true to restate adjusted_close."
+        )
+    return warnings
+
+
+def _is_real_number(value) -> bool:
+    """Strict numeric check for USER input: a real, finite int/float (not a bool,
+    not a numeric string such as "60", not NaN/inf). `_is_num` above is lenient
+    about numeric strings, which is wrong for validating request payloads."""
+    return (
+        isinstance(value, numbers.Real)
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+    )
+
+
+def _pct(value: float | None, digits: int = 2) -> float | None:
+    return None if value is None else _round(value * 100.0, digits)
+
+
+def _sign(value: float | None) -> str | None:
+    if value is None:
+        return None
+    return "positive" if value > 0 else "negative" if value < 0 else "zero"
+
+
+def _linked_return(returns: list[float]) -> float:
+    """Geometric linking: prod(1 + r) - 1 (NEVER the sum of returns)."""
+    total = 1.0
+    for r in returns:
+        total *= 1.0 + r
+    return total - 1.0
+
+
+def _summary_stats(values: list[float]) -> dict:
+    if not values:
+        return {
+            "count": 0, "average_return_percent": None, "median_return_percent": None,
+            "positive_count": 0, "positive_rate_percent": None,
+            "best_return_percent": None, "worst_return_percent": None,
+        }
+    arr = np.array(values, dtype=float)
+    positive = int((arr > 0).sum())
+    return {
+        "count": len(values),
+        "average_return_percent": _pct(float(arr.mean())),
+        "median_return_percent": _pct(float(np.median(arr))),
+        "positive_count": positive,
+        "positive_rate_percent": _round(positive / len(values) * 100.0, 1),
+        "best_return_percent": _pct(float(arr.max())),
+        "worst_return_percent": _pct(float(arr.min())),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Strategy 29: Seasonal Investment Performance Heat Map
+#
+# Source: "How to Create Seasonal Investment Performance Heat Maps in Python"
+# (C. L. Tanny). Calendar-year x month grid of returns, plus quarterly
+# returns obtained by GEOMETRICALLY linking the three monthly returns:
+#     quarter = prod(1 + monthly) - 1        (never a sum of percentages)
+#
+# Rules (all enforced in code and covered by tests):
+#   * Monthly return = last observation of the month / last observation of
+#     the IMMEDIATELY PRECEDING calendar month - 1. If the preceding month has
+#     no observation the month is reported as missing/unavailable - it is never
+#     treated as a 0% month, and a return is never stretched over a gap.
+#   * The first month of the data has no base and is reported as `no_base`.
+#   * A month still in progress (or whose data ends early) is `partial_month`
+#     and is excluded from complete-period statistics.
+#   * A quarter is `complete` only when all three monthly returns are valid.
+#     Otherwise `returnPercent` is null; `partialReturnPercent` carries the
+#     linked return of the leading run of valid months (quarter-to-date) and
+#     `monthsIncluded` says how many months it covers.
+#   * Adjustment policy: price_basis='adjusted' (default) = EODHD
+#     adjusted_close (splits + dividends, i.e. total return); 'close' = raw
+#     close (price only, NOT split-adjusted).
+#   * The requested range has MONTH granularity (any month overlapping
+#     [start, end] is shown) and is never hard-coded; history before `start`
+#     is still used as the base for the first displayed month.
+# ---------------------------------------------------------------------------
+
+SEASONAL_DISCLAIMER = (
+    "Historical, descriptive statistics only. Past seasonal patterns do not imply future returns, "
+    "and a pattern across a small number of years is not statistically reliable."
+)
+
+
+def compute_seasonal_heat_map(
+    prices,
+    symbol: str | None = None,
+    start: datetime.date | None = None,
+    end: datetime.date | None = None,
+    price_basis: str = "adjusted",
+    as_of: datetime.date | None = None,
+) -> dict | None:
+    """Monthly + quarterly return heat-map dataset. None when fewer than two
+    distinct months of data (no return can be formed) or nothing in range."""
+    if price_basis not in ARTICLE_PRICE_BASES:
+        raise ValueError(f"price_basis must be one of {ARTICLE_PRICE_BASES}")
+    if start and end and start > end:
+        raise ValueError("start must not be after end")
+
+    series = _article_price_series(prices, price_basis)
+    if series.empty:
+        return None
+    as_of = as_of or datetime.datetime.now(datetime.timezone.utc).date()
+
+    periods = series.index.to_period("M")
+    month_last_value = series.groupby(periods).last()
+    month_last_date = series.index.to_series().groupby(periods).max()
+    if len(month_last_value) < 2:
+        return None
+
+    first_period = month_last_value.index[0]
+    last_period = month_last_value.index[-1]
+    data_first = series.index[0].date()
+    data_last = series.index[-1].date()
+
+    # Final month: complete only if the calendar month is over AND the data reaches its end.
+    final_complete = (
+        as_of > _month_end_date(last_period.year, last_period.month)
+        and data_last
+        >= _last_weekday(last_period.year, last_period.month)
+        - datetime.timedelta(days=PERIOD_END_TOLERANCE_DAYS)
+    )
+
+    range_first = pd.Period(start, "M") if start else first_period
+    range_last = pd.Period(end, "M") if end else last_period
+    shown_first = max(range_first, first_period)
+    shown_last = min(range_last, last_period)
+    if shown_first > shown_last:
+        return None
+
+    # Every month from the first displayed to the last displayed.
+    cells: dict[tuple[int, int], dict] = {}
+    for period in pd.period_range(shown_first, shown_last, freq="M"):
+        key = (period.year, period.month)
+        cell = {
+            "year": period.year, "month": period.month, "label": MONTH_LABELS[period.month - 1],
+            "return_percent": None, "sign": None, "status": "missing",
+            "base_date": None, "end_date": None,
+        }
+        if period in month_last_value.index:
+            cell["end_date"] = month_last_date[period].date().isoformat()
+            prev = period - 1
+            if period == first_period:
+                cell["status"] = "no_base"
+            elif prev not in month_last_value.index:
+                cell["status"] = "prior_month_missing"
+            else:
+                r = float(month_last_value[period] / month_last_value[prev] - 1.0)
+                cell["base_date"] = month_last_date[prev].date().isoformat()
+                if period == last_period and not final_complete:
+                    cell["status"] = "partial_month"
+                    cell["partial_return_percent"] = _pct(r)
+                else:
+                    cell["status"] = "ok"
+                    cell["return_percent"] = _pct(r)
+                    cell["sign"] = _sign(r)
+                    cell["_r"] = r
+        cells[key] = cell
+
+    def month_cell(year: int, month: int) -> dict:
+        existing = cells.get((year, month))
+        if existing is not None:
+            return existing
+        return {
+            "year": year, "month": month, "label": MONTH_LABELS[month - 1],
+            "return_percent": None, "sign": None, "status": "out_of_range",
+            "base_date": None, "end_date": None,
+        }
+
+    rows = []
+    quarter_values: dict[int, list[float]] = {1: [], 2: [], 3: [], 4: []}
+    month_values: dict[int, list[float]] = {m: [] for m in range(1, 13)}
+    all_abs: list[float] = []
+    for year in range(shown_first.year, shown_last.year + 1):
+        months = [month_cell(year, m) for m in range(1, 13)]
+        quarters = []
+        for q in range(4):
+            trio = months[q * 3 : q * 3 + 3]
+            ok_returns = [c["_r"] for c in trio if c["status"] == "ok"]
+            leading = []
+            for c in trio:
+                if c["status"] != "ok":
+                    break
+                leading.append(c["_r"])
+            q_cell = {
+                "year": year, "quarter": q + 1, "label": QUARTER_LABELS[q],
+                "return_percent": None, "partial_return_percent": None, "sign": None,
+                "status": "missing", "months_included": len(leading),
+            }
+            if len(ok_returns) == 3:
+                linked = _linked_return(ok_returns)
+                q_cell.update(
+                    return_percent=_pct(linked), sign=_sign(linked), status="complete", months_included=3
+                )
+                quarter_values[q + 1].append(linked)
+            elif leading:
+                q_cell.update(
+                    partial_return_percent=_pct(_linked_return(leading)), status="partial"
+                )
+            elif ok_returns or any(c["status"] == "partial_month" for c in trio):
+                q_cell["status"] = "partial"
+            elif all(c["status"] == "out_of_range" for c in trio):
+                q_cell["status"] = "out_of_range"
+            quarters.append(q_cell)
+
+        year_ok = [c["_r"] for c in months if c["status"] == "ok"]
+        if len(year_ok) == 12:
+            linked_year = _linked_return(year_ok)
+            calendar_year = {"return_percent": _pct(linked_year), "sign": _sign(linked_year), "status": "complete"}
+        else:
+            calendar_year = {"return_percent": None, "sign": None, "status": "partial" if year_ok else "missing"}
+
+        for c in months:
+            if c["status"] == "ok":
+                month_values[c["month"]].append(c["_r"])
+                all_abs.append(abs(c["_r"]))
+        rows.append({"year": year, "months": months, "quarters": quarters, "calendar_year": calendar_year})
+
+    for row in rows:
+        for c in row["months"]:
+            c.pop("_r", None)
+
+    warnings = _corporate_action_warnings(prices, price_basis)
+    if start and start < data_first:
+        warnings.append(
+            f"Requested start {start.isoformat()} precedes the earliest stored price "
+            f"({data_first.isoformat()}); earlier months are unavailable. Extend history with "
+            "POST /api/admin/backfill."
+        )
+    if end and end > data_last:
+        warnings.append(
+            f"Requested end {end.isoformat()} is after the latest stored price ({data_last.isoformat()})."
+        )
+    if not final_complete and shown_last == last_period:
+        warnings.append(
+            f"{MONTH_LABELS[last_period.month - 1]} {last_period.year} is not a complete month; it is "
+            "excluded from averages and from quarterly/annual linking."
+        )
+    if any(c["status"] in ("missing", "prior_month_missing") for r in rows for c in r["months"]):
+        warnings.append(
+            "Some months have no price data. They are shown as unavailable (never as 0% months), "
+            "and any quarter or year containing them is not reported as complete."
+        )
+
+    return {
+        "symbol": symbol,
+        "price_basis": price_basis,
+        "adjustment_policy": (
+            "EODHD adjusted_close (adjusted for splits and dividends: total-return basis)"
+            if price_basis == "adjusted"
+            else "EODHD raw close (price only; NOT adjusted for splits or dividends)"
+        ),
+        "requested_start": start.isoformat() if start else None,
+        "requested_end": end.isoformat() if end else None,
+        "data_first_date": data_first.isoformat(),
+        "data_last_date": data_last.isoformat(),
+        "as_of": as_of.isoformat(),
+        "month_labels": list(MONTH_LABELS),
+        "quarter_labels": list(QUARTER_LABELS),
+        "rows": rows,
+        "monthly_summary": [
+            {"month": m, "label": MONTH_LABELS[m - 1], **_summary_stats(month_values[m])} for m in range(1, 13)
+        ],
+        "quarterly_summary": [
+            {"quarter": q, "label": QUARTER_LABELS[q - 1], **_summary_stats(quarter_values[q])} for q in range(1, 5)
+        ],
+        "color_scale": {
+            "metric": "return_percent",
+            "neutral": 0.0,
+            "max_abs_return_percent": _pct(max(all_abs)) if all_abs else None,
+            "note": "Diverging scale centred on 0%: positive = gain, negative = loss, null = no data (not 0%).",
+        },
+        "methodology": [
+            "Monthly return = last price of the month / last price of the immediately preceding month - 1.",
+            "Quarterly return = (1+m1)(1+m2)(1+m3) - 1 using the three monthly returns (geometric linking, not a sum).",
+            "Months without a valid base are shown as unavailable, never as zero-return months.",
+            "Incomplete months/quarters are labelled and excluded from complete-period statistics.",
+            "The requested range has month granularity; earlier history is still used as the base for the first month.",
+        ],
+        "data_quality_warnings": warnings,
+        "disclaimer": SEASONAL_DISCLAIMER,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Strategy 30: Investment Diversification Heat Map
+#
+# Source: "How to Create the Investment Diversification Heat Map in Python"
+# (C. L. Tanny). Calendar-year returns for several instruments, ranked within
+# each year, with a user-weighted portfolio shown alongside them.
+#
+# Portfolio policy (explicit, because it changes the numbers):
+#   * Long-only, fully invested: each weight >= 0 and the weights sum to 100%
+#     (+/- 0.01). No cash, leverage or shorting. A ticker omitted from the
+#     weights has a 0% weight (it is still shown/ranked as an instrument).
+#   * ANNUAL REBALANCING: weights are reset to the targets at the start of each
+#     calendar year and drift (buy-and-hold) inside the year, so
+#         portfolio year return = sum_i w_i * r_i(year).
+#     This is NOT equivalent to a buy-and-hold portfolio across years.
+#   * A year is reported for the portfolio only if every positively-weighted
+#     asset has a complete return for that year. Missing assets are never
+#     dropped and weights are never silently renormalised.
+#   * Annual return = last price of the year / last price of the immediately
+#     preceding calendar year - 1 (adjusted_close by default). Listing years
+#     (no base), in-progress years, and years following a data gap are NOT
+#     complete and are excluded from ranking.
+#
+# A portfolio ranking between its constituents says nothing about its risk,
+# and this chart alone does not establish diversification benefits.
+# ---------------------------------------------------------------------------
+
+DIVERSIFICATION_WEIGHT_TOLERANCE = 0.01  # percentage points
+DIVERSIFICATION_DISCLAIMER = (
+    "Descriptive annual returns only. A portfolio whose return ranks between its constituents is not "
+    "thereby lower-risk, and this heat map alone does not establish diversification benefits (it ignores "
+    "volatility, drawdowns and correlations). Past returns do not predict future returns."
+)
+
+
+def validate_portfolio_weights(symbols: list[str], weights_percent: dict) -> dict[str, float]:
+    """Validate user weights (percent units). Raises ValueError with a precise
+    message; returns {SYMBOL: weight_percent} (omitted symbols -> 0.0)."""
+    if not isinstance(weights_percent, dict) or not weights_percent:
+        raise ValueError("weights must be a non-empty mapping of ticker to percent weight.")
+    known = {s.upper() for s in symbols}
+    cleaned: dict[str, float] = {}
+    for raw_symbol, value in weights_percent.items():
+        symbol = str(raw_symbol).strip().upper()
+        if symbol not in known:
+            raise ValueError(f"Weight given for '{raw_symbol}', which is not in the requested tickers.")
+        if symbol in cleaned:
+            raise ValueError(f"Duplicate weight for '{symbol}'.")
+        if not _is_real_number(value):
+            raise ValueError(f"Weight for '{symbol}' must be a finite number (got {value!r}).")
+        weight = float(value)
+        if weight < 0:
+            raise ValueError(f"Weight for '{symbol}' must not be negative (long-only portfolio).")
+        if weight > 100:
+            raise ValueError(f"Weight for '{symbol}' must not exceed 100%.")
+        cleaned[symbol] = weight
+    total = sum(cleaned.values())
+    if abs(total - 100.0) > DIVERSIFICATION_WEIGHT_TOLERANCE:
+        raise ValueError(
+            f"Weights must sum to 100% (fully invested, no cash/leverage); they sum to {total:.4f}%."
+        )
+    return {s: cleaned.get(s.upper(), 0.0) for s in (x.upper() for x in symbols)}
+
+
+def _annual_cells(series: pd.Series, years: list[int], as_of: datetime.date) -> dict[int, dict]:
+    """Per-calendar-year return cells for one instrument (see policy above)."""
+    out: dict[int, dict] = {}
+    if series.empty:
+        for y in years:
+            out[y] = _empty_annual_cell(y, "missing")
+        return out
+    periods = series.index.to_period("Y")
+    year_last_value = series.groupby(periods).last()
+    year_last_date = series.index.to_series().groupby(periods).max()
+    first_year = year_last_value.index[0].year
+    first_obs_value, first_obs_date = float(series.iloc[0]), series.index[0].date()
+    for y in years:
+        cell = _empty_annual_cell(y, "not_listed" if y < first_year else "missing")
+        period = pd.Period(year=y, freq="Y")
+        if period in year_last_value.index:
+            end_value = float(year_last_value[period])
+            end_date = year_last_date[period].date()
+            year_over = as_of > datetime.date(y, 12, 31)
+            reaches_year_end = end_date >= _last_weekday(y, 12) - datetime.timedelta(days=PERIOD_END_TOLERANCE_DAYS)
+            prev = period - 1
+            if y == first_year:
+                cell["status"] = "no_base"
+                if end_date > first_obs_date:
+                    partial = end_value / first_obs_value - 1.0
+                    cell.update(
+                        partial_return_percent=_pct(partial),
+                        window_start=first_obs_date.isoformat(), window_end=end_date.isoformat(),
+                    )
+            elif prev not in year_last_value.index:
+                cell["status"] = "prior_year_missing"
+            else:
+                base_value = float(year_last_value[prev])
+                base_date = year_last_date[prev].date()
+                r = end_value / base_value - 1.0
+                cell.update(window_start=base_date.isoformat(), window_end=end_date.isoformat())
+                if year_over and reaches_year_end:
+                    cell.update(status="complete", return_percent=_pct(r), sign=_sign(r), _r=r)
+                else:
+                    cell.update(status="partial", partial_return_percent=_pct(r), _partial_r=r)
+        out[y] = cell
+    return out
+
+
+def _empty_annual_cell(year: int, status: str) -> dict:
+    return {
+        "year": year, "return_percent": None, "partial_return_percent": None, "sign": None,
+        "status": status, "rank": None, "window_start": None, "window_end": None,
+    }
+
+
+def _rank_desc(values: dict[str, float]) -> dict[str, int]:
+    """Competition ranking, best (highest) = 1, ties share the lowest rank."""
+    keyed = {k: round(v, 10) for k, v in values.items()}
+    return {k: 1 + sum(1 for o in keyed.values() if o > v) for k, v in keyed.items()}
+
+
+def compute_diversification_heat_map(
+    prices_by_symbol: dict,
+    weights_percent: dict | None = None,
+    start: datetime.date | None = None,
+    end: datetime.date | None = None,
+    price_basis: str = "adjusted",
+    as_of: datetime.date | None = None,
+) -> dict | None:
+    """Annual-return heat map + ranking (+ weighted portfolio). None when no
+    instrument has at least two calendar years of data in range."""
+    if price_basis not in ARTICLE_PRICE_BASES:
+        raise ValueError(f"price_basis must be one of {ARTICLE_PRICE_BASES}")
+    if start and end and start > end:
+        raise ValueError("start must not be after end")
+    symbols = [s.upper() for s in prices_by_symbol]
+    weights = validate_portfolio_weights(symbols, weights_percent) if weights_percent else None
+    as_of = as_of or datetime.datetime.now(datetime.timezone.utc).date()
+
+    original_key = {k.upper(): k for k in prices_by_symbol}
+    series = {s: _article_price_series(prices_by_symbol[original_key[s]], price_basis) for s in symbols}
+    if all(s.empty for s in series.values()):
+        return None
+    data_years = [y for s in series.values() if not s.empty for y in (s.index[0].year, s.index[-1].year)]
+    first_year = max(min(data_years), start.year) if start else min(data_years)
+    last_year = min(max(data_years), end.year) if end else max(data_years)
+    if first_year > last_year:
+        return None
+    years = list(range(first_year, last_year + 1))
+
+    cells = {s: _annual_cells(series[s], years, as_of) for s in symbols}
+
+    # Ranking within each year (complete asset returns only).
+    year_rankings = []
+    portfolio_cells: dict[int, dict] = {}
+    warnings: list[str] = []
+    for y in years:
+        complete = {s: cells[s][y]["_r"] for s in symbols if cells[s][y]["status"] == "complete"}
+        for s, rank in _rank_desc(complete).items():
+            cells[s][y]["rank"] = rank
+
+        p_cell = _empty_annual_cell(y, "no_weights")
+        p_r = None
+        if weights is not None:
+            held = [s for s in symbols if weights[s] > 0]
+            missing = [s for s in held if cells[s][y]["status"] != "complete"]
+            if not missing:
+                p_r = sum(weights[s] / 100.0 * cells[s][y]["_r"] for s in held)
+                p_cell.update(status="complete", return_percent=_pct(p_r), sign=_sign(p_r), _r=p_r)
+            elif all(cells[s][y].get("_partial_r") is not None for s in held):
+                part = sum(weights[s] / 100.0 * cells[s][y]["_partial_r"] for s in held)
+                p_cell.update(status="partial", partial_return_percent=_pct(part))
+                ends = {cells[s][y]["window_end"] for s in held}
+                if len(ends) > 1:
+                    warnings.append(
+                        f"{y}: weighted assets' latest observations differ ({', '.join(sorted(ends))}); "
+                        "the partial-year portfolio figure mixes slightly different end dates."
+                    )
+            else:
+                p_cell.update(
+                    status="incomplete",
+                    reason="Weighted asset(s) without a complete return for this year: " + ", ".join(missing),
+                )
+        portfolio_cells[y] = p_cell
+
+        ranking_values = dict(complete)
+        if p_r is not None:
+            ranking_values["PORTFOLIO"] = p_r
+        with_portfolio = _rank_desc(ranking_values)
+        if p_r is not None:
+            p_cell["rank"] = with_portfolio["PORTFOLIO"]
+            p_cell["rank_among"] = len(ranking_values)
+        year_rankings.append(
+            {
+                "year": y,
+                "complete_asset_count": len(complete),
+                "ranking": [
+                    {
+                        "rank": with_portfolio[k], "symbol": k, "is_portfolio": k == "PORTFOLIO",
+                        "return_percent": _pct(v),
+                    }
+                    for k, v in sorted(ranking_values.items(), key=lambda kv: (-round(kv[1], 10), kv[0]))
+                ],
+            }
+        )
+
+    asset_rows = []
+    for s in symbols:
+        done = [cells[s][y]["_r"] for y in years if cells[s][y]["status"] == "complete"]
+        best = max(((cells[s][y]["_r"], y) for y in years if cells[s][y]["status"] == "complete"), default=None)
+        worst = min(((cells[s][y]["_r"], y) for y in years if cells[s][y]["status"] == "complete"), default=None)
+        series_s = series[s]
+        asset_rows.append(
+            {
+                "symbol": s,
+                "weight_percent": _round(weights[s], 4) if weights else None,
+                "first_date": series_s.index[0].date().isoformat() if not series_s.empty else None,
+                "last_date": series_s.index[-1].date().isoformat() if not series_s.empty else None,
+                "cells": [{k: v for k, v in cells[s][y].items() if not k.startswith("_")} for y in years],
+                "complete_years": len(done),
+                "average_annual_return_percent": _pct(float(np.mean(done))) if done else None,
+                "best_year": {"year": best[1], "return_percent": _pct(best[0])} if best else None,
+                "worst_year": {"year": worst[1], "return_percent": _pct(worst[0])} if worst else None,
+            }
+        )
+        if series_s.empty:
+            warnings.append(f"{s}: no usable price history; shown as unavailable in every year.")
+        elif series_s.index[0].year > first_year:
+            warnings.append(
+                f"{s}: history starts {series_s.index[0].date().isoformat()}; earlier years are unavailable "
+                "(not 0%), and its first calendar year has no base so it is not ranked."
+            )
+
+    all_complete = [
+        cells[s][y]["_r"] for s in symbols for y in years if cells[s][y]["status"] == "complete"
+    ]
+    if not all_complete:
+        return None
+    if any(p["status"] == "partial" for c in cells.values() for p in c.values()):
+        warnings.append("The in-progress year is shown as a partial figure and is not ranked.")
+    for s in symbols:
+        for w in _corporate_action_warnings(prices_by_symbol[original_key[s]], price_basis):
+            warnings.append(f"{s}: {w}")
+
+    portfolio = None
+    if weights is not None:
+        portfolio = {
+            "weights_percent": {s: _round(weights[s], 4) for s in symbols},
+            "rebalancing_policy": "annual_reset",
+            "policy_description": (
+                "Target weights are re-applied at the start of every calendar year and drift (buy-and-hold) "
+                "within the year: portfolio return = sum(weight_i x return_i). This is not equivalent to a "
+                "buy-and-hold portfolio across years."
+            ),
+            "cells": [{k: v for k, v in portfolio_cells[y].items() if not k.startswith("_")} for y in years],
+        }
+
+    return {
+        "symbols": symbols,
+        "price_basis": price_basis,
+        "adjustment_policy": (
+            "EODHD adjusted_close (splits + dividends: total-return basis)"
+            if price_basis == "adjusted"
+            else "EODHD raw close (price only; NOT adjusted for splits or dividends)"
+        ),
+        "requested_start": start.isoformat() if start else None,
+        "requested_end": end.isoformat() if end else None,
+        "years": years,
+        "as_of": as_of.isoformat(),
+        "assets": asset_rows,
+        "portfolio": portfolio,
+        "yearly_rankings": year_rankings,
+        "color_scale": {
+            "metric": "return_percent",
+            "neutral": 0.0,
+            "max_abs_return_percent": _pct(max(abs(v) for v in all_complete)),
+            "note": "Diverging scale centred on 0%; rank 1 = best return in that calendar year.",
+        },
+        "methodology": [
+            "Annual return = last price of the year / last price of the previous calendar year - 1.",
+            "Only complete years are ranked; listing years, in-progress years and years after a data gap are not.",
+            "Portfolio = fixed target weights reset every January (annual rebalancing): sum(weight x return).",
+            "A year is reported for the portfolio only if every positively-weighted asset has a complete return.",
+            "The requested range has calendar-year granularity.",
+        ],
+        "data_quality_warnings": warnings,
+        "disclaimer": DIVERSIFICATION_DISCLAIMER,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Strategy 31: EMA + Bollinger Bands + ATR (analytics + historical backtest)
+#
+# Source: "How I Coded a Trading Bot for a 60% YoY Return" (K. Borimechkov).
+# THIS IS A STRATEGY-ANALYTICS / BACKTESTING FEATURE. It places no orders,
+# talks to no broker and contains no execution subsystem. The article's
+# reported return is NOT reproduced or claimed here.
+#
+# Reference rules (article defaults kept; every parameter is configurable):
+#   EMA 30 | Bollinger 15 periods x 1.5 sd | RSI 10 | ATR 7 | trend look-back 7
+#   Uptrend   : for each of the `trend_lookback` candles BEFORE the signal
+#               candle, min(open, close) > EMA at that candle ("body above EMA").
+#   Downtrend : for each of those candles, max(open, close) < EMA.
+#   Long setup : uptrend and signal-candle close <= lower Bollinger Band.
+#   Short setup: downtrend and signal-candle close >= upper Bollinger Band.
+#   Stop distance = ATR(signal candle) x stop_loss_atr_mult
+#   Take-profit distance = stop distance x take_profit_ratio
+#   Extra exits: RSI >= 90 closes a long, RSI <= 10 closes a short.
+#
+# Documented interpretation choices (the article text leaves them open):
+#   * The trend window is the `trend_lookback` candles PRECEDING the signal
+#     candle (the signal candle itself must be the pull-back to the band).
+#   * stop_loss_atr_mult (1.5) and take_profit_ratio (1.5) are configurable
+#     implementation defaults, not values verified from the article.
+#   * Bollinger sd uses the sample standard deviation (ddof=1), matching this
+#     repository's existing Bollinger Bands strategy.
+#
+# Execution model (no look-ahead):
+#   * Indicators at candle t use candles <= t only. A setup seen at the CLOSE
+#     of candle t is filled at the OPEN of candle t+1 (never at the signal close).
+#   * Stop/target levels are anchored to the actual entry fill. ATR is taken
+#     from the signal candle, so it is known before entry.
+#   * Stops/targets are checked against each candle's high/low; if one candle
+#     touches both, the STOP is assumed first (conservative). A candle that
+#     gaps through a level exits at the open, not at the level.
+#   * RSI exits are seen at a candle's close and executed at the next open.
+#   * Every fill pays `slippage_percent` against the trader, and each side pays
+#     `commission_percent`. One position at a time, no pyramiding; the position
+#     is `position_fraction` of equity (<= 1, no leverage). Short positions
+#     assume borrow is available at no cost and ignore dividends.
+#   * An open position is force-closed at the last close of each segment.
+#
+# Out-of-sample discipline: bars are split in time order into a TRAINING
+# segment (first `train_fraction`) and an OUT-OF-SAMPLE segment (the rest).
+# Each segment is simulated independently from a flat start. Optional
+# parameter selection (`optimize=True`) looks at the training segment ONLY.
+# ---------------------------------------------------------------------------
+
+EBA_DEFAULTS: dict = {
+    "ema_period": 30,
+    "bb_period": 15,
+    "bb_std": 1.5,
+    "rsi_period": 10,
+    "atr_period": 7,
+    "trend_lookback": 7,
+    "stop_loss_atr_mult": 1.5,
+    "take_profit_ratio": 1.5,
+    "rsi_long_exit": 90.0,
+    "rsi_short_exit": 10.0,
+    "commission_percent": 0.02,
+    "slippage_percent": 0.05,
+    "position_fraction": 1.0,
+    "train_fraction": 0.6,
+    "allow_short": True,
+}
+# name -> (kind, minimum, maximum)
+EBA_BOUNDS: dict = {
+    "ema_period": ("int", 2, 400),
+    "bb_period": ("int", 2, 400),
+    "bb_std": ("float", 0.25, 5.0),
+    "rsi_period": ("int", 2, 100),
+    "atr_period": ("int", 2, 100),
+    "trend_lookback": ("int", 1, 50),
+    "stop_loss_atr_mult": ("float", 0.1, 10.0),
+    "take_profit_ratio": ("float", 0.1, 10.0),
+    "rsi_long_exit": ("float", 50.0, 100.0),
+    "rsi_short_exit": ("float", 0.0, 50.0),
+    "commission_percent": ("float", 0.0, 2.0),
+    "slippage_percent": ("float", 0.0, 2.0),
+    "position_fraction": ("float", 0.01, 1.0),
+    "train_fraction": ("float", 0.3, 0.9),
+    "allow_short": ("bool", None, None),
+}
+EBA_TIMEFRAMES = ("1d", "1h")
+EBA_MIN_SEGMENT_BARS = 30
+EBA_MIN_TRAIN_TRADES = 5
+EBA_OPT_STOP_MULTS = (1.0, 1.5, 2.0, 3.0)
+EBA_OPT_TP_RATIOS = (1.0, 1.5, 2.0, 3.0)
+EBA_MAX_TRADES_RETURNED = 200
+EBA_EQUITY_POINTS = 250
+EBA_DISCLAIMER = (
+    "Historical simulation for analysis only: no orders are placed and nothing here is a recommendation. "
+    "Results depend on the stated execution/cost assumptions, do not guarantee future performance, and the "
+    "source article's reported return has not been reproduced or verified by this implementation."
+)
+
+
+@dataclasses.dataclass(frozen=True)
+class PriceBar:
+    """Minimal OHLCV bar (e.g. an EODHD hourly candle). Duck-types the DailyPrice
+    attributes the OHLC helpers read; `date` may be a datetime (naive UTC)."""
+
+    date: datetime.datetime
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float = 0.0
+
+
+def resolve_ema_bollinger_atr_params(overrides: dict | None = None) -> dict:
+    """Defaults + validated overrides. Raises ValueError naming the bad parameter."""
+    params = dict(EBA_DEFAULTS)
+    for name, value in (overrides or {}).items():
+        if value is None:
+            continue
+        if name not in EBA_BOUNDS:
+            raise ValueError(f"Unknown parameter '{name}'. Valid: {', '.join(sorted(EBA_BOUNDS))}.")
+        kind, lo, hi = EBA_BOUNDS[name]
+        if kind == "bool":
+            if not isinstance(value, bool):
+                raise ValueError(f"'{name}' must be true or false.")
+            params[name] = value
+            continue
+        if not _is_real_number(value):
+            raise ValueError(f"'{name}' must be a finite number (got {value!r}).")
+        number = float(value)
+        if kind == "int":
+            if number != int(number):
+                raise ValueError(f"'{name}' must be a whole number.")
+            number = int(number)
+        if not lo <= number <= hi:
+            raise ValueError(f"'{name}' must be between {lo} and {hi} (got {number}).")
+        params[name] = number
+    if params["rsi_short_exit"] >= params["rsi_long_exit"]:
+        raise ValueError("rsi_short_exit must be lower than rsi_long_exit.")
+    return params
+
+
+def _ts_str(ts: pd.Timestamp, intraday: bool) -> str:
+    return ts.strftime("%Y-%m-%dT%H:%M:%SZ") if intraday else ts.date().isoformat()
+
+
+def _eba_clean_frame(prices) -> pd.DataFrame:
+    frame = _ohlc_clean(prices)
+    if frame.empty:
+        return frame
+    frame = frame[~frame.index.duplicated(keep="last")].sort_index()
+    frame = frame.dropna(subset=["open"])
+    ok = (
+        (frame[["open", "high", "low", "close"]] > 0).all(axis=1)
+        & (frame["high"] >= frame["low"])
+        & np.isfinite(frame[["open", "high", "low", "close"]]).all(axis=1)
+    )
+    return frame[ok]
+
+
+def _eba_indicators(frame: pd.DataFrame, p: dict) -> dict:
+    """All indicator series, each value using only candles up to and including its own."""
+    close = frame["close"]
+    ema = _ema(close, p["ema_period"])
+    mid = close.rolling(p["bb_period"]).mean()
+    sd = close.rolling(p["bb_period"]).std()
+    upper = mid + p["bb_std"] * sd
+    lower = mid - p["bb_std"] * sd
+    rsi = _rsi(close, p["rsi_period"])
+    atr = _atr(frame, p["atr_period"])
+    body_low = frame[["open", "close"]].min(axis=1)
+    body_high = frame[["open", "close"]].max(axis=1)
+    up_bar = (body_low > ema).astype(float)  # NaN EMA compares False
+    down_bar = (body_high < ema).astype(float)
+    lookback = p["trend_lookback"]
+    # window = the `lookback` candles BEFORE the candle being evaluated
+    uptrend = up_bar.rolling(lookback).min().shift(1).eq(1.0)
+    downtrend = down_bar.rolling(lookback).min().shift(1).eq(1.0)
+    valid = ema.notna() & upper.notna() & atr.notna()
+    return {
+        "ema": ema, "bb_mid": mid, "bb_upper": upper, "bb_lower": lower, "rsi": rsi, "atr": atr,
+        "uptrend": uptrend, "downtrend": downtrend,
+        "long_setup": uptrend & (close <= lower) & valid,
+        "short_setup": downtrend & (close >= upper) & valid,
+    }
+
+
+def _eba_simulate(frame: pd.DataFrame, ind: dict, p: dict, lo: int, hi: int, intraday: bool) -> dict:
+    """Event-driven simulation over bars [lo, hi), starting flat. See block comment."""
+    o = frame["open"].to_numpy(float)
+    h = frame["high"].to_numpy(float)
+    low = frame["low"].to_numpy(float)
+    c = frame["close"].to_numpy(float)
+    atr = ind["atr"].to_numpy(float)
+    rsi = ind["rsi"].to_numpy(float)
+    long_sig = ind["long_setup"].to_numpy(bool)
+    short_sig = ind["short_setup"].to_numpy(bool) if p["allow_short"] else np.zeros(len(c), bool)
+    index = frame.index
+    slip = p["slippage_percent"] / 100.0
+    comm = p["commission_percent"] / 100.0
+    frac = p["position_fraction"]
+
+    trades: list[dict] = []
+    equity = np.ones(hi - lo)
+    realized = 1.0
+    pos: dict | None = None
+    pending_entry: tuple | None = None
+    pending_exit = False
+    bars_in_market = 0
+    ambiguous_bars = 0
+
+    def close_position(i: int, price: float, reason: str) -> None:
+        nonlocal pos, realized
+        side = pos["side"]
+        exit_fill = price * (1.0 - side * slip)
+        price_return = side * (exit_fill / pos["entry"] - 1.0)
+        net = frac * price_return - 2.0 * frac * comm
+        realized = pos["eq0"] * (1.0 + net)
+        trades.append(
+            {
+                "side": "long" if side > 0 else "short",
+                "signal_date": _ts_str(index[pos["signal_idx"]], intraday),
+                "entry_date": _ts_str(index[pos["entry_idx"]], intraday),
+                "entry_price": _round(pos["entry"], 4),
+                "exit_date": _ts_str(index[i], intraday),
+                "exit_price": _round(exit_fill, 4),
+                "exit_reason": reason,
+                "stop_loss": _round(pos["sl"], 4),
+                "take_profit": _round(pos["tp"], 4),
+                "atr_at_signal": _round(pos["atr"], 4),
+                "price_return_percent": _pct(price_return),
+                "equity_return_percent": _pct(net),
+                "bars_held": i - pos["entry_idx"],
+                "_net": net,
+            }
+        )
+        pos = None
+
+    for i in range(lo, hi):
+        if pos is not None and pending_exit:
+            close_position(i, o[i], "rsi_exit")
+            pending_exit = False
+
+        if pending_entry is not None:
+            side, atr_signal, signal_idx = pending_entry
+            pending_entry = None
+            entry = o[i] * (1.0 + side * slip)
+            stop_distance = atr_signal * p["stop_loss_atr_mult"]
+            sl = entry - side * stop_distance
+            tp = entry + side * stop_distance * p["take_profit_ratio"]
+            if sl > 0 and tp > 0:
+                pos = {
+                    "side": side, "entry": entry, "sl": sl, "tp": tp, "eq0": realized,
+                    "entry_idx": i, "signal_idx": signal_idx, "atr": atr_signal,
+                }
+
+        if pos is not None:
+            side = pos["side"]
+            held_before = pos["entry_idx"] < i
+            if side > 0:
+                hit_sl, hit_tp = low[i] <= pos["sl"], h[i] >= pos["tp"]
+                gap_sl, gap_tp = o[i] <= pos["sl"], o[i] >= pos["tp"]
+            else:
+                hit_sl, hit_tp = h[i] >= pos["sl"], low[i] <= pos["tp"]
+                gap_sl, gap_tp = o[i] >= pos["sl"], o[i] <= pos["tp"]
+            if held_before and gap_sl:
+                close_position(i, o[i], "stop_loss_gap")
+            elif held_before and gap_tp:
+                close_position(i, o[i], "take_profit_gap")
+            elif hit_sl:
+                ambiguous_bars += int(hit_tp)
+                close_position(i, pos["sl"], "stop_loss")
+            elif hit_tp:
+                close_position(i, pos["tp"], "take_profit")
+
+        if pos is not None:
+            bars_in_market += 1
+            if i == hi - 1:
+                close_position(i, c[i], "end_of_data")
+            else:
+                if (pos["side"] > 0 and rsi[i] >= p["rsi_long_exit"]) or (
+                    pos["side"] < 0 and rsi[i] <= p["rsi_short_exit"]
+                ):
+                    pending_exit = True
+
+        if pos is None and i + 1 < hi:
+            if long_sig[i]:
+                pending_entry = (1, float(atr[i]), i)
+            elif short_sig[i]:
+                pending_entry = (-1, float(atr[i]), i)
+
+        if pos is None:
+            equity[i - lo] = realized
+        else:
+            equity[i - lo] = pos["eq0"] * (
+                1.0 + frac * pos["side"] * (c[i] / pos["entry"] - 1.0) - frac * comm
+            )
+    return {"trades": trades, "equity": equity, "bars_in_market": bars_in_market, "ambiguous_bars": ambiguous_bars}
+
+
+def _eba_metrics(sim: dict, close: np.ndarray, index: pd.DatetimeIndex) -> dict:
+    equity, trades = sim["equity"], sim["trades"]
+    n = len(equity)
+    net = [t["_net"] for t in trades]
+    wins = [x for x in net if x > 0]
+    losses = [x for x in net if x < 0]
+    peak = np.maximum.accumulate(equity)
+    max_dd = float((equity / peak - 1.0).min())
+    span_days = (index[-1] - index[0]).days
+    total = float(equity[-1] - 1.0)
+    cagr = float(equity[-1] ** (365.25 / span_days) - 1.0) if span_days >= 180 and equity[-1] > 0 else None
+    benchmark = float(close[-1] / close[0] - 1.0)
+    return {
+        "bars": n,
+        "start": index[0],
+        "end": index[-1],
+        "total_return_percent": _pct(total),
+        "cagr_percent": _pct(cagr),
+        "max_drawdown_percent": _pct(max_dd),
+        "trade_count": len(trades),
+        "long_trades": sum(1 for t in trades if t["side"] == "long"),
+        "short_trades": sum(1 for t in trades if t["side"] == "short"),
+        "win_rate_percent": _round(len(wins) / len(trades) * 100.0, 1) if trades else None,
+        "profit_factor": _round(sum(wins) / -sum(losses), 2) if losses else None,
+        "average_trade_percent": _pct(float(np.mean(net))) if net else None,
+        "exposure_percent": _round(sim["bars_in_market"] / n * 100.0, 1),
+        "ambiguous_bars": sim["ambiguous_bars"],
+        "benchmark_buy_hold_return_percent": _pct(benchmark),
+        "excess_return_vs_benchmark_percent": _pct(total - benchmark),
+    }
+
+
+def _eba_segment(sim: dict, frame: pd.DataFrame, lo: int, hi: int, name: str, intraday: bool) -> dict:
+    metrics = _eba_metrics(sim, frame["close"].to_numpy(float)[lo:hi], frame.index[lo:hi])
+    metrics["segment"] = name
+    metrics["start"] = _ts_str(metrics["start"], intraday)
+    metrics["end"] = _ts_str(metrics["end"], intraday)
+    if metrics["profit_factor"] is None and metrics["trade_count"]:
+        metrics["profit_factor_note"] = "No losing trades: profit factor is undefined."
+    return metrics
+
+
+def compute_ema_bollinger_atr(
+    prices,
+    timeframe: str = "1d",
+    params: dict | None = None,
+    optimize: bool = False,
+    data_source: str | None = None,
+) -> dict | None:
+    """Indicator state + train / out-of-sample backtest. None when there is not
+    enough history for the indicators and two evaluation segments."""
+    if timeframe not in EBA_TIMEFRAMES:
+        raise ValueError(f"timeframe must be one of {EBA_TIMEFRAMES}")
+    p = resolve_ema_bollinger_atr_params(params)
+    intraday = timeframe == "1h"
+    frame = _eba_clean_frame(prices)
+    warmup = max(p["ema_period"], p["bb_period"], p["atr_period"] * 2, p["rsi_period"] * 2) + p["trend_lookback"]
+    n = len(frame)
+    if n < warmup + 2 * EBA_MIN_SEGMENT_BARS:
+        return None
+    split = int(n * p["train_fraction"])
+    if split < EBA_MIN_SEGMENT_BARS or n - split < EBA_MIN_SEGMENT_BARS:
+        return None
+
+    ind = _eba_indicators(frame, p)
+    warnings: list[str] = []
+
+    selection = {
+        "enabled": bool(optimize), "objective": "training-segment total return (min "
+        f"{EBA_MIN_TRAIN_TRADES} trades)", "candidates": [], "selected": None,
+        "note": "Parameters are chosen on the training segment only; the out-of-sample segment is never consulted.",
+    }
+    if optimize:
+        for sl_mult in EBA_OPT_STOP_MULTS:
+            for tp_ratio in EBA_OPT_TP_RATIOS:
+                trial = {**p, "stop_loss_atr_mult": sl_mult, "take_profit_ratio": tp_ratio}
+                m = _eba_segment(_eba_simulate(frame, ind, trial, 0, split, intraday), frame, 0, split, "train", intraday)
+                selection["candidates"].append(
+                    {
+                        "stop_loss_atr_mult": sl_mult, "take_profit_ratio": tp_ratio,
+                        "train_total_return_percent": m["total_return_percent"],
+                        "train_trade_count": m["trade_count"],
+                        "train_max_drawdown_percent": m["max_drawdown_percent"],
+                    }
+                )
+        eligible = [x for x in selection["candidates"] if x["train_trade_count"] >= EBA_MIN_TRAIN_TRADES]
+        if eligible:
+            best = max(
+                eligible,
+                key=lambda x: (x["train_total_return_percent"], x["train_max_drawdown_percent"]),
+            )
+            p = {**p, "stop_loss_atr_mult": best["stop_loss_atr_mult"], "take_profit_ratio": best["take_profit_ratio"]}
+            selection["selected"] = {
+                "stop_loss_atr_mult": best["stop_loss_atr_mult"], "take_profit_ratio": best["take_profit_ratio"],
+            }
+        else:
+            warnings.append(
+                f"Parameter selection skipped: no combination produced >= {EBA_MIN_TRAIN_TRADES} training "
+                "trades; defaults were kept."
+            )
+
+    train_sim = _eba_simulate(frame, ind, p, 0, split, intraday)
+    test_sim = _eba_simulate(frame, ind, p, split, n, intraday)
+    train = _eba_segment(train_sim, frame, 0, split, "train", intraday)
+    test = _eba_segment(test_sim, frame, split, n, "out_of_sample", intraday)
+
+    if test["trade_count"] < 30:
+        warnings.append(
+            f"Out-of-sample segment has only {test['trade_count']} trade(s); these statistics are "
+            "statistically weak and should not be extrapolated."
+        )
+    if test["trade_count"] == 0:
+        warnings.append("No setups occurred out-of-sample, so no out-of-sample performance can be assessed.")
+    if intraday:
+        warnings.append(
+            "Hourly bars are raw (not adjusted for splits/dividends) with UTC timestamps; session coverage "
+            "is as delivered by EODHD."
+        )
+    else:
+        warnings.extend(_corporate_action_warnings(prices, "close"))
+        warnings.append(
+            "Daily backtest uses raw (unadjusted) OHLC like the other technical strategies; benchmark "
+            "buy-and-hold is price-only (dividends excluded)."
+        )
+
+    trades_all = []
+    for seg_name, sim, offset in (("train", train_sim, 0), ("out_of_sample", test_sim, split)):
+        for t in sim["trades"]:
+            trades_all.append({**{k: v for k, v in t.items() if k != "_net"}, "segment": seg_name})
+
+    def curve(sim, lo, hi, name):
+        closes = frame["close"].to_numpy(float)[lo:hi]
+        out = []
+        for k in range(hi - lo):
+            out.append(
+                {
+                    "date": _ts_str(frame.index[lo + k], intraday), "segment": name,
+                    "equity": _round(float(sim["equity"][k]), 4),
+                    "benchmark": _round(float(closes[k] / closes[0]), 4),
+                }
+            )
+        return out
+
+    equity_curve = curve(train_sim, 0, split, "train") + curve(test_sim, split, n, "out_of_sample")
+    step = max(1, math.ceil(len(equity_curve) / EBA_EQUITY_POINTS))
+    equity_curve = equity_curve[::step]
+
+    last = len(frame) - 1
+    close_last = float(frame["close"].iloc[-1])
+    atr_last = ind["atr"].iloc[-1]
+    uptrend, downtrend = bool(ind["uptrend"].iloc[-1]), bool(ind["downtrend"].iloc[-1])
+    latest = {
+        "date": _ts_str(frame.index[last], intraday),
+        "close": _round(close_last, 4),
+        "ema": _round(ind["ema"].iloc[-1], 4),
+        "bb_upper": _round(ind["bb_upper"].iloc[-1], 4),
+        "bb_lower": _round(ind["bb_lower"].iloc[-1], 4),
+        "rsi": _round(ind["rsi"].iloc[-1]),
+        "atr": _round(atr_last, 4),
+        "trend": "Uptrend" if uptrend else "Downtrend" if downtrend else "Neutral",
+        "long_setup_active": bool(ind["long_setup"].iloc[-1]),
+        "short_setup_active": bool(ind["short_setup"].iloc[-1]) and p["allow_short"],
+        "reference_stop_distance": _round(float(atr_last) * p["stop_loss_atr_mult"], 4) if pd.notna(atr_last) else None,
+        "reference_take_profit_distance": _round(
+            float(atr_last) * p["stop_loss_atr_mult"] * p["take_profit_ratio"], 4
+        ) if pd.notna(atr_last) else None,
+        "note": "Reference distances are informational: ATR x stop multiplier, and x take-profit ratio.",
+    }
+
+    chart = frame.index[-CHART_LOOKBACK_DAYS:]
+    chart_data = [
+        {
+            "date": _ts_str(ts, intraday),
+            "close": _round(frame.at[ts, "close"], 4),
+            "ema": _round(ind["ema"].at[ts], 4),
+            "bb_upper": _round(ind["bb_upper"].at[ts], 4),
+            "bb_lower": _round(ind["bb_lower"].at[ts], 4),
+            "rsi": _round(ind["rsi"].at[ts]),
+            "atr": _round(ind["atr"].at[ts], 4),
+        }
+        for ts in chart
+    ]
+
+    return {
+        "timeframe": timeframe,
+        "data_source": data_source
+        or ("daily_prices (PostgreSQL, EODHD end-of-day, raw OHLC)" if not intraday else "EODHD intraday API (1h, raw)"),
+        "bars_used": n,
+        "first_bar": _ts_str(frame.index[0], intraday),
+        "last_bar": _ts_str(frame.index[-1], intraday),
+        "parameters": p,
+        "latest": latest,
+        "train_fraction": p["train_fraction"],
+        "train": train,
+        "out_of_sample": test,
+        "parameter_selection": selection,
+        "trade_count_total": len(trades_all),
+        "trades": trades_all[-EBA_MAX_TRADES_RETURNED:],
+        "equity_curve": equity_curve,
+        "chart_data": chart_data,
+        "assumptions": [
+            "Signals use candles up to and including the signal candle's close; fills happen at the next candle's open.",
+            "Trend window = the trend_lookback candles preceding the signal candle (body-above/below-EMA test).",
+            "Stop/target anchored to the entry fill using the signal candle's ATR; stop assumed first if both touch in one candle.",
+            f"Costs per side: commission {p['commission_percent']}% + slippage {p['slippage_percent']}% against the trade.",
+            f"One position at a time, sized at {p['position_fraction'] * 100:g}% of equity; shorts assume free borrow.",
+            "Training and out-of-sample segments are simulated independently, in time order.",
+            "stop_loss_atr_mult and take_profit_ratio defaults are implementation choices, not values verified from the article.",
+        ],
+        "data_quality_warnings": warnings,
+        "disclaimer": EBA_DISCLAIMER,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Strategy 32: Technical Crash-Warning Risk Indicator  (EXPERIMENTAL)
+#
+# Source: "This Financial API Warns You Before Stocks Crash!" (P. Saxena).
+# The article describes moving averages, RSI, MACD and divergence; it does
+# NOT provide a validated statistical crash model, and neither does this. The
+# output is a transparent count of explicit technical conditions - there is no
+# probability, no forecast and no promise that a crash will (or will not)
+# follow. The article's 5-minute intraday variant is NOT implemented: this is
+# the DAILY version only (raw EODHD daily OHLCV from daily_prices).
+#
+# Scored conditions (each true/false at every bar, using data up to that bar):
+#   1 price_below_long_sma        close < SMA(200)
+#   2 short_sma_below_long_sma    SMA(50) < SMA(200)  ("death-cross" state)
+#   3 macd_bearish_cross_recent   MACD(12,26,9) line crossed below its signal
+#                                 line within the last 10 bars and is still below
+#   4 macd_histogram_weakening    MACD histogram lower for 3 consecutive bars
+#   5 rsi_bearish_divergence      the last two confirmed swing highs (see below)
+#                                 within 60 bars: price higher high, RSI(14) lower high
+#   Swing high: a close that is the maximum of the surrounding +/-5 bars. It is
+#   only CONFIRMED 5 bars later, so no future bar is used when evaluating bar t.
+# Informational only (NOT scored): RSI oversold/overbought, MACD below zero,
+# drawdown from the 252-bar high. An oversold RSI is ordinary market behaviour
+# and is explicitly not treated as evidence of a crash.
+#
+# Overall: triggered_count of 5 -> Low (0-1) / Elevated (2-3) / High (4-5), and
+# `warning_active` = triggered_count >= 3. These cut-offs are UNVALIDATED
+# heuristics chosen for readability.
+#
+# Historical evaluation (time-ordered, out-of-sample): a "crash event" at bar t
+# means the close falls >= 10% below close[t] at some point in the next 20
+# bars. Labels use future bars ONLY to score past warnings, never to produce
+# them. The first 60% of evaluable bars (minus a 20-bar purge) is the
+# in-sample block, the remainder out-of-sample. Metrics: precision, recall,
+# false positives, missed episodes, median lead (bars), compared with a simple
+# baseline (close < SMA200) and with the base rate (always-warn precision).
+# ---------------------------------------------------------------------------
+
+CRASH_SMA_SHORT = 50
+CRASH_SMA_LONG = 200
+CRASH_MACD_RECENT_CROSS_BARS = 10
+CRASH_HIST_DECLINE_BARS = 3
+CRASH_SWING_K = 5
+CRASH_DIVERGENCE_LOOKBACK = 60
+CRASH_WARNING_MIN_TRIGGERED = 3
+CRASH_RSI_OVERSOLD = 30.0
+CRASH_RSI_OVERBOUGHT = 70.0
+CRASH_DRAWDOWN_WINDOW = 252
+CRASH_EVENT_THRESHOLD_PERCENT = -10.0
+CRASH_EVENT_HORIZON_BARS = 20
+CRASH_EVAL_TRAIN_FRACTION = 0.6
+CRASH_MIN_EVAL_BARS = 100
+CRASH_MIN_EPISODES_FOR_CONFIDENCE = 5
+MIN_ROWS_CRASH_WARNING = CRASH_SMA_LONG + 60
+CRASH_SCORED_CONDITIONS = (
+    ("price_below_long_sma", "Price below 200-day SMA", f"close < SMA({CRASH_SMA_LONG})"),
+    ("short_sma_below_long_sma", "50-day SMA below 200-day SMA", f"SMA({CRASH_SMA_SHORT}) < SMA({CRASH_SMA_LONG})"),
+    (
+        "macd_bearish_cross_recent", "MACD crossed below signal line recently",
+        f"MACD line crossed below the signal line within the last {CRASH_MACD_RECENT_CROSS_BARS} bars and is still below it",
+    ),
+    (
+        "macd_histogram_weakening", "MACD momentum weakening",
+        f"MACD histogram lower than the previous bar for {CRASH_HIST_DECLINE_BARS} consecutive bars",
+    ),
+    (
+        "rsi_bearish_divergence", "Bearish RSI divergence",
+        (
+            f"last two confirmed swing highs (+/-{CRASH_SWING_K} bars, confirmed {CRASH_SWING_K} bars later, "
+            f"within {CRASH_DIVERGENCE_LOOKBACK} bars): price made a higher high while RSI made a lower high"
+        ),
+    ),
+)
+CRASH_DISCLAIMER = (
+    "Experimental, descriptive technical-risk monitor. It counts explicit indicator conditions; it is not a "
+    "crash prediction, produces no probability, and has not been shown to forecast market declines. "
+    "Do not rely on it for investment decisions."
+)
+
+
+def _crash_frame(prices) -> pd.DataFrame:
+    close = to_close_series(prices)
+    close = close[close.notna() & (close > 0)]
+    close = close[~close.index.duplicated(keep="last")]
+    return pd.DataFrame({"close": close})
+
+
+def _crash_swing_divergence(close: np.ndarray, rsi: np.ndarray) -> tuple[np.ndarray, list]:
+    """Causal bearish RSI divergence flag for every bar + the (j1, j2) swing pair active at each bar."""
+    n = len(close)
+    k = CRASH_SWING_K
+    swing = np.zeros(n, bool)
+    for j in range(k, n - k):
+        window = close[j - k : j + k + 1]
+        swing[j] = close[j] == window.max() and np.isfinite(rsi[j])
+    flag = np.zeros(n, bool)
+    pair: list = [None] * n
+    confirmed: list[int] = []
+    for t in range(n):
+        j = t - k
+        if j >= k and swing[j]:
+            confirmed.append(j)
+        if len(confirmed) >= 2:
+            j2 = confirmed[-1]
+            if j2 > t - CRASH_DIVERGENCE_LOOKBACK:
+                j1 = next(
+                    (x for x in reversed(confirmed[:-1]) if j2 - x >= k and x > t - CRASH_DIVERGENCE_LOOKBACK),
+                    None,
+                )
+                if j1 is not None and close[j2] > close[j1] and rsi[j2] < rsi[j1]:
+                    flag[t] = True
+                    pair[t] = (j1, j2)
+    return flag, pair
+
+
+def _crash_conditions(df: pd.DataFrame) -> dict:
+    close = df["close"]
+    sma_s = close.rolling(CRASH_SMA_SHORT, min_periods=CRASH_SMA_SHORT).mean()
+    sma_l = close.rolling(CRASH_SMA_LONG, min_periods=CRASH_SMA_LONG).mean()
+    rsi = _rsi(close, RSI_PERIOD)
+    macd = _ema(close, MACD_FAST_PERIOD) - _ema(close, MACD_SLOW_PERIOD)
+    signal = macd.ewm(span=MACD_SIGNAL_PERIOD, adjust=False, min_periods=MACD_SIGNAL_PERIOD).mean()
+    hist = macd - signal
+    valid = sma_l.notna() & signal.notna() & rsi.notna()
+
+    below = macd < signal
+    cross_down = (macd.shift(1) >= signal.shift(1)) & below
+    recent_cross = cross_down.astype(float).rolling(CRASH_MACD_RECENT_CROSS_BARS).max().eq(1.0)
+    weakening = pd.Series(True, index=close.index)
+    for lag in range(CRASH_HIST_DECLINE_BARS):
+        weakening &= hist.shift(lag) < hist.shift(lag + 1)
+    div_flag, div_pair = _crash_swing_divergence(close.to_numpy(float), rsi.to_numpy(float))
+
+    flags = {
+        "price_below_long_sma": (close < sma_l) & valid,
+        "short_sma_below_long_sma": (sma_s < sma_l) & valid,
+        "macd_bearish_cross_recent": below & recent_cross & valid,
+        "macd_histogram_weakening": weakening & valid,
+        "rsi_bearish_divergence": pd.Series(div_flag, index=close.index) & valid,
+    }
+    count = sum(flags[cid].astype(int) for cid, _, _ in CRASH_SCORED_CONDITIONS)
+    drawdown = close / close.rolling(CRASH_DRAWDOWN_WINDOW, min_periods=60).max() - 1.0
+    return {
+        "sma_short": sma_s, "sma_long": sma_l, "rsi": rsi, "macd": macd, "signal": signal, "hist": hist,
+        "valid": valid, "flags": flags, "count": count, "divergence_pairs": div_pair, "drawdown": drawdown,
+    }
+
+
+def _crash_risk_level(count: int) -> str:
+    return "Low" if count <= 1 else "Elevated" if count <= 3 else "High"
+
+
+def _classification(label: np.ndarray, warn: np.ndarray, breach: np.ndarray, lo: int, hi: int) -> dict:
+    y, w = label[lo:hi], warn[lo:hi]
+    tp, fp = int((y & w).sum()), int((~y & w).sum())
+    fn, tn = int((y & ~w).sum()), int((~y & ~w).sum())
+    total = max(1, hi - lo)
+    positives = tp + fn
+    # Episodes = maximal runs of consecutive crash-labelled bars.
+    episodes, detected, leads = 0, 0, []
+    i = 0
+    while i < len(y):
+        if y[i]:
+            j = i
+            while j + 1 < len(y) and y[j + 1]:
+                j += 1
+            episodes += 1
+            hits = np.where(w[i : j + 1])[0]
+            if hits.size:
+                detected += 1
+                first = lo + i + int(hits[0])
+                if np.isfinite(breach[first]):
+                    leads.append(float(breach[first]))
+            i = j + 1
+        else:
+            i += 1
+    return {
+        "bars": hi - lo,
+        "crash_labelled_bars": positives,
+        "base_rate_percent": _round(positives / total * 100.0, 1),
+        "warning_bars": tp + fp,
+        "true_positives": tp, "false_positives": fp, "false_negatives": fn, "true_negatives": tn,
+        "precision_percent": _round(tp / (tp + fp) * 100.0, 1) if tp + fp else None,
+        "recall_percent": _round(tp / positives * 100.0, 1) if positives else None,
+        "false_positive_rate_percent": _round(fp / (fp + tn) * 100.0, 1) if fp + tn else None,
+        "episodes": episodes, "episodes_detected": detected, "episodes_missed": episodes - detected,
+        "median_lead_bars": _round(float(np.median(leads)), 1) if leads else None,
+    }
+
+
+def _crash_validation(df: pd.DataFrame, cond: dict) -> dict:
+    close = df["close"].to_numpy(float)
+    n = len(close)
+    horizon = CRASH_EVENT_HORIZON_BARS
+    threshold = CRASH_EVENT_THRESHOLD_PERCENT / 100.0
+    label = np.zeros(n, bool)
+    breach = np.full(n, np.nan)
+    for t in range(n - horizon):
+        hit = np.where(close[t + 1 : t + horizon + 1] / close[t] - 1.0 <= threshold)[0]
+        if hit.size:
+            label[t] = True
+            breach[t] = hit[0] + 1
+    evaluable = np.where(cond["valid"].to_numpy(bool) & (np.arange(n) < n - horizon))[0]
+    definition = {
+        "crash_event": f"close falls >= {abs(CRASH_EVENT_THRESHOLD_PERCENT):g}% below the signal-bar close within "
+        f"the next {horizon} bars",
+        "prediction_horizon_bars": horizon,
+        "warning_rule": f"triggered_count >= {CRASH_WARNING_MIN_TRIGGERED} of {len(CRASH_SCORED_CONDITIONS)}",
+        "baseline_rule": f"close < SMA({CRASH_SMA_LONG}) (single condition)",
+        "split": f"time-ordered: first {CRASH_EVAL_TRAIN_FRACTION:.0%} in-sample, remainder out-of-sample, "
+        f"{horizon}-bar purge between them",
+        "note": "Parameters are fixed in advance and were not tuned on this data; both blocks are reported "
+        "for transparency.",
+    }
+    if len(evaluable) < CRASH_MIN_EVAL_BARS:
+        return {
+            "status": "unavailable",
+            "reason": f"Needs at least {CRASH_MIN_EVAL_BARS} evaluable bars after indicator warm-up "
+            f"(have {len(evaluable)}).",
+            "definition": definition,
+        }
+    v0, v1 = int(evaluable[0]), int(evaluable[-1])
+    split = v0 + int((v1 - v0 + 1) * CRASH_EVAL_TRAIN_FRACTION)
+    warn = (cond["count"] >= CRASH_WARNING_MIN_TRIGGERED).to_numpy(bool)
+    base = cond["flags"]["price_below_long_sma"].to_numpy(bool)
+    blocks = {"in_sample": (v0, max(v0 + 1, split - horizon)), "out_of_sample": (split, v1 + 1)}
+    out = {"status": "available", "definition": definition, "warnings": []}
+    for name, (lo, hi) in blocks.items():
+        strategy = _classification(label, warn, breach, lo, hi)
+        baseline = _classification(label, base, breach, lo, hi)
+        precision, base_rate = strategy["precision_percent"], strategy["base_rate_percent"]
+        strategy["precision_lift_vs_base_rate"] = (
+            _round(precision / base_rate, 2) if precision is not None and base_rate else None
+        )
+        out[name] = {"start": df.index[lo].date().isoformat(), "end": df.index[hi - 1].date().isoformat(),
+                     "indicator": strategy, "baseline_sma200": baseline,
+                     "always_warn_precision_percent": base_rate}
+    oos_episodes = out["out_of_sample"]["indicator"]["episodes"]
+    if oos_episodes < CRASH_MIN_EPISODES_FOR_CONFIDENCE:
+        out["warnings"].append(
+            f"Only {oos_episodes} independent crash episode(s) out-of-sample; precision/recall are statistically "
+            "unreliable and must not be read as evidence of predictive skill."
+        )
+    out["warnings"].append(
+        "Crash-labelled bars are heavily autocorrelated (one decline labels many consecutive bars); episode "
+        "counts are the more honest sample size."
+    )
+    return out
+
+
+def compute_crash_warning(prices) -> dict | None:
+    """Daily technical-risk readout with component observations and a labelled,
+    time-ordered historical evaluation. None when history is insufficient."""
+    df = _crash_frame(prices)
+    if len(df) < MIN_ROWS_CRASH_WARNING:
+        return None
+    cond = _crash_conditions(df)
+    if not bool(cond["valid"].iloc[-1]):
+        return None
+    last = len(df) - 1
+    last_ts = df.index[last]
+    flags = cond["flags"]
+
+    def run_start(cid: str) -> str | None:
+        series = flags[cid].to_numpy(bool)
+        if not series[last]:
+            return None
+        i = last
+        while i - 1 >= 0 and series[i - 1]:
+            i -= 1
+        return df.index[i].date().isoformat()
+
+    conditions = []
+    for cid, label, rule in CRASH_SCORED_CONDITIONS:
+        conditions.append(
+            {
+                "id": cid, "label": label, "rule": rule, "scored": True,
+                "triggered": bool(flags[cid].iloc[last]),
+                "triggered_since": run_start(cid),
+                "observed_at": last_ts.date().isoformat(),
+            }
+        )
+    rsi_last = float(cond["rsi"].iloc[last])
+    informational = [
+        {
+            "id": "rsi_oversold", "label": "RSI oversold", "scored": False,
+            "triggered": rsi_last < CRASH_RSI_OVERSOLD,
+            "rule": f"RSI({RSI_PERIOD}) < {CRASH_RSI_OVERSOLD:g}",
+            "note": "Informational only. Oversold readings are common in ordinary corrections and are not evidence of a crash.",
+            "observed_at": last_ts.date().isoformat(),
+        },
+        {
+            "id": "rsi_overbought", "label": "RSI overbought", "scored": False,
+            "triggered": rsi_last > CRASH_RSI_OVERBOUGHT,
+            "rule": f"RSI({RSI_PERIOD}) > {CRASH_RSI_OVERBOUGHT:g}", "note": "Informational only.",
+            "observed_at": last_ts.date().isoformat(),
+        },
+        {
+            "id": "macd_below_zero", "label": "MACD line below zero", "scored": False,
+            "triggered": bool(cond["macd"].iloc[last] < 0), "rule": "MACD line < 0",
+            "note": "Informational only.", "observed_at": last_ts.date().isoformat(),
+        },
+    ]
+
+    divergence = None
+    pair = cond["divergence_pairs"][last]
+    if pair is not None:
+        j1, j2 = pair
+        divergence = {
+            "first_swing_date": df.index[j1].date().isoformat(),
+            "first_swing_close": _round(df["close"].iloc[j1]),
+            "first_swing_rsi": _round(cond["rsi"].iloc[j1]),
+            "second_swing_date": df.index[j2].date().isoformat(),
+            "second_swing_close": _round(df["close"].iloc[j2]),
+            "second_swing_rsi": _round(cond["rsi"].iloc[j2]),
+            "confirmed_on": df.index[min(last, j2 + CRASH_SWING_K)].date().isoformat(),
+        }
+
+    count = int(cond["count"].iloc[last])
+    tail = df.index[-CHART_LOOKBACK_DAYS:]
+    chart = []
+    for ts in tail:
+        row = {
+            "date": ts.date().isoformat(),
+            "close": _round(df.at[ts, "close"]),
+            "sma_short": _round(cond["sma_short"].at[ts]),
+            "sma_long": _round(cond["sma_long"].at[ts]),
+            "rsi": _round(cond["rsi"].at[ts]),
+            "macd": _round(cond["macd"].at[ts], 3),
+            "signal": _round(cond["signal"].at[ts], 3),
+            "histogram": _round(cond["hist"].at[ts], 3),
+            "triggered_count": int(cond["count"].at[ts]) if bool(cond["valid"].at[ts]) else None,
+            "triggered": [cid for cid, _, _ in CRASH_SCORED_CONDITIONS if bool(flags[cid].at[ts])]
+            if bool(cond["valid"].at[ts]) else [],
+        }
+        chart.append(row)
+
+    warnings = _corporate_action_warnings(prices, "close")
+    return {
+        "timeframe": "1d",
+        "data_basis": "daily_prices (PostgreSQL, EODHD end-of-day), raw close; daily version only - the article's "
+        "5-minute intraday variant is not implemented",
+        "as_of": last_ts.date().isoformat(),
+        "bars_used": len(df),
+        "indicators": {
+            "close": _round(df["close"].iloc[last]),
+            "sma_short": _round(cond["sma_short"].iloc[last]),
+            "sma_long": _round(cond["sma_long"].iloc[last]),
+            "rsi": _round(rsi_last),
+            "macd": _round(cond["macd"].iloc[last], 3),
+            "signal": _round(cond["signal"].iloc[last], 3),
+            "histogram": _round(cond["hist"].iloc[last], 3),
+            "drawdown_from_252d_high_percent": _pct(cond["drawdown"].iloc[last]),
+        },
+        "conditions": conditions,
+        "informational": informational,
+        "divergence": divergence,
+        "triggered_count": count,
+        "scored_condition_count": len(CRASH_SCORED_CONDITIONS),
+        "risk_level": _crash_risk_level(count),
+        "warning_active": count >= CRASH_WARNING_MIN_TRIGGERED,
+        "assessment": (
+            f"{count} of {len(CRASH_SCORED_CONDITIONS)} technical risk conditions are present as of "
+            f"{last_ts.date().isoformat()} ({_crash_risk_level(count)} technical risk, heuristic cut-offs). "
+            "This describes current indicator conditions only; it is not a forecast."
+        ),
+        "validation": _crash_validation(df, cond),
+        "parameters": {
+            "sma_short": CRASH_SMA_SHORT, "sma_long": CRASH_SMA_LONG, "rsi_period": RSI_PERIOD,
+            "macd": [MACD_FAST_PERIOD, MACD_SLOW_PERIOD, MACD_SIGNAL_PERIOD],
+            "macd_recent_cross_bars": CRASH_MACD_RECENT_CROSS_BARS,
+            "histogram_decline_bars": CRASH_HIST_DECLINE_BARS,
+            "swing_half_window": CRASH_SWING_K, "divergence_lookback_bars": CRASH_DIVERGENCE_LOOKBACK,
+            "warning_min_triggered": CRASH_WARNING_MIN_TRIGGERED,
+        },
+        "chart_data": chart,
+        "methodology": [
+            "Each condition is evaluated per bar using only data up to that bar; swing highs are confirmed 5 bars late.",
+            "The overall level is a plain count of triggered conditions (unvalidated heuristic cut-offs), not a probability.",
+            "Oversold RSI, overbought RSI, MACD<0 and drawdown are shown for context and are not scored.",
+            "Historical evaluation labels future declines only to grade past warnings, in time order, out-of-sample.",
+        ],
+        "data_quality_warnings": warnings,
+        "disclaimer": CRASH_DISCLAIMER,
     }
