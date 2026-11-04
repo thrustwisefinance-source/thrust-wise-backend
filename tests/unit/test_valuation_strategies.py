@@ -665,7 +665,8 @@ class TestValuationExtraction:
 
 # Every (method, path) the API exposes: the 19 operations that existed before
 # the valuation strategies, plus the 4 deliberate, backward-compatible additions
-# for the article-based strategies (see the "article-based" block below).
+# for the article-based strategies (see the "article-based" block below) and the
+# 3 for Volatility Harvesting / Candlestick Patterns / Dividend Analysis.
 ORIGINAL_ROUTES = {
     ("GET", "/api/compare"),
     ("GET", "/api/dashboard"),
@@ -691,6 +692,10 @@ ORIGINAL_ROUTES = {
     ("GET", "/api/etfs/{symbol}/strategies/ema_bollinger_atr"),
     ("POST", "/api/portfolio/diversification_heat_map"),
     ("POST", "/api/admin/backfill"),
+    # Volatility Harvesting / Candlestick Pattern Recognition / Dividend Analysis
+    ("POST", "/api/portfolio/volatility_harvesting"),
+    ("GET", "/api/etfs/{symbol}/strategies/candlestick_patterns"),
+    ("GET", "/api/etfs/{symbol}/strategies/dividend_analysis"),
 }
 
 
@@ -914,9 +919,10 @@ class TestRouteIntegration:
         }
 
         async def get_json(key):
-            # ETF cache key bumped v10 -> v11 when the article-based strategies
-            # were added, so cached v10 payloads (without them) are not served.
-            assert key == "tw:v11:strategies:QQQ"
+            # ETF cache key bumped v10 -> v11 (article-based strategies) and then
+            # v11 -> v12 (SMA traffic light + candlestick patterns), so cached
+            # payloads without the newer fields are not served.
+            assert key == "tw:v12:strategies:QQQ"
             return cached_etf
 
         monkeypatch.setattr(seeded.cache, "get_json", get_json)
@@ -1009,6 +1015,8 @@ class TestRegression:
             "ta_candles_trend_health",
             # article-based Strategy 31 (appended; see test_article_strategies.py)
             "ema_bollinger_atr",
+            # Candlestick Pattern Recognition (appended; see test_candlestick_patterns.py)
+            "candlestick_pattern_recognition",
         ]
         assert list(QuantitativeStrategies.model_fields)[:6] == [
             "evar_risk",

@@ -173,6 +173,7 @@ async def backfill_symbol_history(
         await session.commit()
     after = await session.scalar(select(func.count()).select_from(DailyPrice).where(DailyPrice.symbol == symbol))
     first_date = await session.scalar(select(func.min(DailyPrice.date)).where(DailyPrice.symbol == symbol))
+    await cache.delete_prefix("tw:v12:strategies:")
     await cache.delete_prefix("tw:v11:strategies:")
     await cache.delete_prefix("tw:v1:article:")
     return {
@@ -256,6 +257,7 @@ async def ingest_all(trigger: str = "schedule") -> None:
         # stale since the key was bumped) and the parameterised article-based
         # strategy results (seasonal heat map, diversification heat map,
         # EMA+Bollinger+ATR backtest, hourly bar cache).
+        "tw:v12:strategies:",
         "tw:v11:strategies:",
         "tw:v1:article:",
     ):

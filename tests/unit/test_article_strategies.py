@@ -1162,7 +1162,8 @@ class TestRegistrationAndSchemas:
         # existing strategies still present
         assert data["macd"] is not None and data["ema50Rsi"] is not None
         assert resp.json()["message"] is None or "Seasonal" not in resp.json()["message"]
-        assert ("tw:v11:strategies:VOO", None) in api.cache.sets
+        # cache key bumped v11 -> v12 when the SMA traffic light + candlestick patterns were added
+        assert ("tw:v12:strategies:VOO", None) in api.cache.sets
         assert (api.db, "VOO") in api.calls  # the injected session is what reaches the loader
 
     def test_short_history_leaves_new_fields_null_with_existing_message_pattern(self, api):

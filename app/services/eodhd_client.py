@@ -2,6 +2,7 @@
 Thin async wrapper around the EODHD APIs with retry/backoff.
 
 Historical daily bars: https://eodhd.com/financial-apis/api-for-historical-data-and-volumes
+Dividends:             https://eodhd.com/financial-apis/api-splits-dividends
 Fundamentals:          https://eodhd.com/financial-apis/stock-etfs-fundamental-data-feeds
 Bulk fundamentals:     https://eodhd.com/financial-apis/bulk-api-for-eod-splits-and-dividends
                        (bulk-fundamentals shares the same /bulk-fundamentals/{EXCHANGE}
@@ -267,5 +268,51 @@ async def fetch_intraday_history(
 
     if not isinstance(data, list):
         logger.warning("Unexpected EODHD intraday payload for %s: %r", eodhd_symbol, type(data))
+        return []
+    return data
+
+
+async def fetch_dividends(
+    eodhd_symbol: str,
+    from_date: datetime.date | None = None,
+    to_date: datetime.date | None = None,
+) -> list[dict]:
+    """
+    Fetch dividend history for a symbol like "AAPL.US" from
+    https://eodhd.com/api/div/{symbol} (used by the Dividend Analysis strategy).
+
+    Returns the raw list of dicts: {date (ex-dividend date), declarationDate,
+    recordDate, paymentDate, period, value (split-adjusted per-share amount),
+    unadjustedValue, currency}. An empty list means EODHD returned no dividend
+    rows - it does NOT prove the symbol never paid a dividend.
+
+    Raises:
+      EodhdEntitlementError - 401/402/403: the plan/token does not include this endpoint.
+    Other HTTP/transport errors propagate from the shared retry helper. The
+    API token is never included in messages.
+    """
+    params: dict[str, str] = {"api_token": settings.eodhd_api_token, "fmt": "json"}
+    if from_date:
+        params["from"] = from_date.isoformat()
+    if to_date:
+        params["to"] = to_date.isoformat()
+
+    url = f"{BASE_URL}/div/{eodhd_symbol}"
+    try:
+        data = await _get_json_with_retry(url, params, log_ctx=f"{eodhd_symbol}:dividends")
+    except httpx.HTTPStatusError as exc:
+        status = exc.response.status_code
+        if status in (401, 402, 403):
+            raise EodhdEntitlementError(
+                f"EODHD denied access to dividend data for {eodhd_symbol} (HTTP {status}). "
+                "The configured EODHD plan/token must include the dividends endpoint."
+            ) from exc
+        if status == 404:
+            logger.info("No EODHD dividend coverage for %s", eodhd_symbol)
+            return []
+        raise
+
+    if not isinstance(data, list):
+        logger.warning("Unexpected EODHD dividends payload for %s: %r", eodhd_symbol, type(data))
         return []
     return data

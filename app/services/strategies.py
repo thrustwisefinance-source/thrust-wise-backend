@@ -15,14 +15,19 @@ HTTP access here, no external calls.
 
 import dataclasses
 import datetime
+import logging
 import math
 import numbers
+from collections import Counter
+from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
 
 from app.constants import ETF_REGISTRY
 from app.models import DailyPrice
+
+logger = logging.getLogger(__name__)
 
 # Chart payload: last N trading days of indicator history for the frontend
 CHART_LOOKBACK_DAYS = 180
@@ -5981,3 +5986,2769 @@ def compute_crash_warning(prices) -> dict | None:
         "data_quality_warnings": warnings,
         "disclaimer": CRASH_DISCLAIMER,
     }
+
+
+# ============================================================================
+# SMA TRAFFIC LIGHT  (appended section)
+# ============================================================================
+# Moving Average Traffic Light — a backward-compatible enhancement of the
+# existing SMA Trend strategy (services.strategies.compute_sma_trend).
+#
+# Analytical / visualization only: classifies the *ordering* of the latest
+# close and the 10 / 25 / 50-period simple moving averages. It never emits
+# buy / sell / hold signals.
+#
+# Definitions (strict inequalities; ties are never "bullish" or "bearish"):
+#
+#   Bullish (Green):  Close > SMA10 > SMA25 > SMA50
+#   Bearish (Red):    Close < SMA10 < SMA25 < SMA50
+#   Mixed   (Amber):  anything else (transitional / no full ordering)
+#
+# Indexing conventions (explicit, because they are easy to confuse):
+#
+#   * SMAn at bar t   = mean of the n closes ending at bar t (inclusive),
+#                       i.e. closes[t-n+1 .. t].
+#   * Slope of SMAn   = SMAn[t] vs SMAn[t - SLOPE_LOOKBACK_BARS].
+#   * Crossover       = sign change of (fast SMA - slow SMA) between bar t-1
+#                       and bar t, looked for in the last
+#                       CROSSOVER_LOOKBACK_BARS bars.
+#   * Historical-price comparison for period n compares the latest close with
+#     the close n trading bars earlier (index -1-n), i.e. closes[t-n]. This is
+#     a different quantity from SMAn (which averages closes[t-n+1 .. t]) and is
+#     reported separately from the price-vs-SMA comparison.
+#
+# The calculation reuses services.strategies.to_close_series (raw close, same
+# price basis as the existing SMA Trend) and is a pure function over the
+# already-loaded `list[DailyPrice]` — no DB, HTTP or EODHD access here.
+# Existing SMA Trend values and fields are never modified; the result is
+# attached as an additional nested `traffic_light` object.
+
+logger = logging.getLogger(__name__)
+
+TRAFFIC_LIGHT_PERIODS = (10, 25, 50)
+MIN_ROWS_TRAFFIC_LIGHT = max(TRAFFIC_LIGHT_PERIODS)  # SMA50 needs 50 closes
+SLOPE_LOOKBACK_BARS = 5
+# |slope| at or below this (percent change of the SMA over the slope window)
+# is reported as "Flat".
+SLOPE_FLAT_TOLERANCE_PERCENT = 0.05
+CROSSOVER_LOOKBACK_BARS = 10
+_EPS = 1e-12
+
+STATE_BULLISH = "Bullish"
+STATE_BEARISH = "Bearish"
+STATE_MIXED = "Mixed"
+_COLOURS = {STATE_BULLISH: "Green", STATE_BEARISH: "Red", STATE_MIXED: "Amber"}
+
+_CROSS_PAIRS = ((10, 25), (25, 50), (10, 50))
+
+METHODOLOGY_NOTE = (
+    "Traffic light = ordering of the latest close and the SMA10 / SMA25 / SMA50 of closing prices "
+    "(same raw-close basis as SMA Trend). Green: Close > SMA10 > SMA25 > SMA50. Red: Close < SMA10 < "
+    "SMA25 < SMA50. Amber: any other arrangement. It describes where price sits relative to its "
+    "averages today; it is not a forecast or a trading instruction."
+)
+
+
+def _tl_r(value, digits: int = 4) -> float | None:
+    if value is None:
+        return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(v) or math.isinf(v):
+        return None
+    return round(v, digits)
+
+
+def _position(a: float, b: float) -> str:
+    if a > b + _EPS:
+        return "Above"
+    if a < b - _EPS:
+        return "Below"
+    return "Equal"
+
+
+def _state_series(close: pd.Series, s10: pd.Series, s25: pd.Series, s50: pd.Series) -> pd.Series:
+    bull = (close > s10) & (s10 > s25) & (s25 > s50)
+    bear = (close < s10) & (s10 < s25) & (s25 < s50)
+    return pd.Series(
+        np.where(bull, STATE_BULLISH, np.where(bear, STATE_BEARISH, STATE_MIXED)),
+        index=close.index,
+    )
+
+
+def _ordering(values: dict[str, float]) -> tuple[list[str], str, bool]:
+    """Labels sorted high -> low, a readable "A > B = C" string, and a ties flag."""
+    ranked = sorted(values.items(), key=lambda kv: (-kv[1], list(values).index(kv[0])))
+    labels = [k for k, _ in ranked]
+    text = labels[0]
+    has_tie = False
+    for (_, prev_v), (label, v) in zip(ranked, ranked[1:]):
+        if abs(prev_v - v) <= _EPS:
+            text += f" = {label}"
+            has_tie = True
+        else:
+            text += f" > {label}"
+    return labels, text, has_tie
+
+
+def _slope(sma: pd.Series) -> dict:
+    if len(sma) <= SLOPE_LOOKBACK_BARS:
+        return {"slope_percent": None, "direction": None, "lookback_bars": SLOPE_LOOKBACK_BARS}
+    now, before = float(sma.iloc[-1]), float(sma.iloc[-1 - SLOPE_LOOKBACK_BARS])
+    if before == 0:
+        return {"slope_percent": None, "direction": None, "lookback_bars": SLOPE_LOOKBACK_BARS}
+    pct = (now / before - 1.0) * 100.0
+    if pct > SLOPE_FLAT_TOLERANCE_PERCENT:
+        direction = "Rising"
+    elif pct < -SLOPE_FLAT_TOLERANCE_PERCENT:
+        direction = "Falling"
+    else:
+        direction = "Flat"
+    return {"slope_percent": _tl_r(pct), "direction": direction, "lookback_bars": SLOPE_LOOKBACK_BARS}
+
+
+def _crossovers(df: pd.DataFrame) -> dict:
+    events: list[dict] = []
+    n = len(df)
+    for fast, slow in _CROSS_PAIRS:
+        diff = (df[f"sma{fast}"] - df[f"sma{slow}"]).to_numpy(dtype=float)
+        sign = np.where(diff > _EPS, 1, np.where(diff < -_EPS, -1, 0))
+        first = max(1, n - CROSSOVER_LOOKBACK_BARS)
+        for t in range(first, n):
+            prev, cur = sign[t - 1], sign[t]
+            kind = None
+            if prev <= 0 and cur > 0:
+                kind = "Bullish"
+            elif prev >= 0 and cur < 0:
+                kind = "Bearish"
+            if kind:
+                events.append(
+                    {
+                        "pair": f"SMA{fast}/SMA{slow}",
+                        "fast_period": fast,
+                        "slow_period": slow,
+                        "type": kind,
+                        "date": df.index[t].date().isoformat(),
+                        "bars_ago": n - 1 - t,
+                    }
+                )
+    events.sort(key=lambda e: (e["bars_ago"], e["pair"]))
+    return {
+        "lookback_bars": CROSSOVER_LOOKBACK_BARS,
+        "definition": (
+            "A bullish crossover is a bar where (fast SMA - slow SMA) moves from <= 0 to > 0; "
+            "a bearish crossover moves from >= 0 to < 0."
+        ),
+        "events": events,
+        "any_recent_crossover": bool(events),
+    }
+
+
+def _historical_comparisons(close: pd.Series) -> list[dict]:
+    out: list[dict] = []
+    last_close = float(close.iloc[-1])
+    for n in TRAFFIC_LIGHT_PERIODS:
+        idx = len(close) - 1 - n
+        if idx < 0:
+            out.append(
+                {
+                    "period": n,
+                    "available": False,
+                    "reference_date": None,
+                    "reference_close": None,
+                    "change_percent": None,
+                    "position": None,
+                }
+            )
+            continue
+        ref = float(close.iloc[idx])
+        out.append(
+            {
+                "period": n,
+                "available": True,
+                "reference_date": close.index[idx].date().isoformat(),
+                "reference_close": _tl_r(ref, 2),
+                "change_percent": _tl_r((last_close / ref - 1.0) * 100.0) if ref else None,
+                "position": _position(last_close, ref),
+            }
+        )
+    return out
+
+
+def _tl_interpretation(state: str, ordering_text: str, crossovers: dict) -> str:
+    if state == STATE_BULLISH:
+        text = (
+            "Full bullish ordering: the latest close and the shorter-term averages sit above the "
+            f"longer-term averages ({ordering_text})."
+        )
+    elif state == STATE_BEARISH:
+        text = (
+            "Full bearish ordering: the latest close and the shorter-term averages sit below the "
+            f"longer-term averages ({ordering_text})."
+        )
+    else:
+        text = (
+            "Mixed / transitional: the close and the averages do not form a complete bullish or "
+            f"bearish ordering ({ordering_text})."
+        )
+    if crossovers["events"]:
+        latest = crossovers["events"][0]
+        text += (
+            f" Most recent crossover in the last {CROSSOVER_LOOKBACK_BARS} bars: "
+            f"{latest['type'].lower()} {latest['pair']} on {latest['date']}."
+        )
+    return text + " Descriptive only; not a forecast."
+
+
+def compute_sma_traffic_light(prices: list[DailyPrice]) -> dict | None:
+    """Moving Average Traffic Light for the latest bar, or None when fewer than
+    MIN_ROWS_TRAFFIC_LIGHT valid closes are available. Pure function."""
+    close = to_close_series(prices)
+    if close.empty:
+        return None
+    close = close[np.isfinite(close.to_numpy(dtype=float)) & (close.to_numpy(dtype=float) > 0)]
+    close = close[~close.index.duplicated(keep="last")]
+    if len(close) < MIN_ROWS_TRAFFIC_LIGHT:
+        return None
+
+    df = pd.DataFrame(
+        {
+            "close": close,
+            "sma10": close.rolling(10).mean(),
+            "sma25": close.rolling(25).mean(),
+            "sma50": close.rolling(50).mean(),
+        }
+    ).dropna()
+    if df.empty:
+        return None
+    df["state"] = _state_series(df["close"], df["sma10"], df["sma25"], df["sma50"])
+
+    last = df.iloc[-1]
+    price = float(last["close"])
+    smas = {10: float(last["sma10"]), 25: float(last["sma25"]), 50: float(last["sma50"])}
+    state = str(last["state"])
+
+    labels, ordering_text, has_ties = _ordering(
+        {"Close": price, "SMA10": smas[10], "SMA25": smas[25], "SMA50": smas[50]}
+    )
+    crossovers = _crossovers(df)
+
+    chart_rows = []
+    for ts, row in df.tail(CHART_LOOKBACK_DAYS).iterrows():
+        chart_rows.append(
+            {
+                "date": ts.date().isoformat(),
+                "close": _tl_r(row["close"], 2),
+                "sma10": _tl_r(row["sma10"], 2),
+                "sma25": _tl_r(row["sma25"], 2),
+                "sma50": _tl_r(row["sma50"], 2),
+                "state": str(row["state"]),
+            }
+        )
+
+    return {
+        "state": state,
+        "colour": _COLOURS[state],
+        "as_of": df.index[-1].date().isoformat(),
+        "price": _tl_r(price, 2),
+        "sma10": _tl_r(smas[10], 2),
+        "sma25": _tl_r(smas[25], 2),
+        "sma50": _tl_r(smas[50], 2),
+        "bullish_condition_met": state == STATE_BULLISH,
+        "bearish_condition_met": state == STATE_BEARISH,
+        "ordering_descending": labels,
+        "ordering_text": ordering_text,
+        "has_ties": has_ties,
+        "price_positioning": [
+            {
+                "period": n,
+                "sma": _tl_r(smas[n], 2),
+                "price_vs_sma_percent": _tl_r((price / smas[n] - 1.0) * 100.0),
+                "position": _position(price, smas[n]),
+            }
+            for n in TRAFFIC_LIGHT_PERIODS
+        ],
+        "sma_relationships": {
+            "sma10_vs_sma25": _position(smas[10], smas[25]),
+            "sma25_vs_sma50": _position(smas[25], smas[50]),
+            "sma10_vs_sma50": _position(smas[10], smas[50]),
+        },
+        "slopes": {f"sma{n}": _slope(df[f"sma{n}"]) for n in TRAFFIC_LIGHT_PERIODS},
+        "crossovers": crossovers,
+        "historical_price_comparison": {
+            "definition": (
+                "Latest close compared with the close n trading bars earlier (index -1-n). This is "
+                "NOT the same as comparing price with SMAn, which averages the n closes ending today."
+            ),
+            "comparisons": _historical_comparisons(close),
+        },
+        "interpretation": _tl_interpretation(state, ordering_text, crossovers),
+        "methodology_note": METHODOLOGY_NOTE,
+        "chart_data": chart_rows,
+    }
+
+
+def attach_traffic_light(sma_trend: dict | None, prices: list[DailyPrice]) -> dict | None:
+    """Return a copy of the existing SMA Trend result with the traffic light added
+    under `traffic_light`. All existing keys/values are left exactly as computed.
+
+    `None` (SMA Trend itself lacks history) stays `None`. A traffic-light failure
+    never breaks the SMA Trend response: `traffic_light` is simply left null.
+    """
+    if sma_trend is None:
+        return None
+    enhanced = dict(sma_trend)
+    try:
+        enhanced["traffic_light"] = compute_sma_traffic_light(prices)
+    except Exception:  # noqa: BLE001 - enhancement must never break SMA Trend
+        logger.exception("SMA traffic light computation failed")
+        enhanced["traffic_light"] = None
+    return enhanced
+
+
+# ============================================================================
+# CANDLESTICK PATTERNS  (appended section)
+# ============================================================================
+# Candlestick Pattern Recognition (Technical Strategies).
+#
+# Separate from, and independent of, the existing "TA Candles / Trend Health"
+# strategy (services.strategies Strategy 26), which is left untouched.
+#
+# Analytical / visualization only: reports where recognised candlestick
+# formations occurred in the symbol's daily OHLCV history. A detection is a
+# descriptive, rule-based observation — NOT a prediction, NOT a probability
+# and NOT a trading instruction. No confidence percentages are produced.
+#
+# Detection method
+# ----------------
+# TA-Lib is deliberately NOT used: it needs a compiled C library that this
+# project does not otherwise depend on (and services.strategies states that all
+# indicators are computed manually with pandas/numpy). The patterns below are
+# therefore implemented as explicit, documented rules (see the constants and
+# PATTERN_DEFINITIONS). They follow common textbook definitions and are not
+# byte-identical to TA-Lib's CDL* functions, which use their own tolerances;
+# no signed TA-Lib scores exist in this output.
+#
+# Candle anatomy (per candle):
+#   body   = |close - open|              range = high - low
+#   upper  = high - max(open, close)     lower = min(open, close) - low
+#
+# Prior-trend context (for patterns whose meaning depends on it): the net close
+# change over the TREND_LOOKBACK_BARS closes ending just before the pattern's
+# first candle must be at least TREND_MIN_MOVE_ATR_MULTIPLE x ATR(ATR_PERIOD)
+# (measured at that same prior bar) in the required direction. If that context
+# cannot be measured, the pattern is NOT reported.
+#
+# Data integrity: candles with missing / non-finite / non-positive OHLC or an
+# impossible shape (high < max(open, close, low) or low > min(open, close, high))
+# are dropped and counted, never repaired. A multi-candle pattern is only
+# reported when its candles are consecutive in the original (sorted) history —
+# a dropped candle in the middle breaks the formation. A latest daily candle that
+# may still be forming (US session not yet closed) is excluded.
+#
+# Pure functions over `list[DailyPrice]` already loaded from the database (EODHD
+# daily bars); no DB, HTTP or EODHD access here.
+
+CP_STRATEGY_ID = "candlestick_pattern_recognition"
+CP_STRATEGY_NAME = "Candlestick Pattern Recognition"
+CP_STRATEGY_CATEGORY = "Technical Strategies"
+SUPPORTED_INTERVALS = ("1d",)
+
+# --- documented thresholds --------------------------------------------------
+DOJI_MAX_BODY_RANGE_RATIO = 0.10  # body <= 10% of the candle range
+SHADOW_BODY_MULTIPLE = 2.0  # "long" shadow >= 2 x body (hammer / hanging man / shooting star)
+OPPOSITE_SHADOW_MAX_RANGE_RATIO = 0.10  # opposite shadow <= 10% of range
+AVG_BODY_WINDOW = 10  # average body of the 10 candles preceding a candle
+LONG_BODY_MULTIPLE = 1.0  # "long" body >= 1.0 x preceding average body
+STAR_SMALL_BODY_MULTIPLE = 0.5  # star body <= 0.5 x preceding average body
+CROWS_MIN_BODY_RANGE_RATIO = 0.5  # each crow body >= 50% of its range
+CROWS_MAX_CLOSE_SHADOW_RANGE_RATIO = 0.25  # close within 25% of range from the low
+TREND_LOOKBACK_BARS = 5
+TREND_MIN_MOVE_ATR_MULTIPLE = 1.0
+ATR_PERIOD = 14
+PRICE_TOLERANCE = 1e-9  # relative tolerance for OHLC consistency checks
+
+MIN_ROWS_CANDLESTICK = AVG_BODY_WINDOW + ATR_PERIOD + TREND_LOOKBACK_BARS + 3  # 32
+DEFAULT_LOOKBACK_BARS = 120
+MIN_LOOKBACK_BARS = 5
+MAX_LOOKBACK_BARS = 1260
+MAX_DETECTIONS_RETURNED = 250
+CHART_CANDLES = 180
+MAX_REPORTED_INVALID_DATES = 10
+
+BULLISH = "Bullish"
+BEARISH = "Bearish"
+NEUTRAL = "Neutral"
+
+# name -> (candles, classification, required prior trend, rule text)
+PATTERN_DEFINITIONS: dict[str, dict] = {
+    "Hammer": {
+        "candles": 1,
+        "classification": BULLISH,
+        "requires_prior_trend": "Downtrend",
+        "rule": (
+            "Not a doji (body > 10% of range); lower shadow >= 2 x body; upper shadow <= 10% of range; "
+            "preceded by a downtrend."
+        ),
+        "interpretation": (
+            "Hammer after a decline: sellers pushed price well below the open but buyers recovered most of the "
+            "range by the close. Often read as a possible pause in selling pressure; it is not a forecast."
+        ),
+    },
+    "Hanging Man": {
+        "candles": 1,
+        "classification": BEARISH,
+        "requires_prior_trend": "Uptrend",
+        "rule": (
+            "Same candle shape as a Hammer (not a doji; lower shadow >= 2 x body; upper shadow <= 10% of range) "
+            "but preceded by an uptrend."
+        ),
+        "interpretation": (
+            "Hanging Man after an advance: heavy intraday selling was absorbed by the close. Often read as a "
+            "possible warning of waning buying pressure; it is not a forecast."
+        ),
+    },
+    "Shooting Star": {
+        "candles": 1,
+        "classification": BEARISH,
+        "requires_prior_trend": "Uptrend",
+        "rule": (
+            "Not a doji; upper shadow >= 2 x body; lower shadow <= 10% of range; preceded by an uptrend."
+        ),
+        "interpretation": (
+            "Shooting Star after an advance: buyers lifted price sharply but sellers pushed it back near the open. "
+            "Often read as possible exhaustion of buying; it is not a forecast."
+        ),
+    },
+    "Doji": {
+        "candles": 1,
+        "classification": NEUTRAL,
+        "requires_prior_trend": None,
+        "rule": "Body <= 10% of the candle range (open and close nearly equal) and a non-zero range.",
+        "interpretation": (
+            "Doji: open and close are almost equal, indicating indecision between buyers and sellers in that "
+            "session. Neutral on its own; context matters."
+        ),
+    },
+    "Bullish Engulfing": {
+        "candles": 2,
+        "classification": BULLISH,
+        "requires_prior_trend": "Downtrend",
+        "rule": (
+            "Bearish candle followed by a bullish candle whose real body fully covers the prior real body "
+            "(open <= prior close, close >= prior open, strictly larger body); preceded by a downtrend."
+        ),
+        "interpretation": (
+            "Bullish Engulfing after a decline: buyers overwhelmed the prior session's selling. Often read as a "
+            "possible shift in short-term momentum; it is not a forecast."
+        ),
+    },
+    "Bearish Engulfing": {
+        "candles": 2,
+        "classification": BEARISH,
+        "requires_prior_trend": "Uptrend",
+        "rule": (
+            "Bullish candle followed by a bearish candle whose real body fully covers the prior real body "
+            "(open >= prior close, close <= prior open, strictly larger body); preceded by an uptrend."
+        ),
+        "interpretation": (
+            "Bearish Engulfing after an advance: sellers overwhelmed the prior session's buying. Often read as a "
+            "possible shift in short-term momentum; it is not a forecast."
+        ),
+    },
+    "Bullish Harami": {
+        "candles": 2,
+        "classification": BULLISH,
+        "requires_prior_trend": "Downtrend",
+        "rule": (
+            "Long bearish candle (body >= average body of the preceding 10 candles) followed by a smaller bullish "
+            "candle whose real body lies strictly inside the prior real body; preceded by a downtrend."
+        ),
+        "interpretation": (
+            "Bullish Harami after a decline: selling momentum slowed inside the prior large candle. Often read as "
+            "a possible loss of downside momentum; it is not a forecast."
+        ),
+    },
+    "Bearish Harami": {
+        "candles": 2,
+        "classification": BEARISH,
+        "requires_prior_trend": "Uptrend",
+        "rule": (
+            "Long bullish candle (body >= average body of the preceding 10 candles) followed by a smaller bearish "
+            "candle whose real body lies strictly inside the prior real body; preceded by an uptrend."
+        ),
+        "interpretation": (
+            "Bearish Harami after an advance: buying momentum slowed inside the prior large candle. Often read as "
+            "a possible loss of upside momentum; it is not a forecast."
+        ),
+    },
+    "Morning Star": {
+        "candles": 3,
+        "classification": BULLISH,
+        "requires_prior_trend": "Downtrend",
+        "rule": (
+            "Long bearish candle; then a small-bodied candle (body <= 0.5 x average body) whose real body sits at or "
+            "below the first candle's close; then a bullish candle closing above the midpoint of the first candle's "
+            "real body; preceded by a downtrend."
+        ),
+        "interpretation": (
+            "Morning Star after a decline: a sell-off, a pause, then a strong rebound. Often read as a possible "
+            "bottoming formation; it is not a forecast."
+        ),
+    },
+    "Evening Star": {
+        "candles": 3,
+        "classification": BEARISH,
+        "requires_prior_trend": "Uptrend",
+        "rule": (
+            "Long bullish candle; then a small-bodied candle (body <= 0.5 x average body) whose real body sits at or "
+            "above the first candle's close; then a bearish candle closing below the midpoint of the first candle's "
+            "real body; preceded by an uptrend."
+        ),
+        "interpretation": (
+            "Evening Star after an advance: a rally, a pause, then a strong reversal candle. Often read as a "
+            "possible topping formation; it is not a forecast."
+        ),
+    },
+    "Three Black Crows": {
+        "candles": 3,
+        "classification": BEARISH,
+        "requires_prior_trend": "Uptrend",
+        "rule": (
+            "Three consecutive bearish candles, each closing lower than the previous close, each opening within the "
+            "previous real body, each with a body >= 50% of its range and closing within 25% of its range from its "
+            "low; preceded by an uptrend."
+        ),
+        "interpretation": (
+            "Three Black Crows after an advance: three consecutive strong down sessions closing near their lows. "
+            "Often read as sustained selling pressure; it is not a forecast."
+        ),
+    },
+}
+PATTERN_ORDER = list(PATTERN_DEFINITIONS)
+
+CP_DISCLAIMER = (
+    "Candlestick formations are descriptive observations of past price action. They are not reliable predictors "
+    "of future price movement, carry no probability or confidence score, and are not investment advice."
+)
+
+
+def _is_finite_positive(value) -> bool:
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(v) and v > 0
+
+
+def _is_finite_nonneg(value) -> bool:
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(v) and v >= 0
+
+
+def clean_candles(prices: list[DailyPrice]) -> tuple[pd.DataFrame, dict]:
+    """Validated candle frame (columns open/high/low/close/volume/pos, indexed by
+    date) plus a data-quality report.
+
+    `pos` is the candle's position among the date-sorted, de-duplicated source
+    rows BEFORE invalid rows are dropped; consecutive `pos` values mean the
+    candles were adjacent in the source history."""
+    report = {
+        "source_rows": len(prices or []),
+        "duplicate_dates_dropped": 0,
+        "invalid_candles_dropped": 0,
+        "invalid_candle_dates": [],
+        "missing_date_rows_dropped": 0,
+    }
+    by_date: dict[datetime.date, object] = {}
+    for p in prices or []:
+        d = getattr(p, "date", None)
+        if d is None:
+            report["missing_date_rows_dropped"] += 1
+            continue
+        if isinstance(d, datetime.datetime):
+            d = d.date()
+        if d in by_date:
+            report["duplicate_dates_dropped"] += 1
+        by_date[d] = p
+    rows = []
+    for pos, d in enumerate(sorted(by_date)):
+        p = by_date[d]
+        o, h, l, c = (getattr(p, k, None) for k in ("open", "high", "low", "close"))
+        valid = all(_is_finite_positive(x) for x in (o, h, l, c))
+        if valid:
+            o, h, l, c = float(o), float(h), float(l), float(c)
+            tol = PRICE_TOLERANCE * max(h, 1.0)
+            valid = h >= max(o, c, l) - tol and l <= min(o, c, h) + tol
+        if not valid:
+            report["invalid_candles_dropped"] += 1
+            if len(report["invalid_candle_dates"]) < MAX_REPORTED_INVALID_DATES:
+                report["invalid_candle_dates"].append(d.isoformat())
+            continue
+        vol = getattr(p, "volume", None)
+        rows.append(
+            {
+                "date": pd.Timestamp(d),
+                "open": o,
+                "high": max(h, o, c),
+                "low": min(l, o, c),
+                "close": c,
+                "volume": float(vol) if _is_finite_nonneg(vol) else float("nan"),
+                "pos": pos,
+            }
+        )
+    if not rows:
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume", "pos"]), report
+    frame = pd.DataFrame(rows).set_index("date").sort_index()
+    return frame, report
+
+
+def is_latest_daily_candle_incomplete(last_date: datetime.date, now: datetime.datetime | None = None) -> bool:
+    """True when the latest daily bar's date is today in US Eastern time and the
+    regular session (16:00 ET) has not closed, i.e. the bar may still be forming."""
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=datetime.timezone.utc)
+    try:
+        from zoneinfo import ZoneInfo
+
+        now_et = now.astimezone(ZoneInfo("America/New_York"))
+    except Exception:  # noqa: BLE001 - tz database missing: use a conservative fixed offset
+        now_et = now.astimezone(datetime.timezone(datetime.timedelta(hours=-5)))
+    return last_date == now_et.date() and now_et.time() < datetime.time(16, 0)
+
+
+def _trend_arrays(frame: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(downtrend, uptrend, move_percent) evaluated for the candle that STARTS a
+    formation at each index: uses only closes strictly before that candle."""
+    close = frame["close"]
+    move = close.shift(1) - close.shift(1 + TREND_LOOKBACK_BARS)
+    atr_prev = _atr(frame[["high", "low", "close"]], ATR_PERIOD).shift(1)
+    threshold = TREND_MIN_MOVE_ATR_MULTIPLE * atr_prev
+    down = (move <= -threshold) & threshold.notna() & move.notna()
+    up = (move >= threshold) & threshold.notna() & move.notna()
+    base = close.shift(1 + TREND_LOOKBACK_BARS)
+    move_pct = (move / base * 100.0).where(base > 0)
+    return down.to_numpy(dtype=bool), up.to_numpy(dtype=bool), move_pct.to_numpy(dtype=float)
+
+
+def _shift(arr: np.ndarray, k: int, fill) -> np.ndarray:
+    """arr[i-k] aligned to i (k >= 0) with `fill` where i-k < 0."""
+    out = np.full(arr.shape, fill, dtype=arr.dtype)
+    if k == 0:
+        return arr.copy()
+    if k < len(arr):
+        out[k:] = arr[:-k]
+    return out
+
+
+def _detect_all(frame: pd.DataFrame) -> dict[str, np.ndarray]:
+    """Boolean arrays (True at the candle that COMPLETES the formation) per pattern."""
+    o = frame["open"].to_numpy(dtype=float)
+    h = frame["high"].to_numpy(dtype=float)
+    l = frame["low"].to_numpy(dtype=float)
+    c = frame["close"].to_numpy(dtype=float)
+    pos = frame["pos"].to_numpy(dtype=np.int64)
+    n = len(frame)
+
+    body = np.abs(c - o)
+    rng = h - l
+    top = np.maximum(o, c)
+    bottom = np.minimum(o, c)
+    upper = h - top
+    lower = bottom - l
+    bull = c > o
+    bear = c < o
+    has_range = rng > 0
+
+    avg_body = pd.Series(body).rolling(AVG_BODY_WINDOW).mean().shift(1).to_numpy(dtype=float)
+    avg_ok = np.isfinite(avg_body)
+    long_body = avg_ok & (body > 0) & (body >= LONG_BODY_MULTIPLE * np.nan_to_num(avg_body))
+    small_body = avg_ok & (body <= STAR_SMALL_BODY_MULTIPLE * np.nan_to_num(avg_body))
+
+    down, up, _ = _trend_arrays(frame)
+
+    # contiguity: candle i-k .. i adjacent in the source history
+    contig2 = np.zeros(n, dtype=bool)
+    contig3 = np.zeros(n, dtype=bool)
+    if n >= 2:
+        contig2[1:] = (pos[1:] - pos[:-1]) == 1
+    if n >= 3:
+        contig3[2:] = ((pos[2:] - pos[:-2]) == 2) & contig2[2:] & contig2[1:-1]
+
+    doji = has_range & (body <= DOJI_MAX_BODY_RANGE_RATIO * rng)
+    not_doji = has_range & (body > DOJI_MAX_BODY_RANGE_RATIO * rng)
+    hammer_shape = (
+        not_doji
+        & (lower >= SHADOW_BODY_MULTIPLE * body)
+        & (upper <= OPPOSITE_SHADOW_MAX_RANGE_RATIO * rng)
+    )
+    star_shape = (
+        not_doji
+        & (upper >= SHADOW_BODY_MULTIPLE * body)
+        & (lower <= OPPOSITE_SHADOW_MAX_RANGE_RATIO * rng)
+    )
+
+    # one-candle patterns: the trend context is read before candle i itself
+    result: dict[str, np.ndarray] = {
+        "Hammer": hammer_shape & down,
+        "Hanging Man": hammer_shape & up,
+        "Shooting Star": star_shape & up,
+        "Doji": doji,
+    }
+
+    # previous-candle views (index s = i-1, first candle of a 2-candle formation)
+    o1, c1 = _shift(o, 1, 0.0), _shift(c, 1, 0.0)
+    body1 = _shift(body, 1, 0.0)
+    bull1, bear1 = _shift(bull, 1, False), _shift(bear, 1, False)
+    long1 = _shift(long_body, 1, False)
+    top1, bottom1 = _shift(top, 1, 0.0), _shift(bottom, 1, 0.0)
+    down1, up1 = _shift(down, 1, False), _shift(up, 1, False)
+
+    result["Bullish Engulfing"] = (
+        contig2 & bear1 & bull & (o <= c1) & (c >= o1) & (body > body1) & down1
+    )
+    result["Bearish Engulfing"] = (
+        contig2 & bull1 & bear & (o >= c1) & (c <= o1) & (body > body1) & up1
+    )
+    result["Bullish Harami"] = (
+        contig2 & bear1 & long1 & bull & (body < body1) & (top < top1) & (bottom > bottom1) & down1
+    )
+    result["Bearish Harami"] = (
+        contig2 & bull1 & long1 & bear & (body < body1) & (top < top1) & (bottom > bottom1) & up1
+    )
+
+    # three-candle formations: s = i-2 (first), m = i-1 (middle), i = last
+    o2, c2 = _shift(o, 2, 0.0), _shift(c, 2, 0.0)
+    bull2, bear2 = _shift(bull, 2, False), _shift(bear, 2, False)
+    long2 = _shift(long_body, 2, False)
+    down2, up2 = _shift(down, 2, False), _shift(up, 2, False)
+    small_m = _shift(small_body, 1, False)
+    top_m, bottom_m = top1, bottom1
+    mid_first = (o2 + c2) / 2.0
+
+    result["Morning Star"] = (
+        contig3 & bear2 & long2 & small_m & (top_m <= c2) & bull & (c > mid_first) & down2
+    )
+    result["Evening Star"] = (
+        contig3 & bull2 & long2 & small_m & (bottom_m >= c2) & bear & (c < mid_first) & up2
+    )
+
+    def crow(idx_shift: int) -> np.ndarray:
+        ok = _shift(bear, idx_shift, False)
+        rg = _shift(rng, idx_shift, 0.0)
+        bd = _shift(body, idx_shift, 0.0)
+        low_ = _shift(l, idx_shift, 0.0)
+        cl = _shift(c, idx_shift, 0.0)
+        return (
+            ok
+            & (rg > 0)
+            & (bd >= CROWS_MIN_BODY_RANGE_RATIO * rg)
+            & ((cl - low_) <= CROWS_MAX_CLOSE_SHADOW_RANGE_RATIO * rg)
+        )
+
+    o_m, c_m = o1, c1
+    result["Three Black Crows"] = (
+        contig3
+        & crow(2)
+        & crow(1)
+        & crow(0)
+        & (c_m < c2)
+        & (c < c_m)
+        & (o_m <= o2)
+        & (o_m >= c2)
+        & (o <= o_m)
+        & (o >= c_m)
+        & up2
+    )
+    return result
+
+
+def _candle_record(frame: pd.DataFrame, i: int) -> dict:
+    row = frame.iloc[i]
+    vol = row["volume"]
+    return {
+        "date": frame.index[i].date().isoformat(),
+        "open": round(float(row["open"]), 4),
+        "high": round(float(row["high"]), 4),
+        "low": round(float(row["low"]), 4),
+        "close": round(float(row["close"]), 4),
+        "volume": None if not math.isfinite(float(vol)) else int(vol),
+    }
+
+
+def _context_label(pattern: str, down: bool, up: bool) -> str:
+    required = PATTERN_DEFINITIONS[pattern]["requires_prior_trend"]
+    if required is None:
+        return "Not required"
+    return "Downtrend" if down else "Uptrend" if up else "Unmeasured"
+
+
+def compute_candlestick_patterns(
+    prices: list[DailyPrice],
+    symbol: str | None = None,
+    lookback_bars: int = DEFAULT_LOOKBACK_BARS,
+    now: datetime.datetime | None = None,
+    interval: str = "1d",
+) -> dict | None:
+    """Detect the 11 supported candlestick patterns in the last `lookback_bars`
+    candles. Returns None when there are too few valid candles. Raises ValueError
+    for an unsupported interval or an out-of-range `lookback_bars`."""
+    if interval not in SUPPORTED_INTERVALS:
+        raise ValueError(
+            f"Unsupported interval '{interval}'. Supported: {', '.join(SUPPORTED_INTERVALS)}."
+        )
+    if not isinstance(lookback_bars, int) or isinstance(lookback_bars, bool) or not (
+        MIN_LOOKBACK_BARS <= lookback_bars <= MAX_LOOKBACK_BARS
+    ):
+        raise ValueError(
+            f"lookback_bars must be an integer between {MIN_LOOKBACK_BARS} and {MAX_LOOKBACK_BARS}."
+        )
+
+    frame, quality = clean_candles(prices)
+    warnings: list[str] = []
+    if quality["invalid_candles_dropped"]:
+        warnings.append(
+            f"{quality['invalid_candles_dropped']} candle(s) with missing or inconsistent OHLC were excluded "
+            "(not repaired); formations are never formed across an excluded candle."
+        )
+    if quality["duplicate_dates_dropped"]:
+        warnings.append(f"{quality['duplicate_dates_dropped']} duplicate-date row(s) were collapsed.")
+
+    incomplete_excluded = False
+    if len(frame) and is_latest_daily_candle_incomplete(frame.index[-1].date(), now):
+        frame = frame.iloc[:-1]
+        incomplete_excluded = True
+        warnings.append(
+            "The latest daily candle may still be forming (US session not closed) and was excluded."
+        )
+    quality["incomplete_latest_candle_excluded"] = incomplete_excluded
+
+    if len(frame) < MIN_ROWS_CANDLESTICK:
+        return None
+
+    flags = _detect_all(frame)
+    down, up, move_pct = _trend_arrays(frame)
+    n = len(frame)
+    window_start = max(0, n - lookback_bars)
+
+    detections: list[dict] = []
+    for pattern in PATTERN_ORDER:
+        spec = PATTERN_DEFINITIONS[pattern]
+        hits = np.nonzero(flags[pattern])[0]
+        for i in hits:
+            if i < window_start:
+                continue
+            first = int(i) - spec["candles"] + 1
+            if first < 0:
+                continue
+            candles = [_candle_record(frame, k) for k in range(first, int(i) + 1)]
+            req = spec["requires_prior_trend"]
+            detections.append(
+                {
+                    "pattern": pattern,
+                    "symbol": symbol,
+                    "date": candles[-1]["date"],
+                    "start_date": candles[0]["date"],
+                    "candle_count": spec["candles"],
+                    "classification": spec["classification"],
+                    "candles": candles,
+                    "prior_trend": _context_label(pattern, bool(down[first]), bool(up[first])),
+                    "prior_trend_change_percent": (
+                        None
+                        if req is None or not math.isfinite(float(move_pct[first]))
+                        else round(float(move_pct[first]), 2)
+                    ),
+                    "interpretation": spec["interpretation"],
+                    "detection_method": (
+                        "Rule-based candle geometry (pandas/numpy); thresholds listed in `parameters`. "
+                        "Descriptive observation only: no probability or confidence score."
+                    ),
+                }
+            )
+    detections.sort(key=lambda d: (d["date"], PATTERN_ORDER.index(d["pattern"])))
+    total = len(detections)
+    truncated = total > MAX_DETECTIONS_RETURNED
+    if truncated:
+        detections = detections[-MAX_DETECTIONS_RETURNED:]
+        warnings.append(
+            f"{total} detections found; only the most recent {MAX_DETECTIONS_RETURNED} are returned."
+        )
+
+    counts = {p: 0 for p in PATTERN_ORDER}
+    by_class = {BULLISH: 0, BEARISH: 0, NEUTRAL: 0}
+    for d in detections:
+        counts[d["pattern"]] += 1
+        by_class[d["classification"]] += 1
+    last_date = frame.index[-1].date().isoformat()
+
+    return {
+        "strategy_id": CP_STRATEGY_ID,
+        "strategy_name": CP_STRATEGY_NAME,
+        "category": CP_STRATEGY_CATEGORY,
+        "symbol": symbol,
+        "interval": interval,
+        "analysis_start": frame.index[window_start].date().isoformat(),
+        "analysis_end": last_date,
+        "lookback_bars": lookback_bars,
+        "candles_analyzed": n,
+        "candles_in_window": n - window_start,
+        "detection_method": (
+            "ThrustWise rule-based candlestick detector (pandas/numpy, no TA-Lib). Pattern rules and thresholds "
+            "are documented in `pattern_definitions` and `parameters`."
+        ),
+        "patterns_checked": PATTERN_ORDER,
+        "pattern_definitions": [
+            {
+                "pattern": p,
+                "candle_count": s["candles"],
+                "classification": s["classification"],
+                "requires_prior_trend": s["requires_prior_trend"],
+                "rule": s["rule"],
+            }
+            for p, s in PATTERN_DEFINITIONS.items()
+        ],
+        "parameters": {
+            "doji_max_body_range_ratio": DOJI_MAX_BODY_RANGE_RATIO,
+            "shadow_body_multiple": SHADOW_BODY_MULTIPLE,
+            "opposite_shadow_max_range_ratio": OPPOSITE_SHADOW_MAX_RANGE_RATIO,
+            "avg_body_window": AVG_BODY_WINDOW,
+            "long_body_multiple": LONG_BODY_MULTIPLE,
+            "star_small_body_multiple": STAR_SMALL_BODY_MULTIPLE,
+            "crows_min_body_range_ratio": CROWS_MIN_BODY_RANGE_RATIO,
+            "crows_max_close_shadow_range_ratio": CROWS_MAX_CLOSE_SHADOW_RANGE_RATIO,
+            "trend_lookback_bars": TREND_LOOKBACK_BARS,
+            "trend_min_move_atr_multiple": TREND_MIN_MOVE_ATR_MULTIPLE,
+            "atr_period": ATR_PERIOD,
+        },
+        "total_detections": total,
+        "detections_truncated": truncated,
+        "detection_counts": counts,
+        "classification_counts": by_class,
+        "latest_candle_detections": [d for d in detections if d["date"] == last_date],
+        "detections": detections,
+        "data_quality": quality,
+        "warnings": warnings,
+        "chart_data": [_candle_record(frame, i) for i in range(max(0, n - CHART_CANDLES), n)],
+        "disclaimer": CP_DISCLAIMER,
+    }
+
+
+# ============================================================================
+# VOLATILITY HARVESTING  (appended section)
+# ============================================================================
+# Volatility Harvesting (Quantitative Strategies).
+#
+# Analytical / simulation only: compares a periodically REBALANCED portfolio with
+# a BUY-AND-HOLD portfolio started from the same target weights, over a
+# historical window, using price history already ingested from EODHD
+# (`daily_prices`). It is not a trading engine: no orders, no brokerage, no
+# guaranteed-return claims, and a positive difference is never labelled
+# "harvested volatility profit" (see `interpretation` / `methodology`).
+#
+# Simulation conventions (all deterministic, daily, chronological):
+#
+#   * Prices are aligned on the dates present for EVERY asset (inner join). No
+#     price is forward-filled or invented; dropped dates are counted.
+#   * Day 0 buys the target weights at that day's price (no cost charged on the
+#     initial allocation, for both portfolios).
+#   * Buy-and-hold: units are fixed after day 0, so weights DRIFT with prices.
+#   * Rebalanced: on the FIRST trading day of each new calendar period (month /
+#     quarter / half-year / year, per `rebalance_frequency`) the portfolio is
+#     traded back to the target weights AT THAT DAY'S CLOSE. The decision uses
+#     only that day's and earlier dates/prices — never future prices or
+#     returns. A period start on the very last observation is not counted (no
+#     holding period follows it).
+#   * Transaction cost = `transaction_cost_percent` x traded notional (buys +
+#     sells) at each rebalance, deducted from portfolio value on that day.
+#   * Daily portfolio return = V[t] / V[t-1] - 1 (post-cost value).
+#
+# Metrics: cumulative return; CAGR (geometric, only when the window is at least
+# CAGR_MIN_YEARS long); annualised volatility = stdev(daily returns, ddof=1) x
+# sqrt(252); Sharpe = (mean daily return x 252 - risk-free rate) / annualised
+# volatility (arithmetic annualisation; the risk-free rate is a request
+# parameter, default = the backend's configured RISK_FREE_RATE); maximum
+# drawdown on the daily value path. Undefined metrics (zero volatility, window
+# too short) are returned as null — never NaN / Infinity.
+#
+# Return basis: with `price_basis="adjusted"` returns use EODHD `adjusted_close`
+# (adjusted for splits AND dividends, i.e. an approximation of total return with
+# dividends reinvested in the same asset). With `"close"` they are raw price
+# returns (not split-adjusted). Data-quality notes from the existing
+# corporate-action checks are surfaced as warnings.
+#
+# Pure functions over `list[DailyPrice]`; no DB / HTTP here.
+
+VH_STRATEGY_ID = "volatility_harvesting"
+VH_STRATEGY_NAME = "Volatility Harvesting"
+VH_STRATEGY_CATEGORY = "Quantitative Strategies"
+
+REBALANCE_FREQUENCIES = ("monthly", "quarterly", "semiannual", "annual")
+DEFAULT_REBALANCE_FREQUENCY = "quarterly"
+DEFAULT_INITIAL_VALUE = 100_000.0  # same default as TQQQ/TMF/IEF Rebalancing
+MAX_INITIAL_VALUE = 1e12
+MIN_SYMBOLS = 2
+MAX_SYMBOLS = 12
+MIN_OBSERVATIONS = 60  # aligned daily observations (matches Portfolio Optimization)
+TRADING_DAYS_PER_YEAR = 252
+CAGR_MIN_YEARS = 1.0
+MAX_TRANSACTION_COST_PERCENT = 5.0
+MAX_RISK_FREE_RATE_PERCENT = 50.0
+MAX_COST_SENSITIVITY_POINTS = 8
+MAX_CHART_POINTS = 400
+MAX_WEIGHT_POINTS = 250
+MAX_REBALANCE_EVENTS_RETURNED = 200
+EXTREME_DAILY_MOVE = 0.40
+LARGE_GAP_DAYS = 10
+FLAT_DIFFERENCE_PP = 0.005
+ZERO_VOLATILITY = 1e-12
+
+VH_DISCLAIMER = (
+    "Historical simulation for analysis only; not investment advice, not a trading system and not a guarantee of "
+    "future results. Differences between rebalanced and buy-and-hold results depend on the chosen assets, period, "
+    "frequency and costs, and are not proof of a volatility-harvesting premium."
+)
+
+VH_METHODOLOGY = [
+    "Both portfolios start on the first aligned date with the same target weights and initial value.",
+    "Buy-and-hold keeps its initial units, so weights drift with relative price moves.",
+    "The rebalanced portfolio is traded back to target weights at the close of the first trading day of each new "
+    "period (monthly / quarterly / semiannual / annual); only prices up to that day are used (no look-ahead).",
+    "Transaction cost is a percentage of traded notional (buys + sells), deducted from portfolio value on the "
+    "rebalance day; the initial allocation is not charged.",
+    "Prices are aligned on dates common to all assets; nothing is forward-filled or interpolated.",
+    "Sharpe ratio = (mean daily return x 252 - risk-free rate) / (stdev of daily returns x sqrt(252)).",
+    "CAGR is only reported when the window is at least one year long; annualised figures from shorter windows "
+    "would be misleading.",
+]
+
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+
+def _vh_r(value, digits: int = 4) -> float | None:
+    if value is None:
+        return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(v):
+        return None
+    return round(v, digits)
+
+
+def _vh_pct(value, digits: int = 4) -> float | None:
+    return None if value is None else _vh_r(float(value) * 100.0, digits)
+
+
+def _vh_clean(obj: Any) -> Any:
+    """Recursively convert numpy scalars to Python and non-finite floats to None."""
+    if isinstance(obj, dict):
+        return {str(k): _vh_clean(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_vh_clean(v) for v in obj]
+    if isinstance(obj, np.ndarray):
+        return [_vh_clean(v) for v in obj.tolist()]
+    if isinstance(obj, (np.floating, float)):
+        v = float(obj)
+        return v if math.isfinite(v) else None
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    return obj
+
+
+def validate_request(
+    symbols: list[str],
+    weights_percent: dict | None,
+    rebalance_frequency: str,
+    initial_value: float,
+    transaction_cost_percent: float,
+    risk_free_rate_percent: float,
+    start: datetime.date | None,
+    end: datetime.date | None,
+    cost_sensitivity: list[float] | None = None,
+) -> tuple[list[str], dict[str, float]]:
+    """Validate the request. Returns (normalised symbols, {SYMBOL: weight_percent}).
+    Raises ValueError with a precise, user-facing message."""
+    if not symbols:
+        raise ValueError("The portfolio is empty: provide at least two symbols.")
+    normalised: list[str] = []
+    for raw in symbols:
+        sym = (raw or "").strip().upper() if isinstance(raw, str) else ""
+        if not sym:
+            raise ValueError("Symbols must be non-empty strings.")
+        if sym in normalised:
+            raise ValueError(f"Duplicate symbol '{sym}': each asset may appear only once.")
+        normalised.append(sym)
+    if not MIN_SYMBOLS <= len(normalised) <= MAX_SYMBOLS:
+        raise ValueError(f"Provide between {MIN_SYMBOLS} and {MAX_SYMBOLS} distinct symbols.")
+
+    if weights_percent is None:
+        raise ValueError(
+            "weights_percent is required: target weights (summing to 100) must be supplied explicitly; "
+            "no default portfolio is assumed."
+        )
+    weights = validate_portfolio_weights(normalised, weights_percent)
+    provided = {str(k).strip().upper() for k in weights_percent}
+    missing = [s for s in normalised if s not in provided]
+    if missing:
+        raise ValueError(f"Missing target weight for: {', '.join(missing)}.")
+    zero = [s for s, w in weights.items() if w <= 0]
+    if zero:
+        raise ValueError(
+            f"Target weights must be greater than 0 for every listed symbol (zero weight: {', '.join(zero)}); "
+            "remove the symbol instead."
+        )
+
+    if rebalance_frequency not in REBALANCE_FREQUENCIES:
+        raise ValueError(
+            f"rebalance_frequency must be one of: {', '.join(REBALANCE_FREQUENCIES)}."
+        )
+    if not _is_real_number(initial_value) or not 0 < float(initial_value) <= MAX_INITIAL_VALUE:
+        raise ValueError(f"initial_value must be a finite number greater than 0 (max {MAX_INITIAL_VALUE:g}).")
+    if not _is_real_number(transaction_cost_percent) or not (
+        0 <= float(transaction_cost_percent) <= MAX_TRANSACTION_COST_PERCENT
+    ):
+        raise ValueError(
+            f"transaction_cost_percent must be between 0 and {MAX_TRANSACTION_COST_PERCENT:g} (percent of traded notional)."
+        )
+    if not _is_real_number(risk_free_rate_percent) or not (
+        0 <= float(risk_free_rate_percent) <= MAX_RISK_FREE_RATE_PERCENT
+    ):
+        raise ValueError(f"risk_free_rate_percent must be between 0 and {MAX_RISK_FREE_RATE_PERCENT:g}.")
+    if start is not None and not isinstance(start, datetime.date):
+        raise ValueError("start must be a valid date.")
+    if end is not None and not isinstance(end, datetime.date):
+        raise ValueError("end must be a valid date.")
+    if start and end and start > end:
+        raise ValueError("start must not be after end.")
+    if cost_sensitivity is not None:
+        if not isinstance(cost_sensitivity, list) or not cost_sensitivity:
+            raise ValueError("transaction_cost_sensitivity_percent must be a non-empty list when provided.")
+        if len(cost_sensitivity) > MAX_COST_SENSITIVITY_POINTS:
+            raise ValueError(
+                f"transaction_cost_sensitivity_percent accepts at most {MAX_COST_SENSITIVITY_POINTS} values."
+            )
+        for c in cost_sensitivity:
+            if not _is_real_number(c) or not 0 <= float(c) <= MAX_TRANSACTION_COST_PERCENT:
+                raise ValueError(
+                    f"Each transaction-cost sensitivity value must be between 0 and {MAX_TRANSACTION_COST_PERCENT:g}."
+                )
+    return normalised, weights
+
+
+def _period_keys(index: pd.DatetimeIndex, frequency: str) -> np.ndarray:
+    y, m = index.year.to_numpy(dtype=np.int64), index.month.to_numpy(dtype=np.int64)
+    if frequency == "monthly":
+        return y * 12 + (m - 1)
+    if frequency == "quarterly":
+        return y * 4 + (m - 1) // 3
+    if frequency == "semiannual":
+        return y * 2 + (m - 1) // 6
+    return y
+
+
+def _simulate(
+    prices: np.ndarray,
+    index: pd.DatetimeIndex,
+    target: np.ndarray,
+    frequency: str,
+    initial_value: float,
+    cost_rate: float,
+    rebalance: bool,
+) -> dict:
+    """Daily path of portfolio value and weights. `prices` is T x N (strictly positive)."""
+    t_len, n_assets = prices.shape
+    units = initial_value * target / prices[0]
+    values = np.empty(t_len)
+    weights = np.empty((t_len, n_assets))
+    values[0] = initial_value
+    weights[0] = target
+    keys = _period_keys(index, frequency)
+    events: list[dict] = []
+    total_cost = 0.0
+    for t in range(1, t_len):
+        holdings = units * prices[t]
+        value = float(holdings.sum())
+        if rebalance and keys[t] != keys[t - 1] and t < t_len - 1:
+            trade = value * target - holdings
+            traded = float(np.abs(trade).sum())
+            cost = cost_rate * traded
+            before = holdings / value
+            value_after = value - cost
+            units = value_after * target / prices[t]
+            holdings = units * prices[t]
+            total_cost += cost
+            events.append(
+                {
+                    "date": index[t].date().isoformat(),
+                    "portfolio_value_before": value,
+                    "traded_notional": traded,
+                    "one_way_turnover_percent": traded / (2.0 * value) * 100.0,
+                    "transaction_cost": cost,
+                    "weights_before": before,
+                }
+            )
+            value = value_after
+        values[t] = value
+        weights[t] = holdings / value
+    return {"values": values, "weights": weights, "events": events, "total_cost": total_cost}
+
+
+def _metrics(values: np.ndarray, index: pd.DatetimeIndex, rf_percent: float) -> dict:
+    returns = values[1:] / values[:-1] - 1.0
+    final, start_v = float(values[-1]), float(values[0])
+    cumulative = final / start_v - 1.0
+    years = (index[-1] - index[0]).days / 365.25
+    cagr = None
+    if years >= CAGR_MIN_YEARS and final > 0 and start_v > 0:
+        cagr = (final / start_v) ** (1.0 / years) - 1.0
+    vol = None
+    if len(returns) >= 2:
+        sd = float(np.std(returns, ddof=1))
+        if sd > ZERO_VOLATILITY:
+            vol = sd * math.sqrt(TRADING_DAYS_PER_YEAR)
+    sharpe = None
+    if vol:
+        sharpe = (float(np.mean(returns)) * TRADING_DAYS_PER_YEAR - rf_percent / 100.0) / vol
+    peaks = np.maximum.accumulate(values)
+    drawdown = values / peaks - 1.0
+    trough = int(np.argmin(drawdown))
+    peak = int(np.argmax(values[: trough + 1]))
+    return {
+        "final_value": _vh_r(final, 2),
+        "cumulative_return_percent": _vh_pct(cumulative),
+        "cagr_percent": _vh_pct(cagr),
+        "annualized_volatility_percent": _vh_pct(vol),
+        "sharpe_ratio": _vh_r(sharpe, 4),
+        "max_drawdown_percent": _vh_pct(float(drawdown[trough])),
+        "max_drawdown_peak_date": index[peak].date().isoformat(),
+        "max_drawdown_trough_date": index[trough].date().isoformat(),
+        "_cumulative": cumulative,
+        "_vol": vol,
+        "_drawdown": drawdown,
+    }
+
+
+def _public(metrics: dict, *, events: int, total_cost: float, frequency: str | None) -> dict:
+    out = {k: v for k, v in metrics.items() if not k.startswith("_")}
+    out["rebalancing_frequency"] = frequency
+    out["rebalance_events"] = events
+    out["total_transaction_cost"] = _vh_r(total_cost, 2)
+    return out
+
+
+def _diff(a: float | None, b: float | None, digits: int = 4) -> float | None:
+    return None if a is None or b is None else _vh_r(a - b, digits)
+
+
+def _comparison(reb: dict, bh: dict) -> dict:
+    """Rebalanced minus buy-and-hold, in the units of each metric."""
+    ret_pp = _diff(reb["cumulative_return_percent"], bh["cumulative_return_percent"])
+    if ret_pp is None or abs(ret_pp) < FLAT_DIFFERENCE_PP:
+        direction = "No material difference"
+    elif ret_pp > 0:
+        direction = "Rebalanced ahead"
+    else:
+        direction = "Buy-and-hold ahead"
+    return {
+        "final_value_difference": _diff(reb["final_value"], bh["final_value"], 2),
+        "cumulative_return_difference_pp": ret_pp,
+        "cagr_difference_pp": _diff(reb["cagr_percent"], bh["cagr_percent"]),
+        "volatility_difference_pp": _diff(
+            reb["annualized_volatility_percent"], bh["annualized_volatility_percent"]
+        ),
+        "sharpe_difference": _diff(reb["sharpe_ratio"], bh["sharpe_ratio"]),
+        "max_drawdown_difference_pp": _diff(reb["max_drawdown_percent"], bh["max_drawdown_percent"]),
+        "return_difference_direction": direction,
+        "attribution_note": (
+            "The difference is the net effect of rebalancing on this particular historical path (including "
+            "transaction costs and the assets' own trends). It is not isolated as a volatility-harvesting premium "
+            "and does not predict future results."
+        ),
+    }
+
+
+def _downsample(n: int, limit: int) -> list[int]:
+    if n <= limit:
+        return list(range(n))
+    stride = math.ceil(n / limit)
+    idx = list(range(0, n, stride))
+    if idx[-1] != n - 1:
+        idx.append(n - 1)
+    return idx
+
+
+def _vh_interpretation(comp: dict, reb: dict, bh: dict, events: int, frequency: str, cost_pct: float) -> str:
+    if events == 0:
+        return (
+            f"No {frequency} rebalancing date fell inside the window, so the rebalanced portfolio is "
+            "identical to buy-and-hold. Extend the period or use a higher rebalancing frequency."
+        )
+    pp = comp["cumulative_return_difference_pp"]
+    direction = comp["return_difference_direction"]
+    if direction == "No material difference":
+        head = "The rebalanced and buy-and-hold portfolios finished with essentially the same cumulative return."
+    elif direction == "Rebalanced ahead":
+        head = (
+            f"Over this window the {frequency}-rebalanced portfolio finished {abs(pp):.2f} percentage points "
+            "ahead of buy-and-hold"
+        )
+        head += f" after {cost_pct:g}% transaction costs." if cost_pct else " (no transaction costs assumed)."
+    else:
+        head = (
+            f"Over this window buy-and-hold finished {abs(pp):.2f} percentage points ahead of the "
+            f"{frequency}-rebalanced portfolio"
+        )
+        head += f" (rebalancing included {cost_pct:g}% transaction costs)." if cost_pct else "."
+    risk = ""
+    vd, dd = comp["volatility_difference_pp"], comp["max_drawdown_difference_pp"]
+    if vd is not None and dd is not None:
+        risk = (
+            f" Annualised volatility was {abs(vd):.2f} pp {'lower' if vd < 0 else 'higher'} and maximum drawdown "
+            f"{abs(dd):.2f} pp {'shallower' if dd > 0 else 'deeper'} for the rebalanced portfolio."
+        )
+    return head + risk + " This is a description of one historical path, not evidence of a guaranteed harvesting gain."
+
+
+# ---------------------------------------------------------------------------
+# public API
+# ---------------------------------------------------------------------------
+
+
+def compute_volatility_harvesting(
+    prices_by_symbol: dict[str, list],
+    weights_percent: dict[str, float] | None,
+    *,
+    rebalance_frequency: str = DEFAULT_REBALANCE_FREQUENCY,
+    initial_value: float = DEFAULT_INITIAL_VALUE,
+    transaction_cost_percent: float = 0.0,
+    risk_free_rate_percent: float = 0.0,
+    start: datetime.date | None = None,
+    end: datetime.date | None = None,
+    price_basis: str = "adjusted",
+    include_frequency_comparison: bool = False,
+    transaction_cost_sensitivity_percent: list[float] | None = None,
+) -> dict:
+    """Rebalanced vs buy-and-hold comparison. Raises ValueError (message safe to
+    show to the caller) for invalid input or insufficient aligned history."""
+    symbols, weights = validate_request(
+        list(prices_by_symbol),
+        weights_percent,
+        rebalance_frequency,
+        initial_value,
+        transaction_cost_percent,
+        risk_free_rate_percent,
+        start,
+        end,
+        transaction_cost_sensitivity_percent,
+    )
+    if price_basis not in ("adjusted", "close"):
+        raise ValueError("price_basis must be 'adjusted' or 'close'.")
+
+    series, warnings, per_asset_range = {}, [], {}
+    for sym in symbols:
+        s = _article_price_series(prices_by_symbol[sym], price_basis)
+        if s.empty:
+            raise ValueError(f"No usable {price_basis} price history for {sym}.")
+        series[sym] = s
+        per_asset_range[sym] = (s.index[0].date().isoformat(), s.index[-1].date().isoformat(), len(s))
+        warnings.extend(f"{sym}: {w}" for w in _corporate_action_warnings(prices_by_symbol[sym], price_basis))
+
+    union_len = len(set().union(*(s.index for s in series.values())))
+    frame = pd.concat(series, axis=1, join="inner").sort_index()
+    frame = frame[symbols]
+    dropped_misaligned = union_len - len(frame)
+    if start:
+        frame = frame[frame.index >= pd.Timestamp(start)]
+    if end:
+        frame = frame[frame.index <= pd.Timestamp(end)]
+    if len(frame) < MIN_OBSERVATIONS:
+        raise ValueError(
+            f"Insufficient aligned price history: {len(frame)} common trading days in the requested window; "
+            f"at least {MIN_OBSERVATIONS} are required across all assets."
+        )
+    if dropped_misaligned:
+        warnings.append(
+            f"{dropped_misaligned} date(s) present for only some assets were excluded so that all assets are "
+            "aligned on common trading days (no values were filled in)."
+        )
+    gaps = frame.index.to_series().diff().dt.days.dropna()
+    if (gaps > LARGE_GAP_DAYS).any():
+        worst = gaps.idxmax()
+        warnings.append(
+            f"Largest gap between aligned observations is {int(gaps.max())} calendar days (ending "
+            f"{worst.date().isoformat()}); returns across gaps are measured date-to-date."
+        )
+
+    prices = frame.to_numpy(dtype=float)
+    index = pd.DatetimeIndex(frame.index)
+    asset_returns = prices[1:] / prices[:-1] - 1.0
+    extreme = np.argwhere(np.abs(asset_returns) > EXTREME_DAILY_MOVE)
+    for row, col in extreme[:5]:
+        warnings.append(
+            f"{symbols[col]}: daily move of {asset_returns[row, col] * 100:.1f}% on {index[row + 1].date().isoformat()} "
+            "(possible unadjusted split or data error)."
+        )
+
+    target = np.array([weights[s] for s in symbols], dtype=float) / 100.0
+    cost_rate = float(transaction_cost_percent) / 100.0
+    v0 = float(initial_value)
+
+    bh_sim = _simulate(prices, index, target, rebalance_frequency, v0, cost_rate, rebalance=False)
+    rb_sim = _simulate(prices, index, target, rebalance_frequency, v0, cost_rate, rebalance=True)
+    bh_m = _metrics(bh_sim["values"], index, risk_free_rate_percent)
+    rb_m = _metrics(rb_sim["values"], index, risk_free_rate_percent)
+    n_events = len(rb_sim["events"])
+    bh_pub = _public(bh_m, events=0, total_cost=0.0, frequency=None)
+    rb_pub = _public(rb_m, events=n_events, total_cost=rb_sim["total_cost"], frequency=rebalance_frequency)
+    comparison = _comparison(rb_pub, bh_pub)
+    if n_events == 0:
+        warnings.append(
+            f"No {rebalance_frequency} rebalancing event occurred inside the window; both portfolios are identical."
+        )
+    years = (index[-1] - index[0]).days / 365.25
+    if years < CAGR_MIN_YEARS:
+        warnings.append(
+            f"The window is {years:.2f} years long; CAGR is not reported for windows shorter than "
+            f"{CAGR_MIN_YEARS:g} year."
+        )
+    if bh_m["_vol"] is None or rb_m["_vol"] is None:
+        warnings.append("Volatility is (near) zero or undefined, so Sharpe ratio is not reported.")
+
+    # --- per-asset statistics and correlations -----------------------------
+    asset_stats = []
+    for j, sym in enumerate(symbols):
+        col = prices[:, j]
+        sd = float(np.std(asset_returns[:, j], ddof=1)) if len(asset_returns) > 1 else 0.0
+        a_cagr = (col[-1] / col[0]) ** (1.0 / years) - 1.0 if years >= CAGR_MIN_YEARS else None
+        asset_stats.append(
+            {
+                "symbol": sym,
+                "target_weight_percent": weights[sym],
+                "first_date": per_asset_range[sym][0],
+                "last_date": per_asset_range[sym][1],
+                "observations_in_window": int(len(col)),
+                "total_return_percent": _vh_pct(col[-1] / col[0] - 1.0),
+                "cagr_percent": _vh_pct(a_cagr),
+                "annualized_volatility_percent": _vh_pct(sd * math.sqrt(TRADING_DAYS_PER_YEAR))
+                if sd > ZERO_VOLATILITY
+                else None,
+            }
+        )
+    with np.errstate(invalid="ignore", divide="ignore"):  # constant-price assets: correlation undefined -> null
+        corr = np.corrcoef(asset_returns, rowvar=False) if asset_returns.shape[1] > 1 else np.array([[1.0]])
+    corr = np.where(np.isfinite(corr), corr, np.nan)
+    pair_values = corr[np.triu_indices(len(symbols), k=1)]
+    avg_corr = _vh_r(np.nanmean(pair_values), 4) if pair_values.size and np.isfinite(pair_values).any() else None
+
+    # --- rebalance events & weight evolution -------------------------------
+    events_out = []
+    for ev in rb_sim["events"][:MAX_REBALANCE_EVENTS_RETURNED]:
+        events_out.append(
+            {
+                "date": ev["date"],
+                "portfolio_value_before": _vh_r(ev["portfolio_value_before"], 2),
+                "traded_notional": _vh_r(ev["traded_notional"], 2),
+                "one_way_turnover_percent": _vh_r(ev["one_way_turnover_percent"], 4),
+                "transaction_cost": _vh_r(ev["transaction_cost"], 2),
+                "weights_before_percent": {s: _vh_r(ev["weights_before"][j] * 100.0, 4) for j, s in enumerate(symbols)},
+                "weights_after_percent": {s: weights[s] for s in symbols},
+            }
+        )
+    weight_rows = []
+    for t in _downsample(len(index), MAX_WEIGHT_POINTS):
+        weight_rows.append(
+            {
+                "date": index[t].date().isoformat(),
+                "rebalanced_weights_percent": {
+                    s: _vh_r(rb_sim["weights"][t, j] * 100.0, 4) for j, s in enumerate(symbols)
+                },
+                "buy_and_hold_weights_percent": {
+                    s: _vh_r(bh_sim["weights"][t, j] * 100.0, 4) for j, s in enumerate(symbols)
+                },
+            }
+        )
+    chart_rows = []
+    for t in _downsample(len(index), MAX_CHART_POINTS):
+        chart_rows.append(
+            {
+                "date": index[t].date().isoformat(),
+                "rebalanced_value": _vh_r(rb_sim["values"][t], 2),
+                "buy_and_hold_value": _vh_r(bh_sim["values"][t], 2),
+                "rebalanced_drawdown_percent": _vh_pct(rb_m["_drawdown"][t]),
+                "buy_and_hold_drawdown_percent": _vh_pct(bh_m["_drawdown"][t]),
+            }
+        )
+
+    # --- optional analyses ---------------------------------------------------
+    frequency_rows = None
+    if include_frequency_comparison:
+        frequency_rows = []
+        for freq in REBALANCE_FREQUENCIES:
+            sim = _simulate(prices, index, target, freq, v0, cost_rate, rebalance=True)
+            pub = _public(_metrics(sim["values"], index, risk_free_rate_percent), events=len(sim["events"]),
+                          total_cost=sim["total_cost"], frequency=freq)
+            frequency_rows.append(
+                {
+                    "frequency": freq,
+                    **{k: pub[k] for k in (
+                        "rebalance_events", "final_value", "cumulative_return_percent", "cagr_percent",
+                        "annualized_volatility_percent", "sharpe_ratio", "max_drawdown_percent",
+                        "total_transaction_cost",
+                    )},
+                    "cumulative_return_difference_pp": _diff(
+                        pub["cumulative_return_percent"], bh_pub["cumulative_return_percent"]
+                    ),
+                    "sharpe_difference": _diff(pub["sharpe_ratio"], bh_pub["sharpe_ratio"]),
+                }
+            )
+    sensitivity_rows = None
+    if transaction_cost_sensitivity_percent:
+        sensitivity_rows = []
+        for cost_pct in transaction_cost_sensitivity_percent:
+            sim = _simulate(prices, index, target, rebalance_frequency, v0, float(cost_pct) / 100.0, rebalance=True)
+            pub = _public(_metrics(sim["values"], index, risk_free_rate_percent), events=len(sim["events"]),
+                          total_cost=sim["total_cost"], frequency=rebalance_frequency)
+            bh_for_cost = bh_pub  # buy-and-hold pays no rebalancing cost
+            sensitivity_rows.append(
+                {
+                    "transaction_cost_percent": float(cost_pct),
+                    "final_value": pub["final_value"],
+                    "cumulative_return_percent": pub["cumulative_return_percent"],
+                    "sharpe_ratio": pub["sharpe_ratio"],
+                    "total_transaction_cost": pub["total_transaction_cost"],
+                    "cumulative_return_difference_pp": _diff(
+                        pub["cumulative_return_percent"], bh_for_cost["cumulative_return_percent"]
+                    ),
+                }
+            )
+
+    result = {
+        "strategy_id": VH_STRATEGY_ID,
+        "strategy_name": VH_STRATEGY_NAME,
+        "category": VH_STRATEGY_CATEGORY,
+        "portfolio": {
+            "symbols": symbols,
+            "weights_percent": {s: weights[s] for s in symbols},
+            "initial_value": _vh_r(v0, 2),
+        },
+        "analysis_period": {
+            "requested_start": start.isoformat() if start else None,
+            "requested_end": end.isoformat() if end else None,
+            "start": index[0].date().isoformat(),
+            "end": index[-1].date().isoformat(),
+            "observations": int(len(index)),
+            "years": _vh_r(years, 4),
+        },
+        "price_basis": price_basis,
+        "return_basis": (
+            "Approximate total return: EODHD adjusted_close (adjusted for splits and dividends; dividends are "
+            "implicitly reinvested in the same asset)."
+            if price_basis == "adjusted"
+            else "Price return from raw close (not adjusted for splits or dividends)."
+        ),
+        "rebalancing": {
+            "frequency": rebalance_frequency,
+            "trigger": "First trading day of each new calendar period, executed at that day's close.",
+            "events": n_events,
+            "transaction_cost_percent": float(transaction_cost_percent),
+            "cost_model": "Percent of traded notional (buys + sells), deducted on the rebalance day.",
+        },
+        "assumptions": {
+            "risk_free_rate_percent": float(risk_free_rate_percent),
+            "trading_days_per_year": TRADING_DAYS_PER_YEAR,
+            "sharpe_definition": "(mean daily return x 252 - risk-free rate) / (stdev of daily returns x sqrt(252))",
+            "long_only_fully_invested": True,
+        },
+        "rebalanced": rb_pub,
+        "buy_and_hold": bh_pub,
+        "comparison": comparison,
+        "asset_statistics": asset_stats,
+        "correlation_matrix": {
+            "symbols": symbols,
+            "values": [[_vh_r(v, 4) for v in row] for row in corr.tolist()],
+        },
+        "average_pairwise_correlation": avg_corr,
+        "rebalance_events": events_out,
+        "rebalance_events_truncated": n_events > MAX_REBALANCE_EVENTS_RETURNED,
+        "weight_evolution": weight_rows,
+        "frequency_comparison": frequency_rows,
+        "transaction_cost_sensitivity": sensitivity_rows,
+        "chart_data": chart_rows,
+        "interpretation": _vh_interpretation(
+            comparison, rb_pub, bh_pub, n_events, rebalance_frequency, float(transaction_cost_percent)
+        ),
+        "methodology": VH_METHODOLOGY,
+        "data_quality": {
+            "aligned_observations": int(len(index)),
+            "misaligned_dates_excluded": int(dropped_misaligned),
+            "per_asset_history": {
+                s: {"first_date": a, "last_date": b, "observations": n} for s, (a, b, n) in per_asset_range.items()
+            },
+        },
+        "data_quality_warnings": warnings,
+        "disclaimer": VH_DISCLAIMER,
+    }
+    return _vh_clean(result)
+
+
+# ============================================================================
+# DIVIDEND ANALYSIS  (appended section)
+# ============================================================================
+# Dividend Analysis (Quantitative Strategies).
+#
+# Six analytical components computed from EODHD data only:
+#
+#   1. Dividend Yield          (trailing-twelve-month, plus labelled forward figures)
+#   2. Payout Ratio            (dividends per share / EPS, matched reporting periods)
+#   3. Dividend Growth         (YoY, 3/5/10-year growth and CAGR)
+#   4. Historical Dividend Trend (increasing / stable / decreasing / irregular, possible
+#                                cuts and suspensions)
+#   5. Dividend Sustainability (rule-based read of payout, earnings, free cash flow,
+#                                revenue and leverage)
+#   6. Dividend Cut Risk       (explainable, rule-based indicators — NOT a probability
+#                                and NOT a trained model)
+#
+# Dividend Forecasting is intentionally NOT implemented. Extension point: every
+# component is a separate pure function taking the already-parsed inputs (see
+# `compute_dividend_analysis`) and returning a self-describing dict, so a future
+# `compute_forecast(...)` can be added and attached to the result without changing
+# any existing component or the result shape.
+#
+# Data sources (all EODHD; this module performs no I/O — the router fetches):
+#   * GET /api/div/{SYMBOL}            -> `dividends` rows (date = ex-date, value =
+#         split-adjusted amount per share, unadjustedValue, period, currency, ...)
+#   * GET /api/fundamentals/{SYMBOL}   -> Highlights / SplitsDividends / Earnings
+#         (Annual, History) / Financials (Income_Statement, Balance_Sheet, Cash_Flow)
+#   * Latest close (EODHD EOD bar; from the stored daily_prices for ETFs)
+#
+# Every metric is either DIRECTLY CALCULATED, a RULE-BASED interpretation (thresholds
+# are module constants and are echoed in the output), or reported as unavailable
+# with a reason. Nothing is fabricated: missing inputs never become zeros, and an
+# empty dividend list is NOT treated as proof that no dividend is paid. Thresholds
+# are heuristics, not validated predictions, and sector norms differ (e.g. REITs
+# routinely pay out more than 100% of EPS).
+
+DIV_STRATEGY_ID = "dividend_analysis"
+DIV_STRATEGY_NAME = "Dividend Analysis"
+DIV_STRATEGY_CATEGORY = "Quantitative Strategies"
+
+DIV_AVAILABLE = "available"
+PARTIAL = "partial"
+DIV_UNAVAILABLE = "unavailable"
+NOT_APPLICABLE = "not_applicable"
+INSUFFICIENT = "insufficient_data"
+NO_HISTORY = "no_dividend_history"
+NOT_MEANINGFUL = "not_meaningful"
+
+# --- documented thresholds ---------------------------------------------------
+TTM_DAYS = 365
+FLAT_GROWTH_TOLERANCE_PERCENT = 0.5  # |YoY| <= 0.5% is "Flat"
+GROWTH_HORIZONS_YEARS = (3, 5, 10)
+TREND_WINDOW_CHANGES = 5  # most recent YoY changes used for the trend class
+MIN_YEARS_FOR_TREND = 3  # complete years with payments
+INCREASING_SHARE = 0.6  # >= 60% of usable changes up, none down => Increasing
+PAYMENT_CUT_THRESHOLD_PERCENT = 10.0  # per-payment decline counted as a cut event
+CUT_PERSISTENCE_PERCENT = 5.0  # a later payment still >= 5% below the pre-cut level confirms it
+RECENT_CUT_MONTHS = 24
+DELAY_FACTOR = 1.35
+DELAY_EXTRA_DAYS = 15
+SUSPENSION_FACTOR = 2.0
+SUSPENSION_EXTRA_DAYS = 90
+SUSPENSION_NO_FREQUENCY_DAYS = 730
+FISCAL_YEAR_STALE_DAYS = 548
+TTM_EPS_SPAN_DAYS = (200, 330)  # first-to-last quarter-end span of the 4 quarters used
+PAYOUT_BANDS = ((60.0, "Moderate"), (80.0, "Elevated"), (100.0, "High"))  # above 100 => "Exceeds earnings"
+FCF_COVERAGE_SUPPORTIVE = 1.5
+FCF_COVERAGE_ADEQUATE = 1.0
+FCF_COVERAGE_WEAK = 0.75
+EPS_DECLINE_CONCERN_PERCENT = -20.0
+REVENUE_DECLINE_CONCERN_PERCENT = -10.0
+LEVERAGE_SUPPORTIVE_X = 2.0  # net debt / EBITDA
+LEVERAGE_CONCERN_X = 4.0
+MIN_EVALUABLE_RISK_INDICATORS = 3
+PAYMENT_HISTORY_RETURNED = 40
+
+_PERIOD_PAYMENTS_PER_YEAR = {
+    "monthly": 12,
+    "quarterly": 4,
+    "semiannual": 2,
+    "semi-annual": 2,
+    "semi annual": 2,
+    "annual": 1,
+}
+_EXPECTED_INTERVAL_DAYS = {12: 30.4, 4: 91.3, 2: 182.6, 1: 365.2}
+
+DIV_DISCLAIMER = (
+    "Rule-based, descriptive dividend analytics from EODHD data. The sustainability and cut-risk assessments are "
+    "heuristics with documented thresholds, not validated predictions or probabilities; no machine-learning model is "
+    "used. Sector norms differ and provider data can be incomplete or delayed. Not investment advice."
+)
+
+DIV_METHODOLOGY = [
+    "Dividend amounts use EODHD `value` (split-adjusted per-share amount, so past payments are comparable with today's "
+    "share price). Rows are keyed by ex-dividend date.",
+    "Trailing yield = dividends with ex-date in the last 365 days / latest close x 100. Forward figures are reported "
+    "separately and labelled (provider-reported vs ThrustWise-calculated from the latest regular payment x payments per year).",
+    "Payout ratio = dividends per share / EPS x 100 over the SAME 12-month window ending on the fiscal-year (or latest "
+    "four-quarter) period end; not computed for EPS <= 0 or when currencies differ.",
+    "Growth and trend use calendar-year totals of REGULAR payments (payments EODHD labels 'Special' are excluded) for "
+    "complete years only; years whose payment count differs from the usual count are flagged and excluded from trend "
+    "classification to avoid mistaking ex-date timing shifts for cuts.",
+    "A 'possible cut' is a regular payment at least "
+    f"{PAYMENT_CUT_THRESHOLD_PERCENT:g}% below the previous one (same payment period label); it is 'confirmed' only if a "
+    "later payment stays at the reduced level. A long gap since the last payment is reported as 'possible delay' or "
+    "'possible suspension' — never as a confirmed suspension, because missing or delayed provider data looks the same.",
+]
+
+
+# ---------------------------------------------------------------------------
+# generic helpers
+# ---------------------------------------------------------------------------
+
+
+def _f(value) -> float | None:
+    """Finite float or None; tolerates numeric strings and EODHD's 'None'/'NA' markers."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text or text.lower() in {"none", "null", "na", "n/a", "nan", "-"}:
+            return None
+        try:
+            value = float(text)
+        except ValueError:
+            return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) else None
+
+
+def _d(value) -> datetime.date | None:
+    if isinstance(value, datetime.datetime):
+        return value.date()
+    if isinstance(value, datetime.date):
+        return value
+    if not isinstance(value, str) or len(value) < 10:
+        return None
+    try:
+        return datetime.date.fromisoformat(value[:10])
+    except ValueError:
+        return None
+
+
+def _div_r(value, digits: int = 4) -> float | None:
+    v = _f(value)
+    return None if v is None else round(v, digits)
+
+
+def _div_clean(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        return {str(k): _div_clean(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_div_clean(v) for v in obj]
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, datetime.date):
+        return obj.isoformat()
+    return obj
+
+
+def _pct_change(new: float | None, old: float | None) -> float | None:
+    if new is None or old is None or old <= 0:
+        return None
+    return (new / old - 1.0) * 100.0
+
+
+def _growth_class(pct: float | None) -> str:
+    if pct is None:
+        return "Undefined"
+    if pct > FLAT_GROWTH_TOLERANCE_PERCENT:
+        return "Positive"
+    if pct < -FLAT_GROWTH_TOLERANCE_PERCENT:
+        return "Negative"
+    return "Flat"
+
+
+def _walk(data: Any, *path: str) -> Any:
+    cur = data
+    for key in path:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(key)
+    return cur
+
+
+def _add_years(day: datetime.date, years: int) -> datetime.date:
+    try:
+        return day.replace(year=day.year + years)
+    except ValueError:  # Feb 29
+        return day.replace(year=day.year + years, day=28)
+
+
+# ---------------------------------------------------------------------------
+# dividend rows
+# ---------------------------------------------------------------------------
+
+
+def parse_dividends(rows: list | None, today: datetime.date) -> tuple[list[dict], list[dict], dict]:
+    """(historical rows ascending by ex-date, upcoming rows, quality report)."""
+    quality = {
+        "records_received": len(rows or []),
+        "invalid_records_dropped": 0,
+        "duplicate_records_dropped": 0,
+        "unadjusted_value_used": 0,
+        "special_payments": 0,
+    }
+    seen: set = set()
+    parsed: list[dict] = []
+    for raw in rows or []:
+        if not isinstance(raw, dict):
+            quality["invalid_records_dropped"] += 1
+            continue
+        ex = _d(raw.get("date"))
+        amount = _f(raw.get("value"))
+        if amount is None:
+            amount = _f(raw.get("unadjustedValue"))
+            if amount is not None:
+                quality["unadjusted_value_used"] += 1
+        if ex is None or amount is None or amount <= 0:
+            quality["invalid_records_dropped"] += 1
+            continue
+        period = str(raw.get("period") or "").strip() or None
+        is_special = bool(period and "special" in period.lower())
+        key = (ex, round(amount, 6), is_special)
+        if key in seen:
+            quality["duplicate_records_dropped"] += 1
+            continue
+        seen.add(key)
+        if is_special:
+            quality["special_payments"] += 1
+        parsed.append(
+            {
+                "ex_date": ex,
+                "payment_date": _d(raw.get("paymentDate")),
+                "declaration_date": _d(raw.get("declarationDate")),
+                "record_date": _d(raw.get("recordDate")),
+                "amount": amount,
+                "unadjusted_amount": _f(raw.get("unadjustedValue")),
+                "period": period,
+                "currency": (str(raw.get("currency")).strip().upper() if raw.get("currency") else None),
+                "is_special": is_special,
+            }
+        )
+    parsed.sort(key=lambda r: r["ex_date"])
+    history = [r for r in parsed if r["ex_date"] <= today]
+    upcoming = [r for r in parsed if r["ex_date"] > today]
+    return history, upcoming, quality
+
+
+def _regular(rows: list[dict]) -> list[dict]:
+    return [r for r in rows if not r["is_special"]]
+
+
+def _sum_between(rows: list[dict], after: datetime.date, upto: datetime.date) -> float:
+    return sum(r["amount"] for r in rows if after < r["ex_date"] <= upto)
+
+
+def _annual_table(history: list[dict], today: datetime.date) -> tuple[list[dict], int | None]:
+    """Complete calendar years (ascending) from the first payment year, and the modal
+    regular-payment count (most recent 5 complete years with payments)."""
+    if not history:
+        return [], None
+    first_year = history[0]["ex_date"].year
+    last_complete = today.year - 1
+    if last_complete < first_year:
+        return [], None
+    reg = _regular(history)
+    table = []
+    for year in range(first_year, last_complete + 1):
+        in_year = [r for r in history if r["ex_date"].year == year]
+        reg_year = [r for r in reg if r["ex_date"].year == year]
+        table.append(
+            {
+                "year": year,
+                "total_all": sum(r["amount"] for r in in_year),
+                "total_regular": sum(r["amount"] for r in reg_year),
+                "count_regular": len(reg_year),
+                "special_count": len(in_year) - len(reg_year),
+            }
+        )
+    paying = [t for t in table if t["count_regular"] > 0][-5:]
+    modal = None
+    if paying:
+        counts = Counter(t["count_regular"] for t in paying)
+        top = max(counts.values())
+        tied = {c for c, n in counts.items() if n == top}
+        modal = next(t["count_regular"] for t in reversed(paying) if t["count_regular"] in tied)
+    for t in table:
+        t["count_consistent"] = modal is not None and t["count_regular"] == modal
+    return table, modal
+
+
+def _expected_interval_days(modal: int | None, latest_period: str | None) -> float | None:
+    if modal in _EXPECTED_INTERVAL_DAYS:
+        return _EXPECTED_INTERVAL_DAYS[modal]
+    if modal:
+        return 365.2 / modal
+    if latest_period:
+        ppy = _PERIOD_PAYMENTS_PER_YEAR.get(latest_period.strip().lower())
+        if ppy:
+            return _EXPECTED_INTERVAL_DAYS[ppy]
+    return None
+
+
+# ---------------------------------------------------------------------------
+# component 1: yield
+# ---------------------------------------------------------------------------
+
+
+def compute_yield(
+    history: list[dict],
+    upcoming: list[dict],
+    price: float | None,
+    price_date: str | None,
+    fundamentals: dict | None,
+    modal_count: int | None,
+    today: datetime.date,
+) -> dict:
+    notes: list[str] = []
+    if not history:
+        return {
+            "status": NO_HISTORY,
+            "ttm_dividend_per_share": None,
+            "ttm_yield_percent": None,
+            "reason": (
+                "EODHD returned no dividend records for this symbol. That does not confirm the security has never "
+                "paid a dividend (coverage can be incomplete)."
+            ),
+            "confirmed_non_payer": False,
+        }
+    ttm_rows = [r for r in history if today - datetime.timedelta(days=TTM_DAYS) < r["ex_date"] <= today]
+    ttm = sum(r["amount"] for r in ttm_rows)
+    if not ttm_rows:
+        notes.append(
+            f"No dividend with an ex-date in the last {TTM_DAYS} days appears in the EODHD history (last: "
+            f"{history[-1]['ex_date'].isoformat()}). Dividends may be suspended or the data may be delayed."
+        )
+    latest_regular = next((r for r in reversed(history) if not r["is_special"]), None)
+    ppy = modal_count if modal_count in _EXPECTED_INTERVAL_DAYS else None
+    if ppy is None and latest_regular and latest_regular["period"]:
+        ppy = _PERIOD_PAYMENTS_PER_YEAR.get(latest_regular["period"].strip().lower())
+    indicated = None
+    if latest_regular and ppy:
+        indicated = latest_regular["amount"] * ppy
+
+    valid_price = price is not None and price > 0
+    provider_rate = _f(_walk(fundamentals, "SplitsDividends", "ForwardAnnualDividendRate"))
+    provider_yield = _f(_walk(fundamentals, "SplitsDividends", "ForwardAnnualDividendYield"))
+    currencies = {r["currency"] for r in ttm_rows if r["currency"]}
+    if len(currencies) > 1:
+        notes.append(f"Dividends in the window are paid in multiple currencies ({', '.join(sorted(currencies))}).")
+    out = {
+        "status": DIV_AVAILABLE if valid_price else PARTIAL,
+        "ttm_dividend_per_share": _div_r(ttm, 4),
+        "ttm_payment_count": len(ttm_rows),
+        "ttm_yield_percent": _div_r(ttm / price * 100.0, 4) if valid_price else None,
+        "ttm_basis": f"Sum of dividends with ex-date in the {TTM_DAYS} days to {today.isoformat()}",
+        "share_price": _div_r(price, 4) if valid_price else None,
+        "share_price_date": price_date if valid_price else None,
+        "dividend_currency": next(iter(sorted(currencies)), history[-1]["currency"]),
+        "indicated_forward": {
+            "calculated_annual_dividend_per_share": _div_r(indicated, 4),
+            "calculated_yield_percent": _div_r(indicated / price * 100.0, 4) if indicated and valid_price else None,
+            "calculation": (
+                f"latest regular payment ({latest_regular['amount']:g} on {latest_regular['ex_date'].isoformat()}) "
+                f"x {ppy} payments per year"
+                if indicated and latest_regular
+                else None
+            ),
+            "provider_forward_annual_rate": _div_r(provider_rate, 4),
+            "provider_forward_yield_percent": _div_r(provider_yield * 100.0, 4) if provider_yield is not None else None,
+            "note": "Forward figures are indications from the latest dividend, not declared future payments.",
+        },
+        "upcoming_declared": [
+            {"ex_date": r["ex_date"].isoformat(), "amount": _div_r(r["amount"], 4), "period": r["period"]}
+            for r in upcoming[:4]
+        ],
+        "notes": notes,
+    }
+    if not valid_price:
+        out["reason"] = "Share price is missing or not positive, so yield cannot be computed."
+    return out
+
+
+# ---------------------------------------------------------------------------
+# component 3: growth
+# ---------------------------------------------------------------------------
+
+
+def compute_growth(table: list[dict], modal: int | None) -> dict:
+    if not table or modal is None:
+        return {
+            "status": INSUFFICIENT,
+            "reason": "No complete calendar year of regular dividend payments is available.",
+            "annual_dividends": [],
+        }
+    by_year = {t["year"]: t for t in table}
+    rows = []
+    prev = None
+    for t in table:
+        yoy = _pct_change(t["total_regular"], prev["total_regular"]) if prev else None
+        rows.append(
+            {
+                "year": t["year"],
+                "regular_dividend_per_share": _div_r(t["total_regular"], 4),
+                "total_dividend_per_share": _div_r(t["total_all"], 4),
+                "payment_count": t["count_regular"],
+                "special_payment_count": t["special_count"],
+                "count_consistent": t["count_consistent"],
+                "yoy_growth_percent": _div_r(yoy, 2),
+                "yoy_classification": _growth_class(yoy) if prev else "Undefined",
+            }
+        )
+        prev = t
+    latest = table[-1]
+    yoy_latest = rows[-1]["yoy_growth_percent"]
+    horizons = []
+    for n in GROWTH_HORIZONS_YEARS:
+        start = by_year.get(latest["year"] - n)
+        entry = {"years": n, "from_year": latest["year"] - n, "to_year": latest["year"]}
+        if start is None:
+            entry.update(status=INSUFFICIENT, total_growth_percent=None, cagr_percent=None,
+                         classification="Undefined", reason=f"History does not reach back {n} complete years.")
+        elif start["total_regular"] <= 0:
+            entry.update(status=NOT_MEANINGFUL, total_growth_percent=None, cagr_percent=None,
+                         classification="Undefined",
+                         reason=f"No regular dividend was paid in {start['year']}, so growth/CAGR from it is undefined.")
+        else:
+            end_v = latest["total_regular"]
+            total = (end_v / start["total_regular"] - 1.0) * 100.0
+            cagr = ((end_v / start["total_regular"]) ** (1.0 / n) - 1.0) * 100.0
+            entry.update(status=DIV_AVAILABLE, total_growth_percent=_div_r(total, 2), cagr_percent=_div_r(cagr, 2),
+                         classification=_growth_class(cagr))
+        horizons.append(entry)
+    streak = 0
+    for i in range(len(rows) - 1, 0, -1):
+        if rows[i]["yoy_classification"] == "Positive":
+            streak += 1
+        else:
+            break
+    pay_streak = 0
+    for t in reversed(table):
+        if t["count_regular"] > 0:
+            pay_streak += 1
+        else:
+            break
+    return {
+        "status": DIV_AVAILABLE,
+        "basis": "Calendar-year totals of regular (non-special) split-adjusted dividends per share, complete years only.",
+        "latest_complete_year": latest["year"],
+        "latest_annual_dividend_per_share": _div_r(latest["total_regular"], 4),
+        "yoy_growth_percent": yoy_latest,
+        "yoy_classification": rows[-1]["yoy_classification"],
+        "multi_year": horizons,
+        "consecutive_increase_years": streak,
+        "consecutive_payment_years": pay_streak,
+        "flat_tolerance_percent": FLAT_GROWTH_TOLERANCE_PERCENT,
+        "annual_dividends": rows,
+    }
+
+
+# ---------------------------------------------------------------------------
+# component 4: trend
+# ---------------------------------------------------------------------------
+
+
+def _classify_changes(changes: list[float]) -> str:
+    inc = sum(1 for c in changes if c > FLAT_GROWTH_TOLERANCE_PERCENT)
+    dec = sum(1 for c in changes if c < -FLAT_GROWTH_TOLERANCE_PERCENT)
+    if dec == 0:
+        return "Increasing" if inc / len(changes) >= INCREASING_SHARE else "Stable"
+    if inc == 0:
+        return "Decreasing"
+    return "Irregular"
+
+
+def compute_trend(history: list[dict], upcoming: list[dict], table: list[dict], modal: int | None,
+                  today: datetime.date) -> dict:
+    if not history:
+        return {"status": NO_HISTORY, "classification": "No Dividend History",
+                "reason": "No dividend records returned by EODHD.", "payment_history": [], "chart_data": []}
+
+    regular = _regular(history)
+    paying_years = [t for t in table if t["count_regular"] > 0]
+
+    # --- usable year-over-year changes -----------------------------------
+    changes: list[float] = []
+    excluded: list[dict] = []
+    for prev, cur in zip(table, table[1:]):
+        if prev["total_regular"] <= 0:
+            continue
+        real_stop = cur["count_regular"] == 0 and prev["count_regular"] > 0
+        if (prev["count_consistent"] and cur["count_consistent"]) or real_stop:
+            changes.append((cur["total_regular"] / prev["total_regular"] - 1.0) * 100.0)
+        else:
+            excluded.append({"from_year": prev["year"], "to_year": cur["year"],
+                             "reason": "Payment count differs from the usual count (possible ex-date timing shift)."})
+    recent_changes = changes[-TREND_WINDOW_CHANGES:]
+    recent_tail = table[-(TREND_WINDOW_CHANGES + 1):]
+    inconsistent_share = (
+        sum(1 for t in recent_tail if not t["count_consistent"]) / len(recent_tail) if recent_tail else 0.0
+    )
+    last3 = table[-3:]
+    regularity = "Regular" if len(last3) == 3 and all(t["count_consistent"] for t in last3) else "Irregular"
+
+    if len(paying_years) < MIN_YEARS_FOR_TREND:
+        classification, status = "Insufficient History", INSUFFICIENT
+    elif len(recent_changes) < 2:
+        classification = "Irregular" if inconsistent_share >= 0.5 else "Insufficient History"
+        status = DIV_AVAILABLE if classification == "Irregular" else INSUFFICIENT
+    elif inconsistent_share >= 0.5:
+        classification, status = "Irregular", DIV_AVAILABLE
+    else:
+        classification, status = _classify_changes(recent_changes), DIV_AVAILABLE
+
+    # --- payment-level cut detection -------------------------------------
+    events: list[dict] = []
+    for j in range(1, len(regular)):
+        prev, cur = regular[j - 1], regular[j]
+        if prev["period"] and cur["period"] and prev["period"].lower() != cur["period"].lower():
+            continue  # frequency/type changed: amounts not comparable
+        if (cur["ex_date"] - prev["ex_date"]).days > 400:
+            continue  # a gap, handled as suspension/delay rather than a cut
+        if cur["amount"] <= prev["amount"] * (1 - PAYMENT_CUT_THRESHOLD_PERCENT / 100.0):
+            later = regular[j + 1:]
+            confirmed = any(x["amount"] <= prev["amount"] * (1 - CUT_PERSISTENCE_PERCENT / 100.0) for x in later[:2])
+            events.append(
+                {
+                    "ex_date": cur["ex_date"].isoformat(),
+                    "previous_amount": _div_r(prev["amount"], 4),
+                    "new_amount": _div_r(cur["amount"], 4),
+                    "change_percent": _div_r((cur["amount"] / prev["amount"] - 1.0) * 100.0, 2),
+                    "confirmed": confirmed,
+                    "note": (
+                        "Reduced level persisted in the following payment(s)."
+                        if confirmed
+                        else "Most recent reduction (or later payments recovered); persistence not established."
+                    ),
+                }
+            )
+    cutoff = today - datetime.timedelta(days=int(RECENT_CUT_MONTHS * 30.4))
+    recent_events = [e for e in events if datetime.date.fromisoformat(e["ex_date"]) >= cutoff]
+    annual_decline = False
+    annual_decline_usable = False
+    if len(table) >= 2 and table[-2]["total_regular"] > 0:
+        annual_decline = table[-1]["total_regular"] < table[-2]["total_regular"] * (
+            1 - FLAT_GROWTH_TOLERANCE_PERCENT / 100.0
+        )
+        annual_decline_usable = annual_decline and (
+            (table[-1]["count_consistent"] and table[-2]["count_consistent"]) or table[-1]["count_regular"] == 0
+        )
+    if any(e["confirmed"] for e in recent_events) or annual_decline_usable:
+        cut_status = "observed"
+    elif recent_events or annual_decline:
+        cut_status = "possible"
+    else:
+        cut_status = "none"
+
+    # --- suspension / delay ----------------------------------------------
+    anchor = regular[-1] if regular else history[-1]
+    days_since = (today - anchor["ex_date"]).days
+    expected = _expected_interval_days(modal, anchor["period"])
+    if upcoming:
+        susp_status = "none"
+    elif expected is not None:
+        if days_since > max(SUSPENSION_FACTOR * expected, expected + SUSPENSION_EXTRA_DAYS):
+            susp_status = "possible_suspension"
+        elif days_since > expected * DELAY_FACTOR + DELAY_EXTRA_DAYS:
+            susp_status = "possible_delay"
+        else:
+            susp_status = "none"
+    else:
+        susp_status = "possible_suspension" if days_since > SUSPENSION_NO_FREQUENCY_DAYS else "none"
+
+    payments = [
+        {
+            "ex_date": r["ex_date"].isoformat(),
+            "payment_date": r["payment_date"].isoformat() if r["payment_date"] else None,
+            "amount": _div_r(r["amount"], 4),
+            "period": r["period"],
+            "currency": r["currency"],
+            "is_special": r["is_special"],
+        }
+        for r in history[-PAYMENT_HISTORY_RETURNED:]
+    ]
+    chart = [
+        {"year": t["year"], "regular_dividend_per_share": _div_r(t["total_regular"], 4),
+         "total_dividend_per_share": _div_r(t["total_all"], 4), "payment_count": t["count_regular"]}
+        for t in table
+    ]
+    summary = f"Regular dividends are classified '{classification}'"
+    if cut_status != "none":
+        summary += f"; a dividend reduction is {cut_status}"
+    if susp_status != "none":
+        summary += f"; {susp_status.replace('_', ' ')} (last ex-date {anchor['ex_date'].isoformat()}, {days_since} days ago)"
+    return {
+        "status": status,
+        "classification": classification,
+        "basis": "Usable year-over-year changes of regular calendar-year totals (count-consistent years only).",
+        "usable_yoy_changes_percent": [_div_r(c, 2) for c in recent_changes],
+        "excluded_year_pairs": excluded[-TREND_WINDOW_CHANGES:],
+        "typical_payments_per_year": modal,
+        "payment_regularity": regularity,
+        "possible_dividend_cut": {
+            "status": cut_status,
+            "flag": cut_status != "none",
+            "recent_window_months": RECENT_CUT_MONTHS,
+            "events": events[-5:],
+            "annual_total_decline": annual_decline,
+            "note": (
+                "A cut is 'observed' only when the reduced level persisted or a complete-year total fell on a "
+                "like-for-like payment count; otherwise it is 'possible'. Missing/delayed data is not counted as a cut."
+            ),
+        },
+        "possible_suspension": {
+            "status": susp_status,
+            "flag": susp_status != "none",
+            "last_ex_date": anchor["ex_date"].isoformat(),
+            "days_since_last_dividend": days_since,
+            "expected_interval_days": _div_r(expected, 1),
+            "upcoming_dividend_declared": bool(upcoming),
+            "note": "Cannot be distinguished from delayed or missing provider data; never a confirmed suspension.",
+        },
+        "payment_history": payments,
+        "chart_data": chart,
+        "interpretation": summary + ". Descriptive only.",
+    }
+
+
+# ---------------------------------------------------------------------------
+# fundamentals accessors
+# ---------------------------------------------------------------------------
+
+
+def _dated_entries(container: Any) -> list[tuple[datetime.date, dict]]:
+    if not isinstance(container, dict):
+        return []
+    out: dict[datetime.date, dict] = {}
+    for key, entry in container.items():
+        if not isinstance(entry, dict):
+            continue
+        day = _d(entry.get("date")) or _d(key)
+        if day is not None:
+            out[day] = entry
+    return sorted(out.items(), key=lambda kv: kv[0])
+
+
+def _statement(fundamentals: dict | None, name: str) -> list[tuple[datetime.date, dict]]:
+    return _dated_entries(_walk(fundamentals, "Financials", name, "yearly"))
+
+
+def _annual_eps(fundamentals: dict | None, today: datetime.date) -> list[tuple[datetime.date, float]]:
+    out = []
+    for day, entry in _dated_entries(_walk(fundamentals, "Earnings", "Annual")):
+        eps = _f(entry.get("epsActual"))
+        if eps is not None and day <= today:
+            out.append((day, eps))
+    return out
+
+
+def _quarterly_eps(fundamentals: dict | None, today: datetime.date) -> list[tuple[datetime.date, float]]:
+    out = []
+    for day, entry in _dated_entries(_walk(fundamentals, "Earnings", "History")):
+        eps = _f(entry.get("epsActual"))
+        if eps is not None and day <= today:
+            out.append((day, eps))
+    return out
+
+
+def _payout_band(p: float) -> str:
+    for limit, label in PAYOUT_BANDS:
+        if p <= limit:
+            return label
+    return "Exceeds earnings"
+
+
+# ---------------------------------------------------------------------------
+# component 2: payout ratio
+# ---------------------------------------------------------------------------
+
+
+def compute_payout_ratio(history: list[dict], fundamentals: dict | None, fundamentals_status: str,
+                         today: datetime.date) -> dict:
+    if fundamentals_status == NOT_APPLICABLE:
+        return {"status": NOT_APPLICABLE, "reason": "Payout ratio applies to operating companies, not funds/ETFs."}
+    if not fundamentals:
+        return {"status": DIV_UNAVAILABLE, "reason": f"EODHD fundamentals are unavailable ({fundamentals_status}); EPS is needed."}
+    if not history:
+        return {"status": NO_HISTORY, "reason": "No dividend history, so no payout ratio can be computed."}
+
+    fund_ccy = str(_walk(fundamentals, "General", "CurrencyCode") or "").upper() or None
+    div_ccy = next((r["currency"] for r in reversed(history) if r["currency"]), None)
+    reasons: list[str] = []
+    if fund_ccy and div_ccy and fund_ccy != div_ccy:
+        return {
+            "status": NOT_MEANINGFUL,
+            "reason": f"Dividends are paid in {div_ccy} but financials are reported in {fund_ccy}; no FX conversion is applied.",
+        }
+
+    # fiscal-year basis
+    fiscal = {"status": DIV_UNAVAILABLE, "reason": "Annual EPS (Earnings.Annual) not available."}
+    annual = _annual_eps(fundamentals, today)
+    if annual:
+        end, eps = annual[-1]
+        start = _add_years(end, -1)
+        dps = _sum_between(history, start, end)
+        base = {
+            "fiscal_year_end": end.isoformat(),
+            "eps": _div_r(eps, 4),
+            "dividends_per_share": _div_r(dps, 4),
+            "window": f"{start.isoformat()} (exclusive) to {end.isoformat()}",
+        }
+        if (today - end).days > FISCAL_YEAR_STALE_DAYS:
+            reasons.append(f"Latest annual EPS is for the year ended {end.isoformat()} (stale).")
+        if eps > 0:
+            ratio = dps / eps * 100.0
+            fiscal = {**base, "status": DIV_AVAILABLE, "payout_ratio_percent": _div_r(ratio, 2), "band": _payout_band(ratio)}
+        else:
+            fiscal = {**base, "status": NOT_MEANINGFUL, "payout_ratio_percent": None,
+                      "reason": "EPS is zero or negative, so a payout ratio is not meaningful."}
+
+    # trailing-four-quarter basis
+    ttm = {"status": DIV_UNAVAILABLE, "reason": "Four reported quarters of EPS (Earnings.History) not available."}
+    quarters = _quarterly_eps(fundamentals, today)[-4:]
+    if len(quarters) == 4:
+        span = (quarters[-1][0] - quarters[0][0]).days
+        if TTM_EPS_SPAN_DAYS[0] <= span <= TTM_EPS_SPAN_DAYS[1]:
+            eps_ttm = sum(e for _, e in quarters)
+            end = quarters[-1][0]
+            dps = _sum_between(history, _add_years(end, -1), end)
+            base = {"period_end": end.isoformat(), "eps": _div_r(eps_ttm, 4), "dividends_per_share": _div_r(dps, 4)}
+            if eps_ttm > 0:
+                ratio = dps / eps_ttm * 100.0
+                ttm = {**base, "status": DIV_AVAILABLE, "payout_ratio_percent": _div_r(ratio, 2), "band": _payout_band(ratio)}
+            else:
+                ttm = {**base, "status": NOT_MEANINGFUL, "payout_ratio_percent": None,
+                       "reason": "Trailing EPS is zero or negative, so a payout ratio is not meaningful."}
+        else:
+            ttm = {"status": DIV_UNAVAILABLE, "reason": "The last four reported quarters are not consecutive; TTM EPS not formed."}
+
+    # aggregate cash basis (dividends paid / net income, same fiscal year)
+    aggregate = {"status": DIV_UNAVAILABLE, "reason": "Cash-flow statement (dividendsPaid / netIncome) not available."}
+    for day, entry in reversed(_statement(fundamentals, "Cash_Flow")):
+        paid, ni = _f(entry.get("dividendsPaid")), _f(entry.get("netIncome"))
+        if paid is None:
+            continue
+        if ni is None:
+            ni = next((_f(e.get("netIncome")) for d2, e in _statement(fundamentals, "Income_Statement") if d2 == day), None)
+        if ni is None:
+            continue
+        if ni > 0:
+            ratio = abs(paid) / ni * 100.0
+            aggregate = {"status": DIV_AVAILABLE, "fiscal_year_end": day.isoformat(), "dividends_paid": _div_r(abs(paid), 2),
+                         "net_income": _div_r(ni, 2), "payout_ratio_percent": _div_r(ratio, 2), "band": _payout_band(ratio)}
+        else:
+            aggregate = {"status": NOT_MEANINGFUL, "fiscal_year_end": day.isoformat(), "net_income": _div_r(ni, 2),
+                         "payout_ratio_percent": None, "reason": "Net income is zero or negative."}
+        break
+
+    provider = _f(_walk(fundamentals, "SplitsDividends", "PayoutRatio"))
+    primary = next((p for p in (("fiscal_year", fiscal), ("trailing_twelve_months", ttm)) if p[1]["status"] == DIV_AVAILABLE), None)
+    if primary:
+        status, value, basis = DIV_AVAILABLE, primary[1]["payout_ratio_percent"], primary[0]
+    elif NOT_MEANINGFUL in (fiscal["status"], ttm["status"]):
+        status, value, basis = NOT_MEANINGFUL, None, None
+        reasons.append("Earnings are zero or negative on the available basis.")
+    elif aggregate["status"] == DIV_AVAILABLE:
+        status, value, basis = DIV_AVAILABLE, aggregate["payout_ratio_percent"], "aggregate_cash_basis"
+    else:
+        status, value, basis = DIV_UNAVAILABLE, None, None
+        reasons.append("No usable EPS or cash-flow basis.")
+    return {
+        "status": status,
+        "payout_ratio_percent": value,
+        "primary_basis": basis,
+        "band": _payout_band(value) if value is not None else None,
+        "fiscal_year": fiscal,
+        "trailing_twelve_months": ttm,
+        "aggregate_cash_basis": aggregate,
+        "provider_reported_percent": _div_r(provider * 100.0, 2) if provider is not None else None,
+        "bands": "<=60% Moderate; <=80% Elevated; <=100% High; >100% Exceeds earnings (sector norms differ, e.g. REITs).",
+        "notes": reasons,
+    }
+
+
+# ---------------------------------------------------------------------------
+# component 5: sustainability
+# ---------------------------------------------------------------------------
+
+
+def _factor(factor: str, label: str, assessment: str, value=None, unit: str | None = None,
+            detail: str = "", thresholds: str = "", source: str = "calculated") -> dict:
+    return {"factor": factor, "label": label, "assessment": assessment, "value": value, "unit": unit,
+            "detail": detail, "thresholds": thresholds, "source": source}
+
+
+def compute_sustainability(payout: dict, fundamentals: dict | None, fundamentals_status: str,
+                           today: datetime.date) -> dict:
+    if fundamentals_status == NOT_APPLICABLE:
+        return {"status": NOT_APPLICABLE, "reason": "Sustainability metrics need company financials; not applicable to funds/ETFs."}
+    if not fundamentals:
+        return {"status": DIV_UNAVAILABLE, "reason": f"EODHD fundamentals are unavailable ({fundamentals_status})."}
+
+    factors: list[dict] = []
+    unavailable: list[dict] = []
+
+    # payout ratio
+    p = payout.get("payout_ratio_percent") if payout.get("status") == DIV_AVAILABLE else None
+    if p is not None:
+        band = _payout_band(p)
+        factors.append(_factor("payout_ratio", "Payout ratio", "supportive" if p <= 60 else "neutral" if p <= 80 else "concern",
+                               _div_r(p, 2), "percent", f"{band} payout of earnings.", "supportive <=60; neutral <=80; concern >80"))
+    else:
+        unavailable.append({"metric": "payout_ratio", "reason": payout.get("reason") or "; ".join(payout.get("notes", [])) or "unavailable"})
+
+    # earnings trend (annual EPS)
+    eps_series = _annual_eps(fundamentals, today)[-4:]
+    if len(eps_series) >= 2:
+        (d0, e0), (d1, e1) = eps_series[-2], eps_series[-1]
+        yoy = _pct_change(e1, e0)
+        declines = sum(1 for (_, a), (_, b) in zip(eps_series, eps_series[1:]) if b < a)
+        if e1 <= 0:
+            assessment, detail = "concern", f"Latest annual EPS ({e1:g}) is zero or negative."
+        elif yoy is not None and yoy <= EPS_DECLINE_CONCERN_PERCENT:
+            assessment, detail = "concern", f"Annual EPS fell {abs(yoy):.1f}% year over year."
+        elif yoy is not None and yoy >= 0 and declines == 0:
+            assessment, detail = "supportive", "Annual EPS is positive and not declining."
+        else:
+            assessment, detail = "neutral", "Annual EPS is positive with a modest or mixed change."
+        factors.append(_factor("earnings_trend", "Earnings (EPS) trend", assessment, _div_r(yoy, 2), "percent_yoy", detail,
+                               f"concern if EPS<=0 or YoY <= {EPS_DECLINE_CONCERN_PERCENT:g}%; supportive if YoY>=0 and no declines"))
+    else:
+        unavailable.append({"metric": "earnings_trend", "reason": "Fewer than two annual EPS observations (Earnings.Annual)."})
+
+    # revenue trend
+    income = _statement(fundamentals, "Income_Statement")
+    rev = [(d, _f(e.get("totalRevenue"))) for d, e in income]
+    rev = [(d, v) for d, v in rev if v is not None]
+    if len(rev) >= 2 and rev[-2][1] and rev[-2][1] > 0:
+        yoy = _pct_change(rev[-1][1], rev[-2][1])
+        cagr = None
+        if len(rev) >= 4 and rev[-4][1] and rev[-4][1] > 0 and rev[-1][1] > 0:
+            cagr = ((rev[-1][1] / rev[-4][1]) ** (1 / 3) - 1) * 100.0
+        if yoy is not None and yoy <= REVENUE_DECLINE_CONCERN_PERCENT:
+            assessment = "concern"
+        elif yoy is not None and yoy >= 0:
+            assessment = "supportive"
+        else:
+            assessment = "neutral"
+        factors.append(_factor("revenue_trend", "Revenue trend", assessment, _div_r(yoy, 2), "percent_yoy",
+                               f"Latest annual revenue change {yoy:.1f}% (3-year CAGR: {'n/a' if cagr is None else f'{cagr:.1f}%'}).",
+                               f"concern if YoY <= {REVENUE_DECLINE_CONCERN_PERCENT:g}%; supportive if YoY >= 0"))
+    else:
+        unavailable.append({"metric": "revenue_trend", "reason": "Fewer than two annual revenue observations (Income_Statement.yearly)."})
+
+    # free-cash-flow coverage
+    fcf_entry = None
+    for day, entry in reversed(_statement(fundamentals, "Cash_Flow")):
+        fcf = _f(entry.get("freeCashFlow"))
+        if fcf is None:
+            cfo, capex = _f(entry.get("totalCashFromOperatingActivities")), _f(entry.get("capitalExpenditures"))
+            fcf = cfo - abs(capex) if cfo is not None and capex is not None else None
+        paid = _f(entry.get("dividendsPaid"))
+        if fcf is not None and paid is not None:
+            fcf_entry = (day, fcf, abs(paid))
+            break
+    if fcf_entry and fcf_entry[2] > 0:
+        day, fcf, paid = fcf_entry
+        if fcf <= 0:
+            assessment, value, detail = "concern", None, f"Free cash flow ({fcf:,.0f}) is zero or negative while dividends of {paid:,.0f} were paid."
+        else:
+            value = fcf / paid
+            assessment = "supportive" if value >= FCF_COVERAGE_SUPPORTIVE else "neutral" if value >= FCF_COVERAGE_ADEQUATE else "concern"
+            detail = f"Free cash flow covers dividends paid {value:.2f}x (dividends are {paid / fcf * 100:.0f}% of FCF)."
+        factors.append(_factor("fcf_coverage", "Free-cash-flow coverage", assessment, _div_r(value, 2), "x", detail + f" Fiscal year ended {day.isoformat()}.",
+                               f"supportive >= {FCF_COVERAGE_SUPPORTIVE:g}x; neutral >= {FCF_COVERAGE_ADEQUATE:g}x; concern below or FCF <= 0"))
+    else:
+        unavailable.append({"metric": "fcf_coverage", "reason": "No annual cash-flow statement with free cash flow and dividendsPaid."})
+
+    # leverage
+    lev = None
+    balance = dict(_statement(fundamentals, "Balance_Sheet"))
+    for day, entry in reversed(income):
+        ebitda = _f(entry.get("ebitda"))
+        nd = _f((balance.get(day) or {}).get("netDebt"))
+        if ebitda is not None and nd is not None:
+            lev = (day, nd, ebitda)
+            break
+    if lev:
+        day, nd, ebitda = lev
+        if nd <= 0:
+            assessment, value, detail = "supportive", None, "Net cash position (net debt <= 0)."
+        elif ebitda <= 0:
+            assessment, value, detail = "concern", None, "Net debt with zero/negative EBITDA; leverage ratio not meaningful."
+        else:
+            value = nd / ebitda
+            assessment = "supportive" if value <= LEVERAGE_SUPPORTIVE_X else "neutral" if value <= LEVERAGE_CONCERN_X else "concern"
+            detail = f"Net debt / EBITDA is {value:.2f}x."
+        factors.append(_factor("leverage", "Leverage (net debt / EBITDA)", assessment, _div_r(value, 2), "x", detail + f" Fiscal year ended {day.isoformat()}.",
+                               f"supportive <= {LEVERAGE_SUPPORTIVE_X:g}x or net cash; neutral <= {LEVERAGE_CONCERN_X:g}x; concern above"))
+    else:
+        unavailable.append({"metric": "leverage", "reason": "netDebt (Balance_Sheet) and ebitda (Income_Statement) not available for the same fiscal year."})
+
+    concerns = sum(1 for f in factors if f["assessment"] == "concern")
+    supportive = sum(1 for f in factors if f["assessment"] == "supportive")
+    if len(factors) < 2:
+        overall, status = "Insufficient Data", INSUFFICIENT
+    else:
+        status = DIV_AVAILABLE
+        overall = "Weak" if concerns >= 2 else "Supportive" if concerns == 0 and supportive >= 2 else "Mixed"
+    return {
+        "status": status,
+        "assessment": overall,
+        "assessment_type": "Rule-based heuristic (not a validated prediction)",
+        "rule": "Weak: >=2 concerns. Supportive: no concerns and >=2 supportive factors. Otherwise Mixed. Needs >=2 evaluable factors.",
+        "factors_evaluated": len(factors),
+        "concern_count": concerns,
+        "supportive_count": supportive,
+        "factors": factors,
+        "unavailable_metrics": unavailable,
+    }
+
+
+# ---------------------------------------------------------------------------
+# component 6: cut risk
+# ---------------------------------------------------------------------------
+
+
+def _indicator(key: str, label: str, source: str, severity: str, triggered: bool | None, value, explanation: str) -> dict:
+    return {"indicator": key, "label": label, "source": source, "severity": severity,
+            "triggered": triggered, "value": value, "explanation": explanation}
+
+
+def compute_cut_risk(trend: dict, payout: dict, sustainability: dict, fundamentals_status: str) -> dict:
+    inds: list[dict] = []
+    factors = {f["factor"]: f for f in sustainability.get("factors", [])} if isinstance(sustainability, dict) else {}
+
+    # --- fundamentals-derived ---
+    p = payout.get("payout_ratio_percent") if payout.get("status") == DIV_AVAILABLE else None
+    if p is not None:
+        sev = "high" if p > 100 else "medium"
+        inds.append(_indicator("payout_ratio_high", "Excessive payout ratio", "fundamentals", sev, p > 80, _div_r(p, 2),
+                               f"Payout is {p:.1f}% of earnings (flagged above 80%; high severity above 100%)."))
+    else:
+        inds.append(_indicator("payout_ratio_high", "Excessive payout ratio", "fundamentals", "high", None, None,
+                               "Payout ratio unavailable or not meaningful."))
+
+    eps_nonpos = None
+    for basis in ("fiscal_year", "trailing_twelve_months"):
+        blk = payout.get(basis) if isinstance(payout, dict) else None
+        if isinstance(blk, dict) and blk.get("eps") is not None:
+            eps_nonpos = blk["eps"] <= 0
+            inds.append(_indicator("negative_earnings", "Negative or zero earnings", "fundamentals", "high", eps_nonpos,
+                                   blk["eps"], f"EPS on the {basis.replace('_', ' ')} basis is {blk['eps']:g}."))
+            break
+    if eps_nonpos is None:
+        inds.append(_indicator("negative_earnings", "Negative or zero earnings", "fundamentals", "high", None, None, "EPS unavailable."))
+
+    et = factors.get("earnings_trend")
+    if et:
+        inds.append(_indicator("declining_earnings", "Declining earnings", "fundamentals", "medium",
+                               et["assessment"] == "concern" and (et["value"] is not None and et["value"] <= EPS_DECLINE_CONCERN_PERCENT),
+                               et["value"], et["detail"]))
+    else:
+        inds.append(_indicator("declining_earnings", "Declining earnings", "fundamentals", "medium", None, None, "Annual EPS trend unavailable."))
+
+    fc = factors.get("fcf_coverage")
+    if fc:
+        cov = fc["value"]
+        weak = fc["assessment"] == "concern"
+        sev = "high" if (cov is None or cov < FCF_COVERAGE_WEAK) else "medium"
+        inds.append(_indicator("weak_fcf_coverage", "Weak free-cash-flow coverage", "fundamentals", sev, weak, cov, fc["detail"]))
+    else:
+        inds.append(_indicator("weak_fcf_coverage", "Weak free-cash-flow coverage", "fundamentals", "high", None, None, "Free-cash-flow coverage unavailable."))
+
+    lv = factors.get("leverage")
+    if lv:
+        inds.append(_indicator("high_leverage", "High leverage", "fundamentals", "medium", lv["assessment"] == "concern", lv["value"], lv["detail"]))
+    else:
+        inds.append(_indicator("high_leverage", "High leverage", "fundamentals", "medium", None, None, "Leverage unavailable."))
+
+    rv = factors.get("revenue_trend")
+    if rv:
+        inds.append(_indicator("revenue_decline", "Deteriorating revenue", "fundamentals", "low", rv["assessment"] == "concern", rv["value"], rv["detail"]))
+    else:
+        inds.append(_indicator("revenue_decline", "Deteriorating revenue", "fundamentals", "low", None, None, "Revenue trend unavailable."))
+
+    # --- history-derived ---
+    if trend.get("status") in (DIV_AVAILABLE, INSUFFICIENT) and "possible_dividend_cut" in trend:
+        cut = trend["possible_dividend_cut"]
+        inds.append(_indicator("recent_dividend_reduction", "Recent dividend reduction", "history",
+                               "high" if cut["status"] == "observed" else "medium", cut["status"] != "none", cut["status"],
+                               f"Dividend reduction status: {cut['status']} (last {cut['recent_window_months']} months)."))
+        regular = trend["payment_regularity"] == "Irregular" or trend["classification"] == "Irregular"
+        inds.append(_indicator("inconsistent_history", "Inconsistent dividend history", "history", "medium", regular,
+                               trend["classification"], f"Trend class '{trend['classification']}', payment regularity '{trend['payment_regularity']}'."))
+        susp = trend["possible_suspension"]
+        inds.append(_indicator("payment_gap", "Overdue / possibly suspended dividend", "history",
+                               "high" if susp["status"] == "possible_suspension" else "medium", susp["status"] != "none",
+                               susp["status"], f"{susp['days_since_last_dividend']} days since last ex-date (expected interval {susp['expected_interval_days']})."))
+    else:
+        for key, label in (("recent_dividend_reduction", "Recent dividend reduction"),
+                           ("inconsistent_history", "Inconsistent dividend history"),
+                           ("payment_gap", "Overdue / possibly suspended dividend")):
+            inds.append(_indicator(key, label, "history", "medium", None, None, "Dividend history unavailable."))
+
+    evaluable = [i for i in inds if i["triggered"] is not None]
+    fundamentals_evaluable = [i for i in evaluable if i["source"] == "fundamentals"]
+    missing = [{"indicator": i["indicator"], "reason": i["explanation"]} for i in inds if i["triggered"] is None]
+    triggered = [i for i in evaluable if i["triggered"]]
+    high = sum(1 for i in triggered if i["severity"] == "high")
+    medium = sum(1 for i in triggered if i["severity"] == "medium")
+    if len(evaluable) < MIN_EVALUABLE_RISK_INDICATORS or not fundamentals_evaluable:
+        status, level = INSUFFICIENT, "Insufficient Data"
+        reason = (
+            "Fewer than three indicators could be evaluated, or no fundamentals-based indicator was available "
+            f"(fundamentals: {fundamentals_status}); no overall assessment is given."
+        )
+    else:
+        status = DIV_AVAILABLE
+        level = "Elevated risk indicators" if (high >= 2 or (high >= 1 and medium >= 2)) else \
+            "Moderate risk indicators" if (high == 1 or medium >= 2) else "Few risk indicators"
+        reason = None
+    return {
+        "status": status,
+        "assessment": level,
+        "assessment_type": "Rule-based heuristic",
+        "is_probability": False,
+        "model": "None — transparent rules; no machine-learning model and no probability is produced.",
+        "rule": "Elevated: >=2 high-severity indicators, or >=1 high and >=2 medium. Moderate: exactly 1 high or >=2 medium. "
+                "Otherwise few. Needs >=3 evaluable indicators including >=1 fundamentals-based.",
+        "triggered_count": len(triggered),
+        "evaluable_count": len(evaluable),
+        "indicators": inds,
+        "triggered_indicators": [i["indicator"] for i in triggered],
+        "missing_data": missing,
+        "reason": reason,
+    }
+
+
+# ---------------------------------------------------------------------------
+# orchestration
+# ---------------------------------------------------------------------------
+
+
+def unavailable_result(symbol: str, reasons: list[str], today: datetime.date | None = None) -> dict:
+    """Explicit 'unavailable' object (e.g. EODHD plan lacks the endpoint or the call failed)."""
+    today = today or datetime.date.today()
+    return _div_clean({
+        "strategy_id": DIV_STRATEGY_ID, "strategy_name": DIV_STRATEGY_NAME, "category": DIV_STRATEGY_CATEGORY,
+        "symbol": symbol, "status": DIV_UNAVAILABLE, "as_of": today, "unavailable_reasons": reasons,
+        "components": {}, "data_coverage": {}, "methodology": DIV_METHODOLOGY, "disclaimer": DIV_DISCLAIMER,
+    })
+
+
+def compute_dividend_analysis(
+    *,
+    symbol: str,
+    dividends: list | None,
+    price: float | None,
+    price_date: str | None,
+    fundamentals: dict | None,
+    fundamentals_status: str,
+    instrument_type: str,
+    today: datetime.date | None = None,
+    price_source: str | None = None,
+    notes: list[str] | None = None,
+) -> dict:
+    """Assemble the six components.
+
+    dividends:   None = the EODHD dividend call failed/was denied; [] = succeeded with no rows.
+    fundamentals_status: "ok", "not_applicable" (fund/ETF), or a short reason string such as
+                 "not covered by EODHD" / "plan does not include fundamentals".
+    instrument_type: "stock" or "fund".
+    """
+    today = today or datetime.date.today()
+    notes = list(notes or [])
+    if dividends is None:
+        return unavailable_result(symbol, notes or ["EODHD dividend history could not be retrieved."], today)
+    fundamentals_status = NOT_APPLICABLE if instrument_type == "fund" else fundamentals_status
+    fund = fundamentals if (fundamentals_status == "ok" and isinstance(fundamentals, dict)) else None
+
+    history, upcoming, quality = parse_dividends(dividends, today)
+    table, modal = _annual_table(history, today)
+
+    y = compute_yield(history, upcoming, price, price_date, fund, modal, today)
+    payout = compute_payout_ratio(history, fund, fundamentals_status, today)
+    growth = compute_growth(table, modal) if history else {"status": NO_HISTORY, "reason": "No dividend history.", "annual_dividends": []}
+    trend = compute_trend(history, upcoming, table, modal, today)
+    sustain = compute_sustainability(payout, fund, fundamentals_status, today)
+    risk = compute_cut_risk(trend, payout, sustain, fundamentals_status)
+
+    applicable = [y, growth, trend] + ([payout, sustain, risk] if instrument_type == "stock" else [])
+    bad = {DIV_UNAVAILABLE, INSUFFICIENT}
+    overall = PARTIAL if any(c.get("status") in bad for c in applicable) else DIV_AVAILABLE
+    if not history:
+        overall = PARTIAL
+
+    unavailable_metrics: list[dict] = []
+    for name, comp in (("dividend_yield", y), ("payout_ratio", payout), ("dividend_growth", growth),
+                       ("historical_trend", trend), ("sustainability", sustain), ("cut_risk", risk)):
+        if comp.get("status") in {DIV_UNAVAILABLE, INSUFFICIENT, NO_HISTORY, PARTIAL}:
+            unavailable_metrics.append({"metric": name, "status": comp["status"],
+                                        "reason": comp.get("reason") or "; ".join(comp.get("notes", [])) or "see component"})
+        for m in comp.get("unavailable_metrics", []) if isinstance(comp, dict) else []:
+            unavailable_metrics.append({"metric": f"{name}.{m['metric']}", "status": DIV_UNAVAILABLE, "reason": m["reason"]})
+
+    result = {
+        "strategy_id": DIV_STRATEGY_ID,
+        "strategy_name": DIV_STRATEGY_NAME,
+        "category": DIV_STRATEGY_CATEGORY,
+        "symbol": symbol,
+        "instrument_type": instrument_type,
+        "status": overall,
+        "as_of": today,
+        "data_source": "EODHD (dividends: /api/div; fundamentals: /api/fundamentals; prices: EODHD end-of-day)",
+        "dividend_yield": y,
+        "payout_ratio": payout,
+        "dividend_growth": growth,
+        "historical_trend": trend,
+        "sustainability": sustain,
+        "cut_risk": risk,
+        "data_coverage": {
+            "dividend_records": len(history),
+            "upcoming_dividend_records": len(upcoming),
+            "first_ex_date": history[0]["ex_date"].isoformat() if history else None,
+            "last_ex_date": history[-1]["ex_date"].isoformat() if history else None,
+            "complete_years_analyzed": len(table),
+            "dividend_data_quality": quality,
+            "fundamentals_status": fundamentals_status,
+            "annual_eps_years": len(_annual_eps(fund, today)) if fund else 0,
+            "annual_cash_flow_years": len(_statement(fund, "Cash_Flow")) if fund else 0,
+            "price_available": price is not None and price > 0,
+            "price_source": price_source,
+        },
+        "unavailable_metrics": unavailable_metrics,
+        "limitations": notes + [
+            "Heuristic classifications are not validated predictions; thresholds are listed in each component.",
+            "Provider data can be delayed, restated or incomplete; absent data is reported, never filled in.",
+            "Dividend forecasting is not part of this version.",
+        ],
+        "methodology": DIV_METHODOLOGY,
+        "disclaimer": DIV_DISCLAIMER,
+    }
+    return _div_clean(result)

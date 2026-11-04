@@ -9,6 +9,7 @@ import datetime
 from typing import Any, Literal
 
 from pydantic import Field
+from pydantic.alias_generators import to_camel
 
 from app.schemas.common import CamelModel
 
@@ -122,6 +123,433 @@ class BetterBreakoutStrategy(CamelModel):
     chart_data: list[BetterBreakoutChartPoint]
 
 
+# ----------------------------------------------------------------------------
+# Strategy additions: Moving Average Traffic Light (nested in SmaTrendStrategy),
+# Candlestick Pattern Recognition, Volatility Harvesting, Dividend Analysis.
+# Analytical / visualization data only; every field is nullable where the
+# underlying calculation can be unavailable.
+# ----------------------------------------------------------------------------
+
+
+def camelize_keys(obj: Any) -> Any:
+    """Recursively convert snake_case dict keys to camelCase (values untouched).
+
+    Used for the free-form component bodies of the Dividend Analysis response so
+    they follow the same camelCase JSON convention as the fully typed models.
+    Keys without underscores (tickers, pattern names) are unchanged."""
+    if isinstance(obj, dict):
+        return {to_camel(k) if isinstance(k, str) else k: camelize_keys(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [camelize_keys(v) for v in obj]
+    return obj
+
+
+# ---------------------------------------------------------------------------
+# Moving Average Traffic Light (enhancement of SMA Trend)
+# ---------------------------------------------------------------------------
+
+
+class SmaTrafficLightChartPoint(CamelModel):
+    date: str
+    close: float | None = None
+    sma10: float | None = None
+    sma25: float | None = None
+    sma50: float | None = None
+    state: str | None = None  # "Bullish" | "Mixed" | "Bearish"
+
+
+class SmaPricePosition(CamelModel):
+    period: int
+    sma: float | None = None
+    price_vs_sma_percent: float | None = None
+    position: str | None = None  # "Above" | "Below" | "Equal"
+
+
+class SmaRelationships(CamelModel):
+    sma10_vs_sma25: str
+    sma25_vs_sma50: str
+    sma10_vs_sma50: str
+
+
+class SmaSlope(CamelModel):
+    slope_percent: float | None = None
+    direction: str | None = None  # "Rising" | "Falling" | "Flat"
+    lookback_bars: int
+
+
+class SmaSlopes(CamelModel):
+    sma10: SmaSlope
+    sma25: SmaSlope
+    sma50: SmaSlope
+
+
+class SmaCrossoverEvent(CamelModel):
+    pair: str
+    fast_period: int
+    slow_period: int
+    type: str  # "Bullish" | "Bearish"
+    date: str
+    bars_ago: int
+
+
+class SmaCrossovers(CamelModel):
+    lookback_bars: int
+    definition: str
+    events: list[SmaCrossoverEvent] = Field(default_factory=list)
+    any_recent_crossover: bool
+
+
+class SmaHistoricalComparison(CamelModel):
+    period: int
+    available: bool
+    reference_date: str | None = None
+    reference_close: float | None = None
+    change_percent: float | None = None
+    position: str | None = None
+
+
+class SmaHistoricalPriceComparison(CamelModel):
+    definition: str
+    comparisons: list[SmaHistoricalComparison]
+
+
+class SmaTrafficLight(CamelModel):
+    """Close vs SMA10 / SMA25 / SMA50 ordering. Green = Close > SMA10 > SMA25 >
+    SMA50, Red = the reverse, Amber (Mixed) = anything else. Descriptive only."""
+
+    state: str  # "Bullish" | "Mixed" | "Bearish"
+    colour: str  # "Green" | "Amber" | "Red"
+    as_of: str
+    price: float
+    sma10: float
+    sma25: float
+    sma50: float
+    bullish_condition_met: bool
+    bearish_condition_met: bool
+    ordering_descending: list[str]
+    ordering_text: str
+    has_ties: bool
+    price_positioning: list[SmaPricePosition]
+    sma_relationships: SmaRelationships
+    slopes: SmaSlopes
+    crossovers: SmaCrossovers
+    historical_price_comparison: SmaHistoricalPriceComparison
+    interpretation: str
+    methodology_note: str
+    chart_data: list[SmaTrafficLightChartPoint]
+
+
+# ---------------------------------------------------------------------------
+# Candlestick Pattern Recognition
+# ---------------------------------------------------------------------------
+
+
+class CandleRecord(CamelModel):
+    date: str
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: int | None = None
+
+
+class CandlestickDetection(CamelModel):
+    pattern: str
+    symbol: str | None = None
+    date: str  # date of the candle that completes the formation
+    start_date: str
+    candle_count: int
+    classification: str  # "Bullish" | "Bearish" | "Neutral"
+    candles: list[CandleRecord]
+    prior_trend: str  # "Downtrend" | "Uptrend" | "Not required" | "Unmeasured"
+    prior_trend_change_percent: float | None = None
+    interpretation: str
+    detection_method: str
+
+
+class CandlestickPatternDefinition(CamelModel):
+    pattern: str
+    candle_count: int
+    classification: str
+    requires_prior_trend: str | None = None
+    rule: str
+
+
+class CandlestickParameters(CamelModel):
+    doji_max_body_range_ratio: float
+    shadow_body_multiple: float
+    opposite_shadow_max_range_ratio: float
+    avg_body_window: int
+    long_body_multiple: float
+    star_small_body_multiple: float
+    crows_min_body_range_ratio: float
+    crows_max_close_shadow_range_ratio: float
+    trend_lookback_bars: int
+    trend_min_move_atr_multiple: float
+    atr_period: int
+
+
+class CandlestickDataQuality(CamelModel):
+    source_rows: int
+    duplicate_dates_dropped: int
+    invalid_candles_dropped: int
+    invalid_candle_dates: list[str] = Field(default_factory=list)
+    missing_date_rows_dropped: int
+    incomplete_latest_candle_excluded: bool
+
+
+class CandlestickPatternRecognitionStrategy(CamelModel):
+    """Detected candlestick formations (rule-based; no probabilities or
+    confidence scores). Separate from TA Candles / Trend Health."""
+
+    strategy_id: str
+    strategy_name: str
+    category: str
+    symbol: str | None = None
+    interval: str
+    analysis_start: str
+    analysis_end: str
+    lookback_bars: int
+    candles_analyzed: int
+    candles_in_window: int
+    detection_method: str
+    patterns_checked: list[str]
+    pattern_definitions: list[CandlestickPatternDefinition]
+    parameters: CandlestickParameters
+    total_detections: int
+    detections_truncated: bool
+    detection_counts: dict[str, int]
+    classification_counts: dict[str, int]
+    latest_candle_detections: list[CandlestickDetection] = Field(default_factory=list)
+    detections: list[CandlestickDetection] = Field(default_factory=list)
+    data_quality: CandlestickDataQuality
+    warnings: list[str] = Field(default_factory=list)
+    chart_data: list[CandleRecord]
+    disclaimer: str
+
+
+# ---------------------------------------------------------------------------
+# Volatility Harvesting
+# ---------------------------------------------------------------------------
+
+
+class VolatilityHarvestingRequest(CamelModel):
+    """POST body for /api/portfolio/volatility_harvesting.
+
+    `weights_percent` is REQUIRED (ticker -> percent, long-only, > 0, summing to
+    100 +/-0.01): no default portfolio is ever assumed. `risk_free_rate_percent`
+    defaults to the backend's configured RISK_FREE_RATE. `transaction_cost_percent`
+    is a percentage of traded notional charged at each rebalance."""
+
+    symbols: list[str]
+    weights_percent: dict[str, float] | None = None
+    start: datetime.date | None = None
+    end: datetime.date | None = None
+    rebalance_frequency: Literal["monthly", "quarterly", "semiannual", "annual"] = "quarterly"
+    initial_value: float = 100_000.0
+    transaction_cost_percent: float = 0.0
+    risk_free_rate_percent: float | None = None
+    price_basis: Literal["adjusted", "close"] = "adjusted"
+    include_frequency_comparison: bool = False
+    transaction_cost_sensitivity_percent: list[float] | None = None
+
+
+class VhPortfolio(CamelModel):
+    symbols: list[str]
+    weights_percent: dict[str, float]
+    initial_value: float
+
+
+class VhAnalysisPeriod(CamelModel):
+    requested_start: str | None = None
+    requested_end: str | None = None
+    start: str
+    end: str
+    observations: int
+    years: float | None = None
+
+
+class VhRebalancingConfig(CamelModel):
+    frequency: str
+    trigger: str
+    events: int
+    transaction_cost_percent: float
+    cost_model: str
+
+
+class VhAssumptions(CamelModel):
+    risk_free_rate_percent: float
+    trading_days_per_year: int
+    sharpe_definition: str
+    long_only_fully_invested: bool
+
+
+class VhMetrics(CamelModel):
+    final_value: float | None = None
+    cumulative_return_percent: float | None = None
+    cagr_percent: float | None = None
+    annualized_volatility_percent: float | None = None
+    sharpe_ratio: float | None = None
+    max_drawdown_percent: float | None = None
+    max_drawdown_peak_date: str | None = None
+    max_drawdown_trough_date: str | None = None
+    rebalancing_frequency: str | None = None
+    rebalance_events: int
+    total_transaction_cost: float | None = None
+
+
+class VhComparison(CamelModel):
+    """Rebalanced minus buy-and-hold."""
+
+    final_value_difference: float | None = None
+    cumulative_return_difference_pp: float | None = None
+    cagr_difference_pp: float | None = None
+    volatility_difference_pp: float | None = None
+    sharpe_difference: float | None = None
+    max_drawdown_difference_pp: float | None = None
+    return_difference_direction: str
+    attribution_note: str
+
+
+class VhAssetStatistic(CamelModel):
+    symbol: str
+    target_weight_percent: float
+    first_date: str
+    last_date: str
+    observations_in_window: int
+    total_return_percent: float | None = None
+    cagr_percent: float | None = None
+    annualized_volatility_percent: float | None = None
+
+
+class VhCorrelationMatrix(CamelModel):
+    symbols: list[str]
+    values: list[list[float | None]]
+
+
+class VhRebalanceEvent(CamelModel):
+    date: str
+    portfolio_value_before: float | None = None
+    traded_notional: float | None = None
+    one_way_turnover_percent: float | None = None
+    transaction_cost: float | None = None
+    weights_before_percent: dict[str, float | None]
+    weights_after_percent: dict[str, float]
+
+
+class VhWeightPoint(CamelModel):
+    date: str
+    rebalanced_weights_percent: dict[str, float | None]
+    buy_and_hold_weights_percent: dict[str, float | None]
+
+
+class VhFrequencyRow(CamelModel):
+    frequency: str
+    rebalance_events: int
+    final_value: float | None = None
+    cumulative_return_percent: float | None = None
+    cagr_percent: float | None = None
+    annualized_volatility_percent: float | None = None
+    sharpe_ratio: float | None = None
+    max_drawdown_percent: float | None = None
+    total_transaction_cost: float | None = None
+    cumulative_return_difference_pp: float | None = None
+    sharpe_difference: float | None = None
+
+
+class VhCostSensitivityRow(CamelModel):
+    transaction_cost_percent: float
+    final_value: float | None = None
+    cumulative_return_percent: float | None = None
+    sharpe_ratio: float | None = None
+    total_transaction_cost: float | None = None
+    cumulative_return_difference_pp: float | None = None
+
+
+class VhChartPoint(CamelModel):
+    date: str
+    rebalanced_value: float | None = None
+    buy_and_hold_value: float | None = None
+    rebalanced_drawdown_percent: float | None = None
+    buy_and_hold_drawdown_percent: float | None = None
+
+
+class VhDataQuality(CamelModel):
+    aligned_observations: int
+    misaligned_dates_excluded: int
+    per_asset_history: dict[str, dict[str, Any]]
+
+
+class VolatilityHarvestingStrategy(CamelModel):
+    """Rebalanced vs buy-and-hold historical comparison for a user-specified
+    portfolio. Simulation for analysis only - no orders, no guaranteed gains."""
+
+    strategy_id: str
+    strategy_name: str
+    category: str
+    portfolio: VhPortfolio
+    analysis_period: VhAnalysisPeriod
+    price_basis: str
+    return_basis: str
+    rebalancing: VhRebalancingConfig
+    assumptions: VhAssumptions
+    rebalanced: VhMetrics
+    buy_and_hold: VhMetrics
+    comparison: VhComparison
+    asset_statistics: list[VhAssetStatistic]
+    correlation_matrix: VhCorrelationMatrix
+    average_pairwise_correlation: float | None = None
+    rebalance_events: list[VhRebalanceEvent] = Field(default_factory=list)
+    rebalance_events_truncated: bool = False
+    weight_evolution: list[VhWeightPoint] = Field(default_factory=list)
+    frequency_comparison: list[VhFrequencyRow] | None = None
+    transaction_cost_sensitivity: list[VhCostSensitivityRow] | None = None
+    chart_data: list[VhChartPoint]
+    interpretation: str
+    methodology: list[str] = Field(default_factory=list)
+    data_quality: VhDataQuality
+    data_quality_warnings: list[str] = Field(default_factory=list)
+    disclaimer: str
+
+
+# ---------------------------------------------------------------------------
+# Dividend Analysis
+# ---------------------------------------------------------------------------
+
+
+class DividendAnalysisStrategy(CamelModel):
+    """Six-component dividend analysis (yield, payout ratio, growth, historical
+    trend, sustainability, cut risk) from EODHD data.
+
+    `status` is "available", "partial" (some inputs/components unavailable) or
+    "unavailable" (EODHD data could not be retrieved - see `unavailable_reasons`).
+    Component bodies are status-dependent objects (documented in
+    services.dividend_analysis) and are camelCased by the router. The
+    sustainability and cut-risk assessments are rule-based heuristics, not
+    predictions or probabilities. Dividend forecasting is not included."""
+
+    strategy_id: str
+    strategy_name: str
+    category: str
+    symbol: str
+    instrument_type: str | None = None  # "stock" | "fund"
+    status: str
+    as_of: str
+    data_source: str | None = None
+    unavailable_reasons: list[str] = Field(default_factory=list)
+    dividend_yield: dict[str, Any] | None = None
+    payout_ratio: dict[str, Any] | None = None
+    dividend_growth: dict[str, Any] | None = None
+    historical_trend: dict[str, Any] | None = None
+    sustainability: dict[str, Any] | None = None
+    cut_risk: dict[str, Any] | None = None
+    data_coverage: dict[str, Any] = Field(default_factory=dict)
+    unavailable_metrics: list[dict[str, Any]] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)
+    methodology: list[str] = Field(default_factory=list)
+    disclaimer: str
+
+
 class SmaTrendStrategy(CamelModel):
     price: float
     sma20: float
@@ -133,6 +561,9 @@ class SmaTrendStrategy(CamelModel):
     death_cross: bool
     price_above_sma200: bool
     chart_data: list[SmaTrendChartPoint]
+    # Moving Average Traffic Light (SMA10/25/50 ordering). Optional and additive:
+    # every field above is unchanged. See services.sma_traffic_light.
+    traffic_light: SmaTrafficLight | None = None
 
 
 class VtVsVtiVxusPerformancePoint(CamelModel):
@@ -1560,6 +1991,7 @@ class TechnicalStrategies(CamelModel):
     cpr: CprStrategy | None = None
     ta_candles_trend_health: TaCandlesTrendHealthStrategy | None = None
     ema_bollinger_atr: EmaBollingerAtrStrategy | None = None
+    candlestick_pattern_recognition: CandlestickPatternRecognitionStrategy | None = None
 
 
 class QuantitativeStrategies(CamelModel):
@@ -1667,6 +2099,13 @@ class StrategyAnalytics(CamelModel):
     seasonal_heat_map: SeasonalHeatMapStrategy | None = None
     ema_bollinger_atr: EmaBollingerAtrStrategy | None = None
     crash_warning: CrashWarningStrategy | None = None
+    # Candlestick Pattern Recognition (single-ETF, all symbols; Technical
+    # Strategies). Separate from TA Candles / Trend Health. The parameterised
+    # variant is GET /api/etfs/{symbol}/strategies/candlestick_patterns.
+    # Volatility Harvesting (multi-asset) is POST /api/portfolio/volatility_harvesting
+    # and Dividend Analysis (EODHD dividends + fundamentals) is
+    # GET /api/etfs/{symbol}/strategies/dividend_analysis.
+    candlestick_pattern_recognition: CandlestickPatternRecognitionStrategy | None = None
 
     # Category-organized view of the SAME strategies above (additive —
     # see the "Strategy categories" note preceding TechnicalStrategies).

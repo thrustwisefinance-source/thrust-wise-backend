@@ -7,6 +7,7 @@ trading bot and does NOT return buy/sell/hold signals, recommendations,
 or anything ML-derived.
 """
 
+import asyncio
 import datetime
 import hashlib
 import json
@@ -36,7 +37,20 @@ from app.schemas import (
     SeasonalHeatMapStrategy,
     StrategyAnalytics,
 )
-from app.services import cache, eodhd_client, portfolio_comparison, regime, strategies
+from app.schemas.strategy import (
+    CandlestickPatternRecognitionStrategy,
+    DividendAnalysisStrategy,
+    VolatilityHarvestingRequest,
+    VolatilityHarvestingStrategy,
+    camelize_keys,
+)
+from app.services import (
+    cache,
+    eodhd_client,
+    portfolio_comparison,
+    regime,
+    strategies,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +111,16 @@ MSWING_INDEX_CACHE_KEY = "tw:v1:strategy:mswing_index_value"
 # Cycle, and TQQQ/TMF/IEF Rebalancing above. See
 # services.strategies.compute_factor_momentum (Strategy 14).
 FACTOR_MOMENTUM_CACHE_KEY = "tw:v1:strategy:factor_momentum"
+
+
+def _default_candlestick_patterns(prices, symbol: str) -> dict | None:
+    """Candlestick Pattern Recognition with default parameters for the aggregated
+    response. A failure here must never break the other strategies."""
+    try:
+        return strategies.compute_candlestick_patterns(prices, symbol=symbol)
+    except Exception:  # noqa: BLE001
+        logger.exception("Candlestick pattern recognition failed for %s", symbol)
+        return None
 
 
 async def _load_mswing_index_value(db: AsyncSession) -> float | None:
@@ -490,6 +514,16 @@ async def get_strategy_analytics(symbol: str, db: AsyncSession = Depends(get_db)
     seasonal / EMA-BB-ATR variants are GET /api/etfs/{symbol}/strategies/
     seasonal_heat_map and .../ema_bollinger_atr.
 
+    Also (cache key bumped v11 -> v12): `smaTrend.trafficLight` - the optional,
+    backward-compatible Moving Average Traffic Light (SMA10/25/50 ordering,
+    services.sma_traffic_light) nested inside the unchanged SMA Trend object, and
+    Candlestick Pattern Recognition (`candlestickPatternRecognition`, in
+    `technicalStrategies`; services.candlestick_patterns, default 120-candle
+    window). Volatility Harvesting (POST /api/portfolio/volatility_harvesting) and
+    Dividend Analysis (GET /api/etfs/{symbol}/strategies/dividend_analysis) need
+    user input / EODHD network calls and therefore have dedicated routes below
+    rather than being computed on every aggregated request.
+
     Also carries two fundamental-valuation Quantitative strategies
     (services.strategies Strategies 27-28), added WITHOUT a new endpoint
     or cache-key change (they are attached after the cached ETF payload):
@@ -519,7 +553,7 @@ async def get_strategy_analytics(symbol: str, db: AsyncSession = Depends(get_db)
             ),
         )
 
-    cache_key = f"tw:v11:strategies:{meta.symbol}"
+    cache_key = f"tw:v12:strategies:{meta.symbol}"
     cached = await cache.get_json(cache_key)
     if cached is not None:
         result = cached
@@ -533,7 +567,7 @@ async def get_strategy_analytics(symbol: str, db: AsyncSession = Depends(get_db)
             "macd": strategies.compute_macd(prices),
             "bollinger_bands": strategies.compute_bollinger_bands(prices),
             "better_breakout": strategies.compute_better_breakout(prices),
-            "sma_trend": strategies.compute_sma_trend(prices),
+            "sma_trend": strategies.attach_traffic_light(strategies.compute_sma_trend(prices), prices),
             "vt_vs_vti_vxus": None,
             "evar_risk": strategies.compute_evar_risk(prices),
             "risk_on_risk_off": None,
@@ -560,6 +594,7 @@ async def get_strategy_analytics(symbol: str, db: AsyncSession = Depends(get_db)
             "seasonal_heat_map": strategies.compute_seasonal_heat_map(prices, symbol=meta.symbol),
             "ema_bollinger_atr": strategies.compute_ema_bollinger_atr(prices),
             "crash_warning": strategies.compute_crash_warning(prices),
+            "candlestick_pattern_recognition": _default_candlestick_patterns(prices, meta.symbol),
         }
 
         if meta.symbol == PORTFOLIO_COMPARISON_SYMBOL:
@@ -620,6 +655,7 @@ async def get_strategy_analytics(symbol: str, db: AsyncSession = Depends(get_db)
             "cpr": result["cpr"],
             "ta_candles_trend_health": result["ta_candles_trend_health"],
             "ema_bollinger_atr": result["ema_bollinger_atr"],
+            "candlestick_pattern_recognition": result["candlestick_pattern_recognition"],
         }
         result["quantitative_strategies"] = {
             "evar_risk": result["evar_risk"],
@@ -686,6 +722,7 @@ async def get_strategy_analytics(symbol: str, db: AsyncSession = Depends(get_db)
         "seasonal_heat_map": "Seasonal Performance Heat Map",
         "ema_bollinger_atr": "EMA + Bollinger Bands + ATR",
         "crash_warning": "Technical Crash-Warning Risk Indicator",
+        "candlestick_pattern_recognition": "Candlestick Pattern Recognition",
     }
     if meta.symbol == PORTFOLIO_COMPARISON_SYMBOL:
         strategy_labels["vt_vs_vti_vxus"] = "VT vs VTI+VXUS Portfolio Comparison"
@@ -1085,3 +1122,310 @@ async def post_diversification_heat_map(
         )
     await cache.set_json(cache_key, result)
     return ApiResponse(data=result)
+
+
+# ---------------------------------------------------------------------------
+# Candlestick Pattern Recognition: parameterised variant of the strategy that is
+# also part of GET /etfs/{symbol}/strategies (default 120-candle window). Daily
+# bars only - the interval parameter exists so unsupported values get a clear
+# error instead of silently falling back.
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/{symbol}/strategies/candlestick_patterns",
+    response_model=ApiResponse[CandlestickPatternRecognitionStrategy],
+)
+async def get_candlestick_patterns(
+    symbol: str,
+    lookback_bars: int = Query(
+        default=strategies.DEFAULT_LOOKBACK_BARS,
+        ge=strategies.MIN_LOOKBACK_BARS,
+        le=strategies.MAX_LOOKBACK_BARS,
+        description="Number of most recent daily candles in which formations are reported.",
+    ),
+    interval: str = Query(default="1d", description="Only '1d' (daily candles) is supported."),
+    db: AsyncSession = Depends(get_db),
+):
+    """Detects Hammer, Hanging Man, Shooting Star, Doji, Bullish/Bearish Engulfing,
+    Bullish/Bearish Harami, Morning/Evening Star and Three Black Crows in the
+    symbol's daily OHLCV history (EODHD data stored in daily_prices). Rule-based and
+    descriptive: no probabilities, no trade instructions. Independent of the
+    existing TA Candles / Trend Health strategy."""
+    sym = _resolve_portfolio_symbol(symbol)
+    if interval not in strategies.SUPPORTED_INTERVALS:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Unsupported interval '{interval}'. Supported: "
+                f"{', '.join(strategies.SUPPORTED_INTERVALS)} (daily candles)."
+            ),
+        )
+
+    cache_key = f"{ARTICLE_CACHE_PREFIX}candles:{sym}:{interval}:{lookback_bars}"
+    cached = await cache.get_json(cache_key)
+    if cached is not None:
+        return ApiResponse(data=cached)
+
+    prices = await load_prices(db, sym)
+    require_prices(prices, sym)
+    try:
+        result = strategies.compute_candlestick_patterns(
+            prices, symbol=sym, lookback_bars=lookback_bars, interval=interval
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if result is None:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Insufficient valid candle history for {sym}: at least "
+                f"{strategies.MIN_ROWS_CANDLESTICK} valid daily candles are needed."
+            ),
+        )
+    await cache.set_json(cache_key, result)
+    return ApiResponse(data=result)
+
+
+# ---------------------------------------------------------------------------
+# Volatility Harvesting (Quantitative): multi-asset, user-supplied portfolio -
+# a dedicated POST like the other portfolio routes. Uses the stored EODHD daily
+# history of the supported symbols (ETF_REGISTRY, portfolio-comparison and
+# strategy-only symbols), exactly like /portfolio/diversification_heat_map.
+# ---------------------------------------------------------------------------
+
+
+@portfolio_router.post(
+    "/volatility_harvesting",
+    response_model=ApiResponse[VolatilityHarvestingStrategy],
+)
+async def post_volatility_harvesting(
+    request: VolatilityHarvestingRequest, db: AsyncSession = Depends(get_db)
+):
+    """Rebalanced vs buy-and-hold historical comparison for explicit target weights
+    (see services.volatility_harvesting for the full methodology). Analytical
+    simulation only: no orders, no guaranteed gains; a positive difference is not
+    presented as proven volatility-harvesting profit."""
+    risk_free = (
+        request.risk_free_rate_percent
+        if request.risk_free_rate_percent is not None
+        else settings.risk_free_rate * 100.0
+    )
+    try:
+        symbols, weights = strategies.validate_request(
+            request.symbols,
+            request.weights_percent,
+            request.rebalance_frequency,
+            request.initial_value,
+            request.transaction_cost_percent,
+            risk_free,
+            request.start,
+            request.end,
+            request.transaction_cost_sensitivity_percent,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    for sym in symbols:
+        _resolve_portfolio_symbol(sym)
+
+    cache_key = ARTICLE_CACHE_PREFIX + "volharvest:" + _digest(
+        {
+            "s": symbols, "w": weights, "start": request.start, "end": request.end,
+            "f": request.rebalance_frequency, "v": request.initial_value,
+            "c": request.transaction_cost_percent, "rf": risk_free, "basis": request.price_basis,
+            "cmp": request.include_frequency_comparison,
+            "sens": request.transaction_cost_sensitivity_percent,
+        }
+    )
+    cached = await cache.get_json(cache_key)
+    if cached is not None:
+        return ApiResponse(data=cached)
+
+    prices_by_symbol = {}
+    for sym in symbols:
+        prices = await load_prices(db, sym)
+        require_prices(prices, sym)
+        prices_by_symbol[sym] = prices
+
+    try:
+        result = strategies.compute_volatility_harvesting(
+            prices_by_symbol,
+            weights,
+            rebalance_frequency=request.rebalance_frequency,
+            initial_value=request.initial_value,
+            transaction_cost_percent=request.transaction_cost_percent,
+            risk_free_rate_percent=risk_free,
+            start=request.start,
+            end=request.end,
+            price_basis=request.price_basis,
+            include_frequency_comparison=request.include_frequency_comparison,
+            transaction_cost_sensitivity_percent=request.transaction_cost_sensitivity_percent,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    await cache.set_json(cache_key, result)
+    return ApiResponse(data=result)
+
+
+# ---------------------------------------------------------------------------
+# Dividend Analysis (Quantitative): six components from EODHD dividends,
+# fundamentals and end-of-day price. Dedicated route (not part of the aggregated
+# /strategies payload) because it needs live EODHD calls rather than stored
+# prices; results are cached per symbol for the standard cache TTL, and a failed
+# or non-entitled EODHD call is negative-cached briefly so a broken plan cannot
+# trigger repeated retry storms. Forecasting is intentionally not included.
+# ---------------------------------------------------------------------------
+
+DIVIDEND_CACHE_PREFIX = "tw:v1:dividend:"
+DIVIDEND_FAILURE_CACHE_PREFIX = "tw:v1:dividend_fail:"
+DIVIDEND_FAILURE_TTL_SECONDS = 300
+DIVIDEND_HISTORY_YEARS = 15
+DIVIDEND_PRICE_LOOKBACK_DAYS = 10
+
+
+def _describe_eodhd_error(exc: BaseException, what: str) -> str:
+    """Token-free, user-safe explanation of an EODHD failure."""
+    if isinstance(exc, eodhd_client.EodhdEntitlementError):
+        return str(exc)
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"EODHD {what} request failed (HTTP {exc.response.status_code})."
+    if isinstance(exc, (httpx.TimeoutException, httpx.ConnectError)):
+        return f"EODHD {what} request timed out or could not connect; try again later."
+    return f"EODHD {what} request failed."
+
+
+async def _resolve_dividend_target(db: AsyncSession, symbol: str) -> tuple[str, str, str]:
+    """(plain symbol, EODHD symbol, 'fund' | 'stock'). Only symbols this backend
+    already knows are accepted (registry ETFs and current stock-universe members)."""
+    upper = symbol.strip().upper()
+    if (
+        upper in ETF_REGISTRY
+        or upper in PORTFOLIO_COMPARISON_REGISTRY
+        or upper in STRATEGY_ONLY_REGISTRY
+    ):
+        return upper, _price_source_meta(upper).eodhd_symbol(), "fund"
+    stock = await _find_stock_member(db, upper)
+    if stock is not None:
+        return stock.symbol, stock.eodhd_symbol(), "stock"
+    raise HTTPException(status_code=404, detail=f"Unknown symbol: {symbol}")
+
+
+async def _load_dividend_analysis(db: AsyncSession, plain: str, eodhd_symbol: str, kind: str) -> dict:
+    """Fetch the EODHD inputs (dividends, fundamentals for stocks, latest close)
+    and compute the analysis. Never raises: failures become an explicit
+    'unavailable' result, and an unaffected calculation is still returned."""
+    today = datetime.date.today()
+    notes: list[str] = []
+    from_date = today - datetime.timedelta(days=365 * DIVIDEND_HISTORY_YEARS + 31)
+
+    async def _price() -> tuple[float | None, str | None, str | None]:
+        if kind == "fund":
+            rows = await load_prices(db, plain, limit=1)
+            if rows and rows[-1].close:
+                return float(rows[-1].close), rows[-1].date.isoformat(), "daily_prices (EODHD end-of-day close)"
+            return None, None, None
+        bars = await eodhd_client.fetch_eod_history(
+            eodhd_symbol, from_date=today - datetime.timedelta(days=DIVIDEND_PRICE_LOOKBACK_DAYS)
+        )
+        for bar in sorted(bars, key=lambda b: str(b.get("date")), reverse=True):
+            try:
+                close = float(bar["close"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if close > 0:
+                return close, str(bar.get("date"))[:10], "EODHD end-of-day close"
+        return None, None, None
+
+    async def _fundamentals():
+        if kind != "stock":
+            return None
+        return await eodhd_client.fetch_fundamentals(eodhd_symbol)
+
+    div_res, fund_res, price_res = await asyncio.gather(
+        eodhd_client.fetch_dividends(eodhd_symbol, from_date=from_date),
+        _fundamentals(),
+        _price(),
+        return_exceptions=True,
+    )
+
+    if isinstance(div_res, BaseException):
+        logger.warning("EODHD dividends unavailable for %s: %s", plain, type(div_res).__name__)
+        return strategies.unavailable_result(
+            plain, [_describe_eodhd_error(div_res, "dividend history")], today
+        )
+
+    fundamentals, fundamentals_status = None, "ok"
+    if kind == "stock":
+        if isinstance(fund_res, BaseException):
+            logger.warning("EODHD fundamentals unavailable for %s: %s", plain, type(fund_res).__name__)
+            reason = _describe_eodhd_error(fund_res, "fundamentals")
+            fundamentals_status = "fundamentals request failed"
+            notes.append(reason + " Payout ratio, sustainability and cut-risk fundamentals are unavailable.")
+        elif fund_res is None:
+            fundamentals_status = "not covered by EODHD"
+            notes.append("EODHD has no fundamentals for this symbol; fundamentals-based metrics are unavailable.")
+        else:
+            fundamentals = fund_res
+
+    price = price_date = price_source = None
+    if isinstance(price_res, BaseException):
+        logger.warning("Price lookup for dividend yield failed for %s: %s", plain, type(price_res).__name__)
+        notes.append(_describe_eodhd_error(price_res, "price") + " Dividend yield cannot be computed.")
+    else:
+        price, price_date, price_source = price_res
+        if price is None:
+            notes.append("No recent closing price is available; dividend yield cannot be computed.")
+
+    return strategies.compute_dividend_analysis(
+        symbol=plain,
+        dividends=div_res,
+        price=price,
+        price_date=price_date,
+        fundamentals=fundamentals,
+        fundamentals_status=fundamentals_status,
+        instrument_type=kind,
+        today=today,
+        price_source=price_source,
+        notes=notes,
+    )
+
+
+@router.get(
+    "/{symbol}/strategies/dividend_analysis",
+    response_model=ApiResponse[DividendAnalysisStrategy],
+)
+async def get_dividend_analysis(symbol: str, db: AsyncSession = Depends(get_db)):
+    """Dividend Analysis - yield (trailing + labelled forward), payout ratio,
+    growth, historical trend, sustainability and cut-risk indicators for a
+    registry ETF or a current stock-universe member, from EODHD data only.
+
+    Always HTTP 200 for a known symbol: when EODHD data (or the plan's
+    entitlement) is missing the body carries `status: "unavailable"` / `"partial"`
+    with the reasons, and unaffected components are still returned. Rule-based
+    heuristics only - no probabilities, no ML model, no forecast."""
+    plain, eodhd_symbol, kind = await _resolve_dividend_target(db, symbol)
+
+    cache_key = f"{DIVIDEND_CACHE_PREFIX}{plain}"
+    cached = await cache.get_json(cache_key)
+    if cached is not None:
+        return ApiResponse(data=camelize_keys(cached))
+    failure_key = f"{DIVIDEND_FAILURE_CACHE_PREFIX}{plain}"
+    failed = await cache.get_json(failure_key)
+    if failed is not None:
+        reasons = failed.get("reasons") or ["EODHD dividend data is temporarily unavailable."]
+        return ApiResponse(
+            data=camelize_keys(strategies.unavailable_result(plain, reasons)),
+            message="Dividend data is unavailable: " + " ".join(reasons),
+        )
+
+    result = await _load_dividend_analysis(db, plain, eodhd_symbol, kind)
+    if result["status"] == strategies.DIV_UNAVAILABLE:
+        await cache.set_json(
+            failure_key, {"reasons": result.get("unavailable_reasons", [])}, ttl=DIVIDEND_FAILURE_TTL_SECONDS
+        )
+        message = "Dividend data is unavailable: " + " ".join(result.get("unavailable_reasons", []))
+    else:
+        await cache.set_json(cache_key, result)
+        message = None
+    return ApiResponse(data=camelize_keys(result), message=message)
