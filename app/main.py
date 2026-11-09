@@ -19,6 +19,7 @@ from app.database import Base, engine, get_db
 from app.exceptions import register_exception_handlers
 from app.middleware import RequestIDMiddleware
 from app.routers import admin, canslim, compare, dashboard, etfs, health, scanners, strategy
+from app.routers import strategy_set3  # Set 3 (isolated strategy architecture)
 from app.scanners import ingestion as scanner_ingestion
 from app.services import cache, ingestion
 
@@ -153,6 +154,7 @@ app.include_router(compare.router, prefix="/api")
 app.include_router(etfs.router, prefix="/api")
 app.include_router(strategy.router, prefix="/api")
 app.include_router(strategy.portfolio_router, prefix="/api")
+app.include_router(strategy_set3.router, prefix="/api")  # Set 3 endpoints
 app.include_router(canslim.router, prefix="/api")
 app.include_router(scanners.router, prefix="/api")
 app.include_router(dashboard.router, prefix="/api")
