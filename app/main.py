@@ -20,6 +20,7 @@ from app.exceptions import register_exception_handlers
 from app.middleware import RequestIDMiddleware
 from app.routers import admin, canslim, compare, dashboard, etfs, health, scanners, strategy
 from app.routers import strategy_set3  # Set 3 (isolated strategy architecture)
+from app.routers import scanners_set3, strategies_set3  # Set 3 additive: article strategies + stock scanner
 from app.scanners import ingestion as scanner_ingestion
 from app.services import cache, ingestion
 
@@ -154,6 +155,11 @@ app.include_router(compare.router, prefix="/api")
 app.include_router(etfs.router, prefix="/api")
 app.include_router(strategy.router, prefix="/api")
 app.include_router(strategy.portfolio_router, prefix="/api")
+# Set 3 additive routers. strategies_set3 is registered BEFORE the registry-based
+# strategy_set3 router so its quantitative_set3 route (a strict superset of the
+# existing response) is the one that answers that path.
+app.include_router(strategies_set3.router, prefix="/api")
+app.include_router(scanners_set3.router, prefix="/api")
 app.include_router(strategy_set3.router, prefix="/api")  # Set 3 endpoints
 app.include_router(canslim.router, prefix="/api")
 app.include_router(scanners.router, prefix="/api")
